@@ -270,7 +270,7 @@ def get_fts_db(vault: Path) -> sqlite3.Connection:
     cache_dir = vault / ".akatsuki"
     cache_dir.mkdir(parents=True, exist_ok=True)
     db_path = cache_dir / "index.db"
-    con = sqlite3.connect(str(db_path))
+    con = sqlite3.connect(str(db_path), timeout=30.0)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL;")
 
@@ -555,12 +555,18 @@ def build_fts_clause(words: list[str], op: str = "AND") -> str:
 
 
 def search_vault(
-    vault: Path, query: str, domain: str | None = None, limit: int = 10
+    vault: Path, query: str, domain: str | None = None, limit: int | str = 10
 ) -> list[dict]:
     """Search notes in vault using Okapi BM25 ranking over SQLite FTS5 index."""
     clean_query = query.strip()
     if not clean_query:
         return []
+
+    if limit is not None:
+        try:
+            limit = int(limit)
+        except (ValueError, TypeError):
+            limit = 10
 
     con = get_fts_db(vault)
     sync_fts_index(vault, con)
@@ -694,8 +700,13 @@ def slice_markdown_section(content: str, target: str) -> tuple[str | None, list[
     return sliced_text, toc_lines
 
 
-def apply_token_budget(text: str, budget: int | None) -> str:
+def apply_token_budget(text: str, budget: int | str | None) -> str:
     """Apply token budget packing to markdown text (heuristic ~4 chars/token)."""
+    if budget is not None:
+        try:
+            budget = int(budget)
+        except (ValueError, TypeError):
+            budget = None
     if not budget or budget <= 0:
         return text
     char_budget = budget * 4
@@ -2239,6 +2250,10 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
         content = args.get("content", "")
         overwrite = args.get("overwrite", False)
         raw = args.get("raw", False)
+        if isinstance(overwrite, str):
+            overwrite = overwrite.lower() in ("true", "1", "yes")
+        if isinstance(raw, str):
+            raw = raw.lower() in ("true", "1", "yes")
         if not path or not content:
             return "Error: Both 'path' and 'content' parameters are required.", True
         res, is_err = write_note(vault, path, content, overwrite=overwrite, raw=raw)
@@ -2342,36 +2357,70 @@ def dispatch_single_request(req: dict) -> dict | None:
             "error": {"code": -32600, "message": "Invalid Request: Expected JSON object"},
         }
 
+    is_notification = "id" not in req
     req_id = req.get("id")
     method = req.get("method")
     raw_params = req.get("params")
     params = raw_params if isinstance(raw_params, dict) else {}
 
     if method == "initialize":
+        if is_notification:
+            return None
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}, "resources": {}},
+                "capabilities": {
+                    "tools": {},
+                    "resources": {"subscribe": False, "listChanged": False},
+                },
                 "serverInfo": {"name": "akatsuki", "version": "3.0.0"},
             },
         }
     elif method == "notifications/initialized":
         return None
     elif method == "ping":
+        if is_notification:
+            return None
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     elif method == "tools/list":
+        if is_notification:
+            return None
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": MCP_TOOLS}}
     elif method == "resources/list":
+        if is_notification:
+            return None
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {"resources": MCP_RESOURCES},
         }
+    elif method == "resources/templates/list":
+        if is_notification:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resourceTemplates": [
+                    {
+                        "uriTemplate": "akatsuki://{note}",
+                        "name": "Akatsuki Note",
+                        "description": "Read any note, system spec, or project contract in the vault by stem or relative path.",
+                        "mimeType": "text/markdown",
+                    }
+                ]
+            },
+        }
     elif method == "resources/read":
+        if is_notification:
+            return None
         uri = params.get("uri", "")
-        text_out, is_err = handle_mcp_resource_read(uri)
+        try:
+            text_out, is_err = handle_mcp_resource_read(uri)
+        except Exception as e:
+            text_out, is_err = f"Error reading resource '{uri}': {str(e)}", True
         mime = (
             "application/json"
             if uri in ("akatsuki://services", "akatsuki://projects")
@@ -2399,6 +2448,8 @@ def dispatch_single_request(req: dict) -> dict | None:
             tool_args = {}
         try:
             text_out, is_err = handle_mcp_call(tool_name, tool_args)
+            if is_notification:
+                return None
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -2408,6 +2459,8 @@ def dispatch_single_request(req: dict) -> dict | None:
                 },
             }
         except Exception as e:
+            if is_notification:
+                return None
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -2421,7 +2474,7 @@ def dispatch_single_request(req: dict) -> dict | None:
                     "isError": True,
                 },
             }
-    elif req_id is not None:
+    elif not is_notification:
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -2463,15 +2516,32 @@ def run_mcp_server():
                 continue
             batch_resps = []
             for item in req:
-                single_resp = dispatch_single_request(item)
-                if single_resp is not None:
-                    batch_resps.append(single_resp)
+                try:
+                    single_resp = dispatch_single_request(item)
+                    if single_resp is not None:
+                        batch_resps.append(single_resp)
+                except Exception as e:
+                    item_id = item.get("id") if isinstance(item, dict) else None
+                    batch_resps.append({
+                        "jsonrpc": "2.0",
+                        "id": item_id,
+                        "error": {"code": -32603, "message": f"Internal server error: {e}"},
+                    })
             if batch_resps:
                 sys.stdout.write(json.dumps(batch_resps) + "\n")
                 sys.stdout.flush()
         elif isinstance(req, dict):
-            resp = dispatch_single_request(req)
-            if resp is not None:
+            try:
+                resp = dispatch_single_request(req)
+                if resp is not None:
+                    sys.stdout.write(json.dumps(resp) + "\n")
+                    sys.stdout.flush()
+            except Exception as e:
+                resp = {
+                    "jsonrpc": "2.0",
+                    "id": req.get("id"),
+                    "error": {"code": -32603, "message": f"Internal server error: {e}"},
+                }
                 sys.stdout.write(json.dumps(resp) + "\n")
                 sys.stdout.flush()
         else:

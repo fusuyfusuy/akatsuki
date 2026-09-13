@@ -33,6 +33,51 @@ class TestAkatsukiMCP(unittest.TestCase):
         self.assertEqual(res["id"], 3)
         self.assertIn("resources", res["result"])
 
+    def test_mcp_resources_templates_list(self):
+        req = {"jsonrpc": "2.0", "id": 4, "method": "resources/templates/list", "params": {}}
+        res = dispatch_single_request(req)
+        self.assertEqual(res["id"], 4)
+        self.assertIn("resourceTemplates", res["result"])
+        templates = res["result"]["resourceTemplates"]
+        self.assertTrue(any("akatsuki://{note}" in t["uriTemplate"] for t in templates))
+
+    def test_mcp_notification_silence(self):
+        # Requests omitting 'id' are notifications and MUST NOT return responses
+        req_notify = {"jsonrpc": "2.0", "method": "ping", "params": {}}
+        res = dispatch_single_request(req_notify)
+        self.assertIsNone(res)
+
+        req_tools = {"jsonrpc": "2.0", "method": "tools/list", "params": {}}
+        res = dispatch_single_request(req_tools)
+        self.assertIsNone(res)
+
+    def test_mcp_read_budget_coercion(self):
+        # Verify that string budget does not raise TypeError ('<=' not supported)
+        req = {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "akatsuki_read",
+                "arguments": {"note": "Dokploy-Traefik", "budget": "200"},
+            },
+        }
+        res = dispatch_single_request(req)
+        self.assertEqual(res["id"], 5)
+        self.assertFalse(res["result"]["isError"])
+
+    def test_mcp_resource_read_error_safety(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "resources/read",
+            "params": {"uri": "akatsuki://nonexistent_spec"},
+        }
+        res = dispatch_single_request(req)
+        self.assertEqual(res["id"], 6)
+        self.assertIn("error", res)
+        self.assertEqual(res["error"]["code"], -32602)
+
 
 if __name__ == "__main__":
     unittest.main()
