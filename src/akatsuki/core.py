@@ -90,6 +90,27 @@ def resolve_vault_path(explicit_path: str | Path | None = None) -> Path:
         return CURRENT_VAULT_OVERRIDE
 
     env_vault = os.environ.get("AKATSUKI_VAULT")
+    if not env_vault:
+        cfg_env = Path.home() / ".config" / "knowledge-base" / "env"
+        if cfg_env.is_file():
+            try:
+                for line in cfg_env.read_text(encoding="utf-8").splitlines():
+                    clean = line.strip()
+                    if clean.startswith("export AKATSUKI_VAULT=") or clean.startswith("AKATSUKI_VAULT="):
+                        val = clean.split("=", 1)[1].strip().strip('"').strip("'")
+                        val = os.path.expandvars(val)
+                        if val and Path(val).is_dir():
+                            env_vault = val
+                            break
+                    elif clean.startswith("export KNOWLEDGE_BASE_DIR=") or clean.startswith("KNOWLEDGE_BASE_DIR="):
+                        val = clean.split("=", 1)[1].strip().strip('"').strip("'")
+                        val = os.path.expandvars(val)
+                        if val and (Path(val) / "akatsuki").is_dir():
+                            env_vault = str(Path(val) / "akatsuki")
+                            break
+            except Exception:
+                pass
+
     if env_vault:
         return Path(env_vault).expanduser().resolve()
 
@@ -97,8 +118,10 @@ def resolve_vault_path(explicit_path: str | Path | None = None) -> Path:
     try:
         cwd = Path.cwd().resolve()
         for parent in [cwd, *cwd.parents]:
+            if (parent / "akatsuki" / "40-Systems").is_dir() and (parent / "akatsuki" / "20-Projects").is_dir():
+                return (parent / "akatsuki").resolve()
             if (parent / ".akatsuki").is_dir() or (
-                (parent / "INDEX.md").is_file() and (parent / "AGENTS.md").is_file()
+                (parent / "INDEX.md").is_file() and (parent / "AGENTS.md").is_file() and not (parent / "ejdertasimsi").is_dir()
             ):
                 return parent
             if (parent / "40-Systems").is_dir() and (parent / "20-Projects").is_dir():
@@ -109,6 +132,8 @@ def resolve_vault_path(explicit_path: str | Path | None = None) -> Path:
     # Well-known system locations
     home = Path.home()
     for candidate in [
+        home / "Projects" / "fusuyfusuy" / "knowledge-base" / "akatsuki",
+        home / "projects" / "fusuyfusuy" / "knowledge-base" / "akatsuki",
         home / "configs" / "knowledge-base" / "akatsuki",
         home / ".akatsuki",
         home / "akatsuki",
