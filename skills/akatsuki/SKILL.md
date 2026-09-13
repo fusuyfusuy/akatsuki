@@ -40,6 +40,7 @@ akatsuki daily    [--date <YYYY-MM-DD>] [--json]
 akatsuki log      --project <proj> --summary <sum> [--device <dev>]
 akatsuki lint     [--json]
 akatsuki verify   [--json]
+akatsuki reconcile [--dry-run]
 akatsuki mcp      [--vault <dir>]
 ```
 
