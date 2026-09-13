@@ -18,6 +18,7 @@ import fcntl
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -28,6 +29,35 @@ try:
     HAVE_PYYAML = True
 except ImportError:
     HAVE_PYYAML = False
+
+
+def get_machine_id() -> str:
+    """Return resolved hostname or environment override identifier."""
+    return (
+        os.environ.get("AKATSUKI_HOST")
+        or os.environ.get("HOSTNAME")
+        or socket.gethostname().split(".")[0]
+    )
+
+
+def dump_frontmatter(fm: dict, body: str) -> str:
+    """Serialize YAML frontmatter dictionary and prepend to body."""
+    if HAVE_PYYAML:
+        new_fm_str = yaml.dump(fm, sort_keys=False).strip()
+    else:
+        new_fm_lines = []
+        for k, v in fm.items():
+            if isinstance(v, list):
+                new_fm_lines.append(f"{k}:")
+                for item in v:
+                    new_fm_lines.append(f"  - {item}")
+            elif isinstance(v, dict):
+                new_fm_lines.append(f"{k}: {json.dumps(v, default=str)}")
+            else:
+                new_fm_lines.append(f"{k}: {v}")
+        new_fm_str = "\n".join(new_fm_lines)
+    return f"---\n{new_fm_str}\n---\n" + body.lstrip()
+
 
 RAW_EXTS = {
     ".yml", ".yaml", ".json", ".toml", ".sh", ".py", ".conf",
@@ -226,7 +256,7 @@ def get_fts_db(vault: Path) -> sqlite3.Connection:
     row = cur.fetchone()
     current_ver = row["val"] if row else None
 
-    if current_ver != "4":
+    if current_ver != "5":
         con.execute("DROP TABLE IF EXISTS notes_fts;")
         con.execute("DROP TABLE IF EXISTS file_meta;")
         con.execute("DROP TABLE IF EXISTS entities;")
@@ -262,6 +292,8 @@ def get_fts_db(vault: Path) -> sqlite3.Connection:
                 host TEXT,
                 network TEXT,
                 summary TEXT,
+                updated TEXT,
+                updated_by TEXT,
                 metadata_json TEXT NOT NULL
             );
         """)
@@ -303,7 +335,7 @@ def get_fts_db(vault: Path) -> sqlite3.Connection:
             );
         """)
         con.execute(
-            "INSERT OR REPLACE INTO schema_meta(key, val) VALUES ('version', '4');"
+            "INSERT OR REPLACE INTO schema_meta(key, val) VALUES ('version', '5');"
         )
         con.commit()
 
@@ -361,6 +393,8 @@ def sync_fts_index(vault: Path, con: sqlite3.Connection) -> None:
         repo = str(fm.get("repo")) if fm.get("repo") else None
         host = str(fm.get("host")) if fm.get("host") else None
         network = str(fm.get("network")) if fm.get("network") else None
+        updated = str(fm.get("updated")) if fm.get("updated") else None
+        updated_by = str(fm.get("updated_by")) if fm.get("updated_by") else None
 
         # Clean old records for rel
         con.execute("DELETE FROM notes_fts WHERE rel_path = ?", (rel,))
@@ -382,9 +416,9 @@ def sync_fts_index(vault: Path, con: sqlite3.Connection) -> None:
 
         # 2. Index Entity
         con.execute(
-            """INSERT INTO entities(rel_path, stem, domain, title, type, status, repo, host, network, summary, metadata_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (rel, f.stem, domain, title, note_type, status, repo, host, network, summary, json.dumps(fm, default=str)),
+            """INSERT INTO entities(rel_path, stem, domain, title, type, status, repo, host, network, summary, updated, updated_by, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (rel, f.stem, domain, title, note_type, status, repo, host, network, summary, updated, updated_by, json.dumps(fm, default=str)),
         )
 
         # 3. Index Relations
@@ -964,22 +998,11 @@ def set_note_property(vault: Path, rel_path: str, keypath: str, value_str: str) 
             curr = curr[k]
         curr[keys[-1]] = parsed_val
 
-        if HAVE_PYYAML:
-            new_fm_str = yaml.dump(fm, sort_keys=False).strip()
-        else:
-            new_fm_lines = []
-            for k, v in fm.items():
-                if isinstance(v, list):
-                    new_fm_lines.append(f"{k}:")
-                    for item in v:
-                        new_fm_lines.append(f"  - {item}")
-                elif isinstance(v, dict):
-                    new_fm_lines.append(f"{k}: {json.dumps(v, default=str)}")
-                else:
-                    new_fm_lines.append(f"{k}: {v}")
-            new_fm_str = "\n".join(new_fm_lines)
+        if keypath not in ("updated", "updated_by"):
+            fm["updated"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            fm["updated_by"] = get_machine_id()
 
-        new_content = f"---\n{new_fm_str}\n---\n" + body.lstrip()
+        new_content = dump_frontmatter(fm, body)
         tmp_file = note_file.with_name(f".{note_file.name}.tmp.{os.getpid()}")
         tmp_file.write_text(new_content, encoding="utf-8")
         os.replace(tmp_file, note_file)
@@ -987,6 +1010,12 @@ def set_note_property(vault: Path, rel_path: str, keypath: str, value_str: str) 
         try:
             db = get_fts_db(vault)
             sync_fts_index(vault, db)
+        except Exception:
+            pass
+
+    if not str(rel_path).startswith("01-Daily"):
+        try:
+            append_work_log(vault, project="akatsuki", summary=f"set {note_file.name} {keypath}={value_str} -> exit 0")
         except Exception:
             pass
 
@@ -1202,18 +1231,30 @@ class VaultLock:
                 pass
 
 
-def append_work_log(vault: Path, project: str, summary: str) -> str:
+def append_work_log(
+    vault: Path, project: str, summary: str, device: str | None = None
+) -> str:
     """Append a timestamped work log entry to today's daily note under kernel lock."""
     now = datetime.datetime.now().astimezone()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
+    dev = device or get_machine_id()
 
     with VaultLock(vault):
         daily_note = ensure_daily_note(vault, date_str)
         content = daily_note.read_text(encoding="utf-8")
 
         prefix = f"[{project}]" if project else ""
-        entry = f"- **{time_str}**: {prefix} {summary}".strip()
+        dev_tag = f"[{dev}]" if dev else ""
+        if dev_tag and prefix:
+            header = f"- **{time_str}** {dev_tag}: {prefix} {summary}"
+        elif dev_tag:
+            header = f"- **{time_str}** {dev_tag}: {summary}"
+        elif prefix:
+            header = f"- **{time_str}**: {prefix} {summary}"
+        else:
+            header = f"- **{time_str}**: {summary}"
+        entry = header.strip()
 
         target_heading = "## 📝 Work Log & Session Notes"
         if target_heading in content:
@@ -1309,6 +1350,10 @@ def auto_heal_frontmatter(content: str, rel_path: str) -> str:
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",") if t.strip()]
     summary_val = fm.get("summary") or f"{title} overview and operational documentation."
+    now_iso = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    dev = get_machine_id()
+    updated_val = fm.get("updated", now_iso)
+    updated_by_val = fm.get("updated_by", dev)
 
     fm_lines = [
         "---",
@@ -1320,6 +1365,8 @@ def auto_heal_frontmatter(content: str, rel_path: str) -> str:
     for t in tags:
         fm_lines.append(f"  - {t}")
     fm_lines.append(f'summary: "{summary_val}"')
+    fm_lines.append(f'updated: "{updated_val}"')
+    fm_lines.append(f'updated_by: "{updated_by_val}"')
     fm_lines.append("---\n")
 
     return "\n".join(fm_lines) + body.lstrip()
@@ -1399,6 +1446,12 @@ def append_section_to_note(
         else:
             new_content = orig_content.rstrip() + f"\n\n## {heading}\n{content_to_append.strip()}\n"
 
+        fm, body = parse_frontmatter(new_content)
+        if fm:
+            fm["updated"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            fm["updated_by"] = get_machine_id()
+            new_content = dump_frontmatter(fm, body)
+
         tmp_file = target_file.with_name(f".{target_file.name}.tmp.{os.getpid()}")
         tmp_file.write_text(new_content, encoding="utf-8")
         os.replace(tmp_file, target_file)
@@ -1406,6 +1459,12 @@ def append_section_to_note(
         try:
             db = get_fts_db(vault)
             sync_fts_index(vault, db)
+        except Exception:
+            pass
+
+    if not clean_rel.startswith("01-Daily"):
+        try:
+            append_work_log(vault, project="akatsuki", summary=f"append section '{heading}' in {clean_rel} -> exit 0")
         except Exception:
             pass
 
@@ -1436,10 +1495,17 @@ def write_note(
         final_content = content
     else:
         ok, _ = validate_note_content(content)
-        final_content = content if ok else auto_heal_frontmatter(content, clean_rel)
+        if ok:
+            fm, body = parse_frontmatter(content)
+            fm["updated"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            fm["updated_by"] = get_machine_id()
+            final_content = dump_frontmatter(fm, body)
+        else:
+            final_content = auto_heal_frontmatter(content, clean_rel)
 
     with VaultLock(vault):
-        if target.exists() and not overwrite:
+        was_existing = target.exists()
+        if was_existing and not overwrite:
             return (f"Error: File already exists at '{clean_rel}'. Set overwrite=True to replace.", True)
 
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1458,6 +1524,13 @@ def write_note(
                 sync_fts_index(vault, db)
             except Exception:
                 pass
+
+    if not clean_rel.startswith("01-Daily"):
+        try:
+            action = "overwrite" if was_existing else "create"
+            append_work_log(vault, project="akatsuki", summary=f"{action} {clean_rel} -> exit 0")
+        except Exception:
+            pass
 
     if is_raw:
         return f"Successfully wrote raw file '{clean_rel}'.", False
@@ -1673,7 +1746,8 @@ def cli_daily(args):
 
 def cli_log(args):
     vault = get_vault()
-    res = append_work_log(vault, args.project, args.summary)
+    device = getattr(args, "device", None)
+    res = append_work_log(vault, args.project, args.summary, device=device)
     print(res)
     ok, broken = verify_links(vault)
     if not ok:
@@ -1929,6 +2003,10 @@ MCP_TOOLS = [
                     "type": "string",
                     "description": "Punchy summary of changes made, commit hashes, or test results.",
                 },
+                "device": {
+                    "type": "string",
+                    "description": "Optional device or hostname identifier. Defaults to host machine.",
+                },
             },
             "required": ["summary"],
         },
@@ -2125,9 +2203,10 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
     elif name == "akatsuki_record_log":
         project = args.get("project", "")
         summary = args.get("summary", "")
+        device = args.get("device")
         if not summary:
             return "Error: Missing required parameter 'summary'.", True
-        res = append_work_log(vault, project, summary)
+        res = append_work_log(vault, project, summary, device=device)
         return res, False
 
     elif name == "akatsuki_write_note":
@@ -2576,6 +2655,7 @@ def main():
     p_log = subparsers.add_parser("log", help="Deposit a work log entry into today's note")
     p_log.add_argument("--project", "-p", default="", help="Project or repo name")
     p_log.add_argument("--summary", "-s", required=True, help="Summary of work or commit hash")
+    p_log.add_argument("--device", "-d", default=None, help="Device/hostname identifier (defaults to current host)")
 
     # verify
     subparsers.add_parser("verify", help="Verify wikilinks integrity across vault")
