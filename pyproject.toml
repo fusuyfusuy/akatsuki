@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "akatsuki"
+version = "0.1.0"
+description = "Universal CLI and MCP Gateway for Living Systems Memory and Architectural Contracts for Autonomous AI Agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Yusuf Akçakaya", email = "hey@fusuycorp.com" },
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "living-memory",
+    "architecture",
+    "second-brain",
+    "invariants",
+    "cli",
+    "bm25",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/fusuyfusuy/akatsuki"
+Repository = "https://github.com/fusuyfusuy/akatsuki"
+
+[project.scripts]
+akatsuki = "akatsuki.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
