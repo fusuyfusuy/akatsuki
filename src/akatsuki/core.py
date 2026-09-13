@@ -224,6 +224,48 @@ def parse_frontmatter(content: str) -> tuple[dict[str, object], str]:
     return metadata, body
 
 
+def validate_frontmatter_yaml(fm_raw: str) -> list[str]:
+    """Validate YAML frontmatter syntax without requiring PyYAML, falling back to PyYAML if available."""
+    errors = []
+    if HAVE_PYYAML:
+        try:
+            yaml.safe_load(fm_raw)
+            return []
+        except Exception as e:
+            return [f"YAML parser error: {e}"]
+
+    # Built-in strict YAML sanity checks (zero-dependency)
+    for idx, line in enumerate(fm_raw.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            val = stripped[2:].strip()
+            if ": " in val and not (
+                (val.startswith('"') and val.endswith('"'))
+                or (val.startswith("'") and val.endswith("'"))
+            ):
+                errors.append(f"Line {idx}: Unquoted colon in list item: {stripped}")
+            continue
+        if ":" not in stripped:
+            errors.append(f"Line {idx}: Missing key-value colon delimiter: {stripped}")
+            continue
+        k, v = stripped.split(":", 1)
+        val = v.strip()
+        if not val:
+            continue
+        if ": " in val and not (
+            (val.startswith('"') and val.endswith('"'))
+            or (val.startswith("'") and val.endswith("'"))
+        ):
+            errors.append(f"Line {idx}: Unquoted colon in scalar value: {stripped}")
+        elif (val.startswith('"') and not val.endswith('"')) or (
+            val.startswith("'") and not val.endswith("'")
+        ):
+            errors.append(f"Line {idx}: Unterminated quote: {stripped}")
+    return errors
+
+
 def resolve_note_file(vault: Path, query: str) -> Path | None:
     """Resolve a note path by exact path, relative path, or stem strictly inside vault."""
     q = query.strip()
@@ -1085,6 +1127,20 @@ def lint_vault(vault: Path) -> tuple[str, bool]:
         if missing:
             errors.append(f"'{rel}' [{note_type}]: Missing required field(s): {', '.join(missing)}")
 
+        # Strict YAML validation on markdown frontmatter
+        note_path = vault / rel
+        if note_path.exists():
+            try:
+                raw_text = note_path.read_text(encoding="utf-8")
+                if raw_text.startswith("---"):
+                    parts = raw_text.split("---", 2)
+                    if len(parts) >= 3:
+                        y_errs = validate_frontmatter_yaml(parts[1])
+                        for ye in y_errs:
+                            errors.append(f"'{rel}': Strict YAML frontmatter syntax error ({ye})")
+            except Exception as e:
+                errors.append(f"'{rel}': File read error during lint: {e}")
+
     # Validate syntax for non-markdown configs and scripts
     raw_files = []
     for d in ("50-Configs", "60-Scripts"):
@@ -1201,7 +1257,136 @@ def verify_links(vault: Path) -> tuple[bool, list[tuple[str, str]]]:
         if not inbounds:
             issues.append((rel, "Orphan note: No inbound links from MOC or index"))
 
+    # 4. Graph Closure: Every note in primary domains must be indexed in parent MOC or INDEX.md
+    domain_mocs = {
+        "01-Daily": "01-Daily/Daily-MOC.md",
+        "20-Projects": "20-Projects/Projects-MOC.md",
+        "30-Agents": "30-Agents/Agents-MOC.md",
+        "40-Systems": "40-Systems/Systems-MOC.md",
+        "90-Reference": "90-Reference/Reference-MOC.md",
+        "50-Configs": "50-Configs/Configs-MOC.md",
+        "60-Scripts": "60-Scripts/Scripts-MOC.md",
+    }
+    for rel, inbounds in inbound_links.items():
+        if rel in root_anchors or rel in domain_mocs.values() or rel == "40-Systems/ADRs/ADRs-MOC.md":
+            continue
+        domain = rel.split("/")[0] if "/" in rel else ""
+        parent_moc = domain_mocs.get(domain)
+        if not parent_moc:
+            continue
+        indexers = {"INDEX.md", parent_moc}
+        if rel.startswith("40-Systems/ADRs/"):
+            indexers.add("40-Systems/ADRs/ADRs-MOC.md")
+        if not inbounds.intersection(indexers):
+            issues.append((rel, f"Unindexed note: Not linked in parent MOC ({parent_moc}) or INDEX.md"))
+
     return len(issues) == 0, issues
+
+
+def reconcile_vault(vault: Path, dry_run: bool = False) -> tuple[str, bool]:
+    """Scan vault, auto-quote strict YAML fields, and auto-append unindexed notes to parent MOCs."""
+    actions = []
+
+    files = list(vault.glob("**/*.md"))
+    valid_files = [
+        f for f in files if not str(f.relative_to(vault)).startswith(("_templates", "."))
+    ]
+
+    # 1. Check strict YAML frontmatter quoting
+    for f in valid_files:
+        rel = str(f.relative_to(vault))
+        try:
+            text = f.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if not text.startswith("---"):
+            continue
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            continue
+        fm_raw = parts[1]
+        body = parts[2]
+        needs_write = False
+        new_fm_lines = []
+        for line in fm_raw.splitlines():
+            stripped = line.strip()
+            if ":" in stripped and not stripped.startswith(("-", "#")):
+                k, v = stripped.split(":", 1)
+                val = v.strip()
+                # Check for unquoted scalar with colon-space
+                if ": " in val and not (
+                    (val.startswith('"') and val.endswith('"'))
+                    or (val.startswith("'") and val.endswith("'"))
+                ):
+                    escaped_val = val.replace('"', '\\"')
+                    new_fm_lines.append(f'{k}: "{escaped_val}"')
+                    needs_write = True
+                    actions.append(f"Auto-quoted frontmatter field '{k}' in {rel}")
+                    continue
+            new_fm_lines.append(line)
+        if needs_write and not dry_run:
+            new_content = "---\n" + "\n".join(new_fm_lines) + "\n---" + body
+            f.write_text(new_content, encoding="utf-8")
+
+    # 2. Reconcile unindexed notes to domain MOCs
+    ok, issues = verify_links(vault)
+    unindexed = [item for item in issues if item[1].startswith("Unindexed note")]
+
+    domain_mocs = {
+        "01-Daily": "01-Daily/Daily-MOC.md",
+        "20-Projects": "20-Projects/Projects-MOC.md",
+        "30-Agents": "30-Agents/Agents-MOC.md",
+        "40-Systems": "40-Systems/Systems-MOC.md",
+        "90-Reference": "90-Reference/Reference-MOC.md",
+        "50-Configs": "50-Configs/Configs-MOC.md",
+        "60-Scripts": "60-Scripts/Scripts-MOC.md",
+    }
+
+    for rel, issue in unindexed:
+        domain = rel.split("/")[0] if "/" in rel else ""
+        parent_moc_rel = domain_mocs.get(domain)
+        if not parent_moc_rel:
+            continue
+        moc_path = vault / parent_moc_rel
+        if not moc_path.exists():
+            continue
+        stem = Path(rel).stem
+        note_file = vault / rel
+        note_title = stem
+        note_summary = ""
+        try:
+            meta, _ = parse_frontmatter(note_file.read_text(encoding="utf-8"))
+            note_title = str(meta.get("title", stem))
+            note_summary = str(meta.get("summary", ""))
+        except Exception:
+            pass
+
+        entry = f"- [[{rel[:-3]}|{note_title}]]"
+        if note_summary:
+            entry += f": {note_summary}"
+
+        actions.append(f"Appended unindexed note '{rel}' to {parent_moc_rel}")
+        if not dry_run:
+            moc_text = moc_path.read_text(encoding="utf-8")
+            if entry not in moc_text and f"[[{rel[:-3]}" not in moc_text:
+                if "\n## 🔗" in moc_text:
+                    parts = moc_text.split("\n## 🔗", 1)
+                    new_moc = parts[0].rstrip() + f"\n\n{entry}\n\n## 🔗" + parts[1]
+                else:
+                    new_moc = moc_text.rstrip() + f"\n\n{entry}\n"
+                moc_path.write_text(new_moc, encoding="utf-8")
+
+    if not actions:
+        return (
+            "PASSED: Vault is fully reconciled. Zero unindexed notes or YAML syntax defects.",
+            False,
+        )
+    prefix = "[DRY-RUN] " if dry_run else ""
+    return (
+        f"{prefix}Reconciled {len(actions)} item(s):\n"
+        + "\n".join(f"  - {a}" for a in actions),
+        False,
+    )
 
 
 def ensure_daily_note(vault: Path, date_str: str) -> Path:
@@ -1801,6 +1986,15 @@ def cli_verify(args):
             print(f"  - In '{src}': {issue}", file=sys.stderr)
         sys.exit(1)
     print("PASSED: All wikilinks and markdown links in akatsuki resolve cleanly (zero orphans).")
+
+
+def cli_reconcile(args):
+    vault = get_vault()
+    out, is_err = reconcile_vault(vault, dry_run=args.dry_run)
+    if is_err:
+        print(out, file=sys.stderr)
+        sys.exit(1)
+    print(out)
 
 
 def cli_list(args):
@@ -2760,7 +2954,11 @@ def main():
     p_log.add_argument("--device", "-d", default=None, help="Device/hostname identifier (defaults to current host)")
 
     # verify
-    subparsers.add_parser("verify", help="Verify wikilinks integrity across vault")
+    subparsers.add_parser("verify", help="Verify wikilinks and graph closure across vault")
+
+    # reconcile
+    p_reconcile = subparsers.add_parser("reconcile", help="Auto-reconcile unindexed notes and strict YAML across vault")
+    p_reconcile.add_argument("--dry-run", "-n", action="store_true", help="Simulate reconciliation without writing changes")
 
     # mcp
     subparsers.add_parser("mcp", help="Run as Model Context Protocol (MCP) server on stdio")
@@ -2807,6 +3005,8 @@ def main():
         cli_log(args)
     elif args.command == "verify":
         cli_verify(args)
+    elif args.command == "reconcile":
+        cli_reconcile(args)
     elif args.command == "mcp":
         run_mcp_server()
     else:
