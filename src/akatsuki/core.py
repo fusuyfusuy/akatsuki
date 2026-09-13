@@ -1361,6 +1361,8 @@ def auto_heal_frontmatter(content: str, rel_path: str) -> str:
         inferred_type = "agent"
     elif clean_rel.startswith("01-Daily"):
         inferred_type = "daily"
+    elif clean_rel.startswith("90-Reference"):
+        inferred_type = "reference"
     elif clean_rel.startswith("90-Database"):
         inferred_type = "database"
     else:
@@ -1850,6 +1852,7 @@ MCP_TOOLS = [
                         "40-Systems",
                         "50-Configs",
                         "60-Scripts",
+                        "90-Reference",
                         "90-Database",
                     ],
                     "description": "Optional domain directory to restrict search scope.",
@@ -2094,6 +2097,7 @@ MCP_TOOLS = [
                         "40-Systems",
                         "50-Configs",
                         "60-Scripts",
+                        "90-Reference",
                         "90-Database",
                     ],
                     "description": "Optional domain directory filter.",
@@ -2568,6 +2572,7 @@ def cli_init(args: argparse.Namespace) -> None:
         "30-Agents",
         "40-Systems",
         "50-Configs",
+        "90-Reference",
         "90-Database",
         "_templates",
     ]
@@ -2664,6 +2669,7 @@ def main():
             "40-Systems",
             "50-Configs",
             "60-Scripts",
+            "90-Reference",
             "90-Database",
         ],
     )
@@ -2725,6 +2731,7 @@ def main():
             "40-Systems",
             "50-Configs",
             "60-Scripts",
+            "90-Reference",
             "90-Database",
         ],
     )
