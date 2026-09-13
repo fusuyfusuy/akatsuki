@@ -1,154 +1,202 @@
 ---
 name: akatsuki
 description: >
-  Bidirectional Knowledge Secretariat gateway to the operator's Phoenix second brain
-  (`akatsuki` at `~/configs/knowledge-base/akatsuki`). Use whenever working in any
-  repository to (1) read and orient on systems architecture, live services, port mappings,
-  project stacks, and cluster policies, or (2) deposit and record architectural decisions,
-  infrastructure changes, benchmark results, production deployments, and work logs. Available
-  both as a native CLI (`akatsuki`) and as an MCP server (`akatsuki_*` tools).
+  Bidirectional Knowledge Secretariat gateway to the operator's Phoenix second brain.
+  Use when entering any repository to orient on systems architecture, live services, port mappings,
+  project stacks, and cluster policies, or to deposit architectural decisions, production deployments,
+  and telegraphic work logs. Native CLI and MCP stdio.
 ---
 
-# `akatsuki` // Bidirectional Second Brain Gateway
+# AKATSUKI(1) — Knowledge Secretariat & Second Brain Gateway
 
-> *"The Phoenix rises from the ashes of legacy complexity: clean markdown, strict types, zero-jank craft, and autonomous agent symbiosis."*
-
-The **`akatsuki`** skill provides **two-way symbiosis** between autonomous coding agents across all repositories and the operator's central knowledge base at:
-
-```
-Vault Root: ~/configs/knowledge-base/akatsuki (or $AKATSUKI_VAULT)
-CLI Binary: ~/.local/bin/akatsuki (on PATH)
-MCP Server: akatsuki mcp (stdio JSON-RPC 2.0)
-```
-
----
-
-## 🧭 Inbound: Querying & Reading from the Second Brain
-
-When an agent enters or works in ANY project (e.g. `configs/selfhosted`, `3d-filament-finder`, `hepyeni`, `bountools`, `mimori`), use `akatsuki` to instantly understand cluster state, architecture, and constraints:
-
-### 1. Fast CLI Commands
-
-```bash
-# Okapi BM25 search with morphological suffix expansion, adaptive boolean query, and snippet extraction
-akatsuki search "docker swarm placement"
-akatsuki search "postgres database" --domain "40-Systems"
-
-# Extract machine-actionable boundary contract without human narrative bloat (70-90% token reduction)
-akatsuki contract 20-Projects/bountools
-akatsuki contract Dokploy-Traefik
-
-# Read note with strict token budgeting (prevents context window exhaustion)
-akatsuki read Deployment-Playbook --budget 200
-akatsuki read Services-Catalog --section "Live Production Services"
-
-# O(1) exact property getter (zero-hallucination structured lookup)
-akatsuki get services.bountools.ports
-akatsuki get entities.filament.repo
-akatsuki get systems.TanriZarAtmaz-Host.status
-
-# Execute read-only SQL against SQLite WAL index tables (entities, services, relations, invariants)
-akatsuki query "SELECT name, ports, host FROM services WHERE host = 'TanriZarAtmaz'"
-
-# Calculate architectural blast radius before changing infrastructure or routes
-akatsuki blast Dokploy-Traefik
-akatsuki blast TanriZarAtmaz
-
-# Execute living invariant assertion blocks (```bash:verify) across notes
-akatsuki test
-akatsuki test TanriZarAtmaz-Host
-
-# Surgically update a frontmatter key-value property without full-file rewrite
-akatsuki set 20-Projects/filament --key status --value maintenance
-
-# Validate that all notes conform to strict machine schemas
-akatsuki lint
-
-# Append content directly under a section without full-file rewrite
-akatsuki append 20-Projects/my-project --heading "Invariants" --content "- Service timeouts capped at 3s"
-
-# Instant live container & port allocation dump (JSON)
-akatsuki services
-
-# Active project inventory and tech stacks (JSON)
-akatsuki projects
-
-# View today's operational log & active horizons
-akatsuki daily
+```text
+KERNEL:
+  TARGET: Autonomous Agent Knowledge Secretariat & Cross-Project Topology
+  BINARY: ~/.local/bin/akatsuki (CLI) | akatsuki mcp (JSON-RPC stdio)
+  VAULT:  ~/configs/knowledge-base/akatsuki (or $AKATSUKI_VAULT)
+  INVARIANTS:
+    1_TELEMETRY:  Telegraphic Caveman (<140 chars; No articles/copulas/pronouns)
+    2_PURITY:     Pure Markdown & Strict YAML — zero Obsidian plugin lock-in
+    3_BUDGETING:  Token-Bounded Reads (contract > read --budget > full read)
+    4_INTEGRITY:  Zero Orphan Notes — wikilink resolution verify == exit 0
 ```
 
-### 2. Available MCP Tools (If MCP is enabled)
+## SYNOPSIS
 
-- `akatsuki_search(query: str, domain?: str, limit?: int)`: Okapi BM25 search over SQLite FTS5 (`unicode61` tokenizer) with morphological suffix expansion and context snippet excerpts.
-- `akatsuki_read(note: str, section?: str, budget?: int)`: Fetches note content or slices a section, with optional token budgeting (`budget`).
-- `akatsuki_contract(note: str)`: Slices pure machine-actionable boundary contract (ports, network, relations, invariants, verifications).
-- `akatsuki_get(key: str)`: Sub-millisecond O(1) exact property getter (e.g. `services.bountools.ports`, `entities.filament.repo`).
-- `akatsuki_query(sql: str)`: Read-only SQL query against index tables (`entities`, `services`, `relations`, `invariants`, `verifications`).
-- `akatsuki_blast(target: str)`: Calculates upstream dependents, downstream dependencies, and boundary sinks for a target.
-- `akatsuki_test(note?: str)`: Executes machine-verifiable assertion blocks (`bash:verify`) against the host.
-- `akatsuki_set(note: str, key: str, value: str)`: Surgically updates frontmatter key-values under kernel lock.
-- `akatsuki_lint()`: Validates all notes against strict type schemas.
-- `akatsuki_append_section(note: str, heading: str, content: str)`: Atomically injects markdown content under a heading.
-- `akatsuki_write_note(path: str, content: str, overwrite?: bool)`: Writes/updates a note with auto-healed YAML frontmatter.
-- `akatsuki_services()`: Retrieves active Docker Swarm containers, replicas, ports, and roles as structured JSON.
-- `akatsuki_projects()`: Dumps registered software projects and stacks as structured JSON.
-- `akatsuki_daily(date?: str)`: Retrieves today's active focus horizon and recent entries.
-- `akatsuki_record_log(project: str, summary: str, device?: str)`: Appends timestamped log entry tagged with device into today's daily note under kernel lock.
-- `akatsuki_verify()`: Verifies wikilink integrity across the entire vault.
-- `akatsuki_list_notes(domain?: str)`: Lists notes and summaries filtered by domain.
+```shell
+akatsuki search   <query> [--domain <domain>] [--limit <N>] [--json]
+akatsuki contract <note> [--json]
+akatsuki read     <note> [--section <sec>] [--budget <N>] [--json]
+akatsuki get      <key> [--json]
+akatsuki query    <sql> [--json]
+akatsuki blast    <target> [--json]
+akatsuki test     [<note>] [--json]
+akatsuki set      <note> --key <key> --value <val> [--json]
+akatsuki append   <note> --heading <heading> --content <content> [--json]
+akatsuki write    <path> --content <content> [--overwrite] [--json]
+akatsuki services [--json]
+akatsuki projects [--json]
+akatsuki daily    [--date <YYYY-MM-DD>] [--json]
+akatsuki log      --project <proj> --summary <sum> [--device <dev>]
+akatsuki lint     [--json]
+akatsuki verify   [--json]
+akatsuki mcp      [--vault <dir>]
+```
 
 ---
 
-## ⚡ Outbound: Depositing & Recording into the Second Brain
+## AGENT LIFECYCLE PIPELINE
 
-Whenever you complete work, alter system contracts, or ship a deployment, file it directly back into `akatsuki`:
-
-### 1. Work Log Capture (Telegraphic Caveman Syntax)
-
-```bash
-akatsuki log --project "<project-name>" --summary "<verb> <target> -> <delta>; <evidence>" [--device "<device>"]
+```text
+ORIENT -> CONTRACT -> BLAST -> MUTATE -> VERIFY -> LOG
 ```
 
-*Enforces telegraphic caveman syntax (<140 chars): omit articles, copulas, and filler. Automatically resolves host machine if `--device` is omitted. Appends `- **HH:MM** [device]: [project] <summary>` to today's `01-Daily/YYYY-MM-DD.md`.*
-
-Mutations made via `write`, `set`, and `append` automatically update `updated` and `updated_by` frontmatter attributes and record a mutation audit entry into today's daily log.
-
-### 2. Updating Project or System Specs
-
-- When an agent updates a project's architecture, routes, or database schemas:
-  Edit `~/configs/knowledge-base/akatsuki/20-Projects/<project-name>.md`.
-- When an agent updates infrastructure (Docker Swarm, EPYC tuning, runner nodes):
-  Edit `~/configs/knowledge-base/akatsuki/40-Systems/<system-name>.md`.
-
-### 3. Onboarding a New Service
-
-1. Copy `~/configs/knowledge-base/akatsuki/_templates/project-template.md` to `20-Projects/<new-project>.md`.
-2. Populate frontmatter, architecture, invariants, and roadmap.
-3. Register wikilink in `20-Projects/Projects-MOC.md` and `INDEX.md`.
+1. **TURN-0 (Inbound Orientation)**:
+   - Live Topology & Ports: `akatsuki services` | MCP: `akatsuki_services()`
+   - Project Stacks: `akatsuki projects` | MCP: `akatsuki_projects()`
+   - Knowledge Search: `akatsuki search "<topic>"` | MCP: `akatsuki_search(query="<topic>")`
+2. **CONTRACT (Token-Dense Slicing)**:
+   - `akatsuki contract <note>` | MCP: `akatsuki_contract(note="<note>")`
+   - Slices pure machine-actionable boundaries (ports, network, relations, invariants, verifications), eliminating 70–90% narrative token bloat.
+3. **BLAST (Pre-Mutation Safety Gate)**:
+   - `akatsuki blast <target>` | MCP: `akatsuki_blast(target="<target>")`
+   - Maps upstream dependents, downstream dependencies, and boundary sinks across infrastructure and services before applying changes.
+4. **MUTATE (Structured Updates)**:
+   - Property update: `akatsuki set <note> --key K --value V` | MCP: `akatsuki_set(note, key, value)`
+   - Section append: `akatsuki append <note> --heading H --content C` | MCP: `akatsuki_append_section(note, heading, content)`
+   - Note creation: `akatsuki write <path> --content C` | MCP: `akatsuki_write_note(path, content)`
+5. **VERIFY (Integrity Gate)**:
+   - `akatsuki lint ∧ akatsuki verify == exit 0`
+   - Enforces strict schema conformance, valid frontmatter, and bidirectional wikilink closure across the entire vault.
+6. **LOG (Outbound Telemetry)**:
+   - `akatsuki log --project <proj> --summary "<verb> <target> -> <delta>; <evidence>"`
+   - Enforces telegraphic caveman syntax (<140 chars). Injects timestamped entry into today's daily log under kernel lock.
 
 ---
 
-## 🏛️ Secretariat Guardrails & Rules Enforced
+## SUBCOMMAND SPECIFICATIONS
 
-1. **Pure Markdown & Zero Plugin Lock-In**:
-   - **MUST NOT emit Obsidian plugin codeblocks**: No ````tasks````, no ````dataviewjs````, no Templater `<% ... %>`.
-   - All tasks must be standard markdown checkboxes (`- [ ]`, `- [x]`).
-2. **Valid YAML Frontmatter**:
-   - Every file must have metadata: `title`, `date`, `type`, `tags`, `summary`.
-3. **Wikilinks & Zero Orphans**:
-   - Use standard Obsidian wikilinks: `[[Domain/NoteName|Display Text]]` or `[[NoteName]]`.
-   - Every note MUST be linked to its parent MOC and/or `INDEX.md`.
-4. **Facts Over Prose**:
-   - Cite exact file paths, commit hashes, machine names (`TanriZarAtmaz`, `OCocuk`, `HakimBey`), port numbers, and exit codes.
+### `search` — Okapi BM25 Knowledge Search
+```shell
+akatsuki search <query> [--domain <domain>] [--limit <N>] [--json]
+```
+- Full-text search over SQLite FTS5 index with `unicode61` tokenizer and morphological suffix expansion.
+- `--domain <dir>`: Restrict search (e.g. `20-Projects`, `40-Systems`).
+- `--limit <N>`: Truncate matches to fit token budgets (default: 10).
+
+### `contract` — Boundary Contract Slicing
+```shell
+akatsuki contract <note> [--json]
+```
+- Extracts machine-actionable interfaces: declared ports, network bindings, dependencies, invariants, and live verification blocks.
+- Primary orientation primitive: use instead of `read` to save 70–90% context tokens.
+
+### `read` — Token-Bounded Note Reading
+```shell
+akatsuki read <note> [--section <sec>] [--budget <N>] [--json]
+```
+- Fetches full note content or surgically slices a specific markdown section.
+- `--budget <N>`: Truncates content cleanly to fit within token bounds.
+
+### `get` & `query` — Structured Data Extraction
+```shell
+akatsuki get <key> [--json]    # Sub-millisecond O(1) exact property getter
+akatsuki query <sql> [--json]  # Read-only SQL query against SQLite index
+```
+- `get`: Fast dot-path access (e.g. `services.bountools.ports`, `entities.filament.repo`, `systems.TanriZarAtmaz-Host.status`).
+- `query`: Direct SQL querying against index tables (`entities`, `services`, `relations`, `invariants`, `verifications`).
+
+### `blast` — Dependency & Ripple Analysis
+```shell
+akatsuki blast <target> [--json]
+```
+- Calculates upstream dependents, downstream dependencies, and boundary sinks for services, containers, or host nodes.
+
+### `test` — Invariant Verification Runner
+```shell
+akatsuki test [<note>] [--json]
+```
+- Extracts and executes embedded executable invariant blocks (` ```bash:verify `) against live infrastructure.
+
+### `set`, `append` & `write` — Structured Mutations
+```shell
+akatsuki set <note> --key <key> --value <val> [--json]
+akatsuki append <note> --heading <heading> --content <content> [--json]
+akatsuki write <path> --content <content> [--overwrite] [--json]
+```
+- `set`: Surgically modifies frontmatter keys without rewriting file bodies.
+- `append`: Atomically injects markdown bullets or text under a specific heading.
+- `write`: Creates or updates a note with auto-healed YAML frontmatter.
+- All mutations automatically update `updated` timestamps and log audit trails into today's daily log.
+
+### `services` & `projects` — Live Topology Dumps
+```shell
+akatsuki services [--json]  # Active Docker Swarm containers, replicas, ports, and roles
+akatsuki projects [--json]  # Registered software projects, repositories, and tech stacks
+```
+
+### `daily` & `log` — Operational Telemetry Ledger
+```shell
+akatsuki daily [--date <YYYY-MM-DD>] [--json]
+akatsuki log --project <proj> --summary <sum> [--device <dev>]
+```
+- `daily`: Returns today's active focus horizon and recent work entries.
+- `log`: Appends telegraphic work log (`- **HH:MM** [device]: [project] <summary>`). Automatically detects local hostname if `--device` is omitted.
+
+### `lint` & `verify` — Vault Health Gates
+```shell
+akatsuki lint [--json]    # Validates note frontmatter and schemas
+akatsuki verify [--json]  # Asserts zero broken wikilinks across entire vault
+```
 
 ---
 
-## 🧪 Verification Gate
+## MCP SERVER & TOOL DUALITY
 
-Before concluding any session that modified `akatsuki`:
+Run stdio daemon: `akatsuki mcp [--vault <dir>]`
 
-```bash
-akatsuki verify
+| MCP Tool | CLI Equivalent | Key Arguments |
+| :--- | :--- | :--- |
+| `akatsuki_search` | `akatsuki search` | `query`, `domain`, `limit` |
+| `akatsuki_contract` | `akatsuki contract` | `note` |
+| `akatsuki_read` | `akatsuki read` | `note`, `section`, `budget` |
+| `akatsuki_get` | `akatsuki get` | `key` |
+| `akatsuki_query` | `akatsuki query` | `sql` |
+| `akatsuki_blast` | `akatsuki blast` | `target` |
+| `akatsuki_test` | `akatsuki test` | `note` |
+| `akatsuki_set` | `akatsuki set` | `note`, `key`, `value` |
+| `akatsuki_append_section` | `akatsuki append` | `note`, `heading`, `content` |
+| `akatsuki_write_note` | `akatsuki write` | `path`, `content`, `overwrite` |
+| `akatsuki_services` | `akatsuki services`| *(none)* |
+| `akatsuki_projects` | `akatsuki projects`| *(none)* |
+| `akatsuki_daily` | `akatsuki daily` | `date` |
+| `akatsuki_record_log` | `akatsuki log` | `project`, `summary`, `device` |
+| `akatsuki_lint` | `akatsuki lint` | *(none)* |
+| `akatsuki_verify` | `akatsuki verify` | *(none)* |
+| `akatsuki_list_notes` | *(internal)* | `domain` |
+
+---
+
+## TELEMETRY & VAULT CONTRACTS
+
+### 1. Telegraphic Log Format Contract
+Work log summaries MUST follow this exact schema:
+```text
+[proj] <verb> <target> -> <delta>; <evidence/exit>
 ```
+* **Rules**: Strictly $<140$ chars. Omit articles (`a`, `an`, `the`), copulas (`is`, `was`), and pronouns (`I`, `we`).
+* **Example**: `[dokploy] update traefik-cert -> renew wildcard SAN; exit 0`
+* **Example**: `[filament] patch scraper -> fix selector drift on product grid; smoke test pass`
 
-Exit code MUST be 0 (`PASSED: All wikilinks in akatsuki resolve cleanly.`).
+### 2. Obsidian Compatibility & Zero-Plugin Invariant
+- **Banned Blocks**: NEVER emit ````tasks````, ````dataviewjs````, or `<% templater %>` tags.
+- **Checkboxes**: Use standard markdown checkboxes only (`- [ ]`, `- [x]`).
+- **Wikilinks**: Always link notes with standard syntax: `[[TargetNote]]` or `[[TargetNote|Alias]]`. Zero orphan notes permitted.
+
+---
+
+## EXIT CODES
+
+- `0`: Success / Verification Passed.
+- `1`: Unresolved wikilink, schema lint error, failed invariant assertion, or note not found.
+- `2`: Invalid CLI arguments.
