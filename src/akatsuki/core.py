@@ -14,7 +14,13 @@ Pure Agent Memory Substrate:
 import argparse
 import ast
 import datetime
-import fcntl
+
+try:
+    import fcntl
+
+    HAVE_FCNTL = True
+except ImportError:
+    HAVE_FCNTL = False
 import json
 import os
 import re
@@ -26,6 +32,7 @@ from pathlib import Path
 
 try:
     import yaml
+
     HAVE_PYYAML = True
 except ImportError:
     HAVE_PYYAML = False
@@ -33,11 +40,31 @@ except ImportError:
 
 def get_machine_id() -> str:
     """Return resolved hostname or environment override identifier."""
-    return (
-        os.environ.get("AKATSUKI_HOST")
-        or os.environ.get("HOSTNAME")
-        or socket.gethostname().split(".")[0]
+    return os.environ.get("AKATSUKI_HOST") or os.environ.get("HOSTNAME") or socket.gethostname().split(".")[0]
+
+
+def _yaml_format_scalar(val: object) -> str:
+    """Safely format a scalar value for YAML without unquoted colon defects."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, (int, float)):
+        return str(val)
+    s = str(val)
+    if not s:
+        return '""'
+    needs_quotes = (
+        ": " in s
+        or s.endswith(":")
+        or s.startswith(("- ", "#", "[", "{", "*", "&", "!", "|", ">", "%", "@", "`"))
+        or any(c in s for c in ('"', "'", "\n"))
+        or s.lower() in ("true", "false", "yes", "no", "null", "none")
     )
+    if needs_quotes:
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return s
 
 
 def dump_frontmatter(fm: dict, body: str) -> str:
@@ -50,18 +77,38 @@ def dump_frontmatter(fm: dict, body: str) -> str:
             if isinstance(v, list):
                 new_fm_lines.append(f"{k}:")
                 for item in v:
-                    new_fm_lines.append(f"  - {item}")
+                    new_fm_lines.append(f"  - {_yaml_format_scalar(item)}")
             elif isinstance(v, dict):
-                new_fm_lines.append(f"{k}: {json.dumps(v, default=str)}")
+                new_fm_lines.append(f"{k}:")
+                for sub_k, sub_v in v.items():
+                    if isinstance(sub_v, list):
+                        new_fm_lines.append(f"  {sub_k}:")
+                        for sub_item in sub_v:
+                            new_fm_lines.append(f"    - {_yaml_format_scalar(sub_item)}")
+                    elif isinstance(sub_v, dict):
+                        new_fm_lines.append(f"  {sub_k}: {json.dumps(sub_v, default=str)}")
+                    else:
+                        new_fm_lines.append(f"  {sub_k}: {_yaml_format_scalar(sub_v)}")
             else:
-                new_fm_lines.append(f"{k}: {v}")
+                new_fm_lines.append(f"{k}: {_yaml_format_scalar(v)}")
         new_fm_str = "\n".join(new_fm_lines)
     return f"---\n{new_fm_str}\n---\n" + body.lstrip()
 
 
 RAW_EXTS = {
-    ".yml", ".yaml", ".json", ".toml", ".sh", ".py", ".conf",
-    ".sql", ".txt", ".service", ".timer", ".ini", ".cfg"
+    ".yml",
+    ".yaml",
+    ".json",
+    ".toml",
+    ".sh",
+    ".py",
+    ".conf",
+    ".sql",
+    ".txt",
+    ".service",
+    ".timer",
+    ".ini",
+    ".cfg",
 }
 
 
@@ -71,16 +118,17 @@ def is_raw_path(rel_path: str) -> bool:
         return True
     return any(name.endswith(ext) for ext in RAW_EXTS)
 
+
 CURRENT_VAULT_OVERRIDE: Path | None = None
 
 
 def resolve_vault_path(explicit_path: str | Path | None = None) -> Path:
     """Multi-tiered vault resolution:
     1. Explicitly passed argument (--vault / param)
-    2. CURRENT_VAULT_OVERRIDE (set via CLI --vault)
+    2. CURRENT_VAULT_OVERRIDE (set via CLI --vault or tests)
     3. AKATSUKI_VAULT environment variable
     4. Upward directory walk from current working directory
-    5. Well-known fallback paths (~/configs/knowledge-base/akatsuki, ~/.akatsuki, ~/akatsuki)
+    5. Well-known fallback paths (~/.config/akatsuki, ~/.akatsuki, ~/akatsuki)
     6. Current working directory fallback
     """
     if explicit_path:
@@ -121,7 +169,7 @@ def resolve_vault_path(explicit_path: str | Path | None = None) -> Path:
             if (parent / "akatsuki" / "40-Systems").is_dir() and (parent / "akatsuki" / "20-Projects").is_dir():
                 return (parent / "akatsuki").resolve()
             if (parent / ".akatsuki").is_dir() or (
-                (parent / "INDEX.md").is_file() and (parent / "AGENTS.md").is_file() and not (parent / "ejdertasimsi").is_dir()
+                (parent / "INDEX.md").is_file() and (parent / "AGENTS.md").is_file()
             ):
                 return parent
             if (parent / "40-Systems").is_dir() and (parent / "20-Projects").is_dir():
@@ -132,9 +180,7 @@ def resolve_vault_path(explicit_path: str | Path | None = None) -> Path:
     # Well-known system locations
     home = Path.home()
     for candidate in [
-        home / "Projects" / "fusuyfusuy" / "knowledge-base" / "akatsuki",
-        home / "projects" / "fusuyfusuy" / "knowledge-base" / "akatsuki",
-        home / "configs" / "knowledge-base" / "akatsuki",
+        home / ".config" / "akatsuki",
         home / ".akatsuki",
         home / "akatsuki",
     ]:
@@ -161,13 +207,16 @@ def get_vault() -> Path:
 
 
 def contained_path(vault: Path, rel_path: str) -> Path | None:
-    """Resolve rel_path strictly inside the vault. Returns None on escape."""
-    candidate = Path(rel_path.strip())
+    """Resolve rel_path strictly inside the vault. Returns None on escape or root."""
+    clean = rel_path.strip()
+    if not clean or clean in (".", "./"):
+        return None
+    candidate = Path(clean)
     if candidate.is_absolute():
         return None
     vault = vault.resolve()
     target = (vault / candidate).resolve()
-    if target != vault and vault not in target.parents:
+    if target == vault or vault not in target.parents:
         return None
     return target
 
@@ -193,33 +242,64 @@ def parse_frontmatter(content: str) -> tuple[dict[str, object], str]:
             pass
 
     metadata: dict[str, object] = {}
-    list_key: str | None = None
+    current_top_key: str | None = None
+    current_sub_key: str | None = None
+
     for line in fm_raw.splitlines():
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
         stripped = line.strip()
-        if stripped.startswith("- "):
-            if list_key:
-                metadata.setdefault(list_key, [])
-                assert isinstance(metadata[list_key], list)
-                metadata[list_key].append(stripped[2:].strip().strip('"').strip("'"))
-            continue
-        if ":" not in line or line != line.lstrip():
-            list_key = None
-            continue
-        k, v = line.split(":", 1)
-        key, val = k.strip(), v.strip()
-        if key == "tags" and val.startswith("[") and val.endswith("]"):
-            metadata[key] = [
-                x.strip().strip('"').strip("'")
-                for x in val[1:-1].split(",")
-                if x.strip()
-            ]
-            list_key = None
-        elif not val:
-            metadata[key] = []
-            list_key = key
-        else:
-            metadata[key] = val.strip('"').strip("'")
-            list_key = None
+
+        if indent == 0:
+            if ":" in stripped:
+                k, v = stripped.split(":", 1)
+                k, v = k.strip(), v.strip()
+                current_top_key = k
+                current_sub_key = None
+                if not v:
+                    metadata[k] = None
+                elif v.startswith("[") and v.endswith("]"):
+                    metadata[k] = [x.strip().strip('"').strip("'") for x in v[1:-1].split(",") if x.strip()]
+                else:
+                    metadata[k] = v.strip('"').strip("'")
+        elif indent == 2:
+            if stripped.startswith("- "):
+                val = stripped[2:].strip().strip('"').strip("'")
+                if current_top_key:
+                    if metadata.get(current_top_key) is None or not isinstance(metadata.get(current_top_key), list):
+                        metadata[current_top_key] = []
+                    assert isinstance(metadata[current_top_key], list)
+                    metadata[current_top_key].append(val)
+            elif ":" in stripped:
+                sub_k, sub_v = stripped.split(":", 1)
+                sub_k, sub_v = sub_k.strip(), sub_v.strip()
+                if current_top_key:
+                    if metadata.get(current_top_key) is None or not isinstance(metadata.get(current_top_key), dict):
+                        metadata[current_top_key] = {}
+                    current_sub_key = sub_k
+                    assert isinstance(metadata[current_top_key], dict)
+                    if not sub_v:
+                        metadata[current_top_key][sub_k] = []
+                    elif sub_v.startswith("[") and sub_v.endswith("]"):
+                        metadata[current_top_key][sub_k] = [
+                            x.strip().strip('"').strip("'") for x in sub_v[1:-1].split(",") if x.strip()
+                        ]
+                    else:
+                        metadata[current_top_key][sub_k] = sub_v.strip('"').strip("'")
+        elif indent >= 4:
+            if stripped.startswith("- "):
+                val = stripped[2:].strip().strip('"').strip("'")
+                if current_top_key and current_sub_key:
+                    top_dict = metadata.get(current_top_key)
+                    if isinstance(top_dict, dict):
+                        if not isinstance(top_dict.get(current_sub_key), list):
+                            top_dict[current_sub_key] = []
+                        top_dict[current_sub_key].append(val)
+
+    for k, v in metadata.items():
+        if v is None:
+            metadata[k] = []
 
     return metadata, body
 
@@ -242,26 +322,22 @@ def validate_frontmatter_yaml(fm_raw: str) -> list[str]:
         if stripped.startswith("- "):
             val = stripped[2:].strip()
             if ": " in val and not (
-                (val.startswith('"') and val.endswith('"'))
-                or (val.startswith("'") and val.endswith("'"))
+                (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'"))
             ):
                 errors.append(f"Line {idx}: Unquoted colon in list item: {stripped}")
             continue
         if ":" not in stripped:
             errors.append(f"Line {idx}: Missing key-value colon delimiter: {stripped}")
             continue
-        k, v = stripped.split(":", 1)
+        _k, v = stripped.split(":", 1)
         val = v.strip()
         if not val:
             continue
         if ": " in val and not (
-            (val.startswith('"') and val.endswith('"'))
-            or (val.startswith("'") and val.endswith("'"))
+            (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'"))
         ):
             errors.append(f"Line {idx}: Unquoted colon in scalar value: {stripped}")
-        elif (val.startswith('"') and not val.endswith('"')) or (
-            val.startswith("'") and not val.endswith("'")
-        ):
+        elif (val.startswith('"') and not val.endswith('"')) or (val.startswith("'") and not val.endswith("'")):
             errors.append(f"Line {idx}: Unterminated quote: {stripped}")
     return errors
 
@@ -316,9 +392,7 @@ def get_fts_db(vault: Path) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL;")
 
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, val TEXT);"
-    )
+    con.execute("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, val TEXT);")
     cur = con.execute("SELECT val FROM schema_meta WHERE key = 'version';")
     row = cur.fetchone()
     current_ver = row["val"] if row else None
@@ -332,9 +406,7 @@ def get_fts_db(vault: Path) -> sqlite3.Connection:
         con.execute("DROP TABLE IF EXISTS invariants;")
         con.execute("DROP TABLE IF EXISTS verifications;")
 
-        con.execute(
-            "CREATE TABLE file_meta (rel_path TEXT PRIMARY KEY, mtime REAL NOT NULL, size INTEGER NOT NULL);"
-        )
+        con.execute("CREATE TABLE file_meta (rel_path TEXT PRIMARY KEY, mtime REAL NOT NULL, size INTEGER NOT NULL);")
         con.execute("""
             CREATE VIRTUAL TABLE notes_fts USING fts5(
                 rel_path UNINDEXED,
@@ -401,9 +473,7 @@ def get_fts_db(vault: Path) -> sqlite3.Connection:
                 command TEXT NOT NULL
             );
         """)
-        con.execute(
-            "INSERT OR REPLACE INTO schema_meta(key, val) VALUES ('version', '5');"
-        )
+        con.execute("INSERT OR REPLACE INTO schema_meta(key, val) VALUES ('version', '5');")
         con.commit()
 
     return con
@@ -485,7 +555,21 @@ def sync_fts_index(vault: Path, con: sqlite3.Connection) -> None:
         con.execute(
             """INSERT INTO entities(rel_path, stem, domain, title, type, status, repo, host, network, summary, updated, updated_by, metadata_json)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (rel, f.stem, domain, title, note_type, status, repo, host, network, summary, updated, updated_by, json.dumps(fm, default=str)),
+            (
+                rel,
+                f.stem,
+                domain,
+                title,
+                note_type,
+                status,
+                repo,
+                host,
+                network,
+                summary,
+                updated,
+                updated_by,
+                json.dumps(fm, default=str),
+            ),
         )
 
         # 3. Index Relations
@@ -541,6 +625,7 @@ def sync_fts_index(vault: Path, con: sqlite3.Connection) -> None:
                 )
 
         # 6. Index Services from Services-Catalog.md
+        default_host = get_machine_id()
         if rel == "40-Systems/Services-Catalog.md":
             for line in body.splitlines():
                 if not line.strip().startswith("|") or ":---" in line or "Service / Stack" in line:
@@ -555,14 +640,27 @@ def sync_fts_index(vault: Path, con: sqlite3.Connection) -> None:
                     con.execute(
                         """INSERT OR REPLACE INTO services(name, container_prefix, ports, replicas, role, host, network, rel_path)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (svc_name, container, ports, replicas, role, "TanriZarAtmaz", "dokploy-network", rel),
+                        (svc_name, container, ports, replicas, role, default_host, "default", rel),
                     )
         elif fm.get("ports") or note_type == "service":
-            ports_val = json.dumps(fm.get("ports"), default=str) if isinstance(fm.get("ports"), list) else str(fm.get("ports") or "")
+            ports_val = (
+                json.dumps(fm.get("ports"), default=str)
+                if isinstance(fm.get("ports"), list)
+                else str(fm.get("ports") or "")
+            )
             con.execute(
                 """INSERT OR REPLACE INTO services(name, container_prefix, ports, replicas, role, host, network, rel_path)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (f.stem, str(fm.get("container") or f"{f.stem}_*"), ports_val, "1", summary, host or "TanriZarAtmaz", network or "dokploy-network", rel),
+                (
+                    f.stem,
+                    str(fm.get("container") or f"{f.stem}_*"),
+                    ports_val,
+                    "1",
+                    summary,
+                    host or default_host,
+                    network or "default",
+                    rel,
+                ),
             )
 
     con.commit()
@@ -597,9 +695,13 @@ def build_fts_clause(words: list[str], op: str = "AND") -> str:
 
 
 def search_vault(
-    vault: Path, query: str, domain: str | None = None, limit: int | str = 10
+    vault: Path,
+    query: str,
+    domain: str | None = None,
+    limit: int | str = 10,
+    with_graph: bool = False,
 ) -> list[dict]:
-    """Search notes in vault using Okapi BM25 ranking over SQLite FTS5 index."""
+    """Search notes in vault using Okapi BM25 ranking over SQLite FTS5 index, optionally augmenting with 1-hop graph relations."""
     clean_query = query.strip()
     if not clean_query:
         return []
@@ -617,11 +719,7 @@ def search_vault(
     if not words:
         return []
 
-    if (
-        clean_query.startswith('"')
-        and clean_query.endswith('"')
-        and len(clean_query) > 2
-    ):
+    if clean_query.startswith('"') and clean_query.endswith('"') and len(clean_query) > 2:
         phrase = clean_query.strip('"').replace('"', '""')
         queries_to_try = [f'"{phrase}"']
     else:
@@ -656,18 +754,43 @@ def search_vault(
     results = []
     for r in rows:
         snip = r["snippet"].strip() if r["snippet"] else ""
-        results.append(
-            {
-                "rel_path": r["rel_path"],
-                "stem": r["stem"],
-                "domain": r["domain"],
-                "title": r["title"],
-                "summary": r["summary"],
-                "score": round(abs(r["score"]), 3),
-                "snippet": snip,
-                "matches": [(1, snip)] if snip else [],
+        item = {
+            "rel_path": r["rel_path"],
+            "stem": r["stem"],
+            "domain": r["domain"],
+            "title": r["title"],
+            "summary": r["summary"],
+            "score": round(abs(r["score"]), 3),
+            "snippet": snip,
+            "matches": [(1, snip)] if snip else [],
+        }
+        if with_graph:
+            s_stem = r["stem"]
+            cur_up = con.execute(
+                "SELECT source_rel, relation_type FROM relations WHERE target_stem = ? LIMIT 5",
+                (s_stem,),
+            )
+            up_rows = [f"{row['source_rel']} ({row['relation_type']})" for row in cur_up.fetchall()]
+
+            cur_down = con.execute(
+                "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ? LIMIT 5",
+                (f"{s_stem}.md", f"%/{s_stem}.md", f"%/{s_stem}/%"),
+            )
+            down_rows = [f"{row['target_stem']} ({row['relation_type']})" for row in cur_down.fetchall()]
+
+            cur_svcs = con.execute(
+                "SELECT name, ports, host, network FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ? LIMIT 3",
+                (s_stem, s_stem, f"%/{s_stem}.md"),
+            )
+            svc_rows = [f"{s['name']}" + (f" (:{s['ports']})" if s["ports"] else "") for s in cur_svcs.fetchall()]
+
+            item["graph"] = {
+                "upstream": up_rows,
+                "downstream": down_rows,
+                "services": svc_rows,
             }
-        )
+
+        results.append(item)
 
     return results
 
@@ -683,12 +806,22 @@ def extract_headings(content: str) -> list[tuple[int, str, int]]:
     lines = content.splitlines()
     in_frontmatter = content.startswith("---")
     fm_dashes = 0
+    in_code_fence = False
+
     for idx, line in enumerate(lines, 1):
+        stripped = line.strip()
         if in_frontmatter:
-            if line.strip() == "---":
+            if stripped == "---":
                 fm_dashes += 1
                 if fm_dashes == 2:
                     in_frontmatter = False
+            continue
+
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_fence = not in_code_fence
+            continue
+
+        if in_code_fence:
             continue
 
         m = re.match(r"^(#{1,6})\s+(.+)$", line)
@@ -715,13 +848,13 @@ def slice_markdown_section(content: str, target: str) -> tuple[str | None, list[
     target_clean = normalize_heading(target)
 
     matched_idx = -1
-    for i, (lvl, title, line_no) in enumerate(headings):
+    for i, (_lvl, title, _line_no) in enumerate(headings):
         if target_clean == normalize_heading(title) or target.lower() == title.lower():
             matched_idx = i
             break
 
     if matched_idx == -1:
-        for i, (lvl, title, line_no) in enumerate(headings):
+        for i, (_lvl, title, _line_no) in enumerate(headings):
             if target_clean in normalize_heading(title) or target.lower() in title.lower():
                 matched_idx = i
                 break
@@ -729,11 +862,11 @@ def slice_markdown_section(content: str, target: str) -> tuple[str | None, list[
     if matched_idx == -1:
         return None, toc_lines
 
-    match_lvl, match_title, match_line_no = headings[matched_idx]
+    match_lvl, _match_title, match_line_no = headings[matched_idx]
     start_line_idx = match_line_no - 1
 
     end_line_idx = len(lines)
-    for next_lvl, next_title, next_line_no in headings[matched_idx + 1 :]:
+    for next_lvl, _next_title, next_line_no in headings[matched_idx + 1 :]:
         if next_lvl <= match_lvl:
             end_line_idx = next_line_no - 1
             break
@@ -797,11 +930,7 @@ def extract_note_contract(vault: Path, note_query: str) -> tuple[str, bool]:
         if not inv_slice:
             inv_slice, _ = slice_markdown_section(content, "Non-Negotiable Invariants")
         if inv_slice:
-            invariants = [
-                ln.strip()[2:].strip()
-                for ln in inv_slice.splitlines()
-                if ln.strip().startswith("- ")
-            ]
+            invariants = [ln.strip()[2:].strip() for ln in inv_slice.splitlines() if ln.strip().startswith("- ")]
 
     verif_blocks = [b.split("```")[0].strip() for b in body.split("```bash:verify")[1:]]
     clean_verifs = [v for v in verif_blocks if v]
@@ -901,22 +1030,30 @@ def execute_sql_query(vault: Path, sql: str) -> tuple[str, bool]:
     """Execute a read-only SQL query against the akatsuki index database."""
     clean_sql = sql.strip()
     norm = clean_sql.upper()
-    if not (norm.startswith("SELECT") or norm.startswith("WITH") or norm.startswith("EXPLAIN") or norm.startswith("PRAGMA")):
+    if not (norm.startswith("SELECT") or norm.startswith("WITH") or norm.startswith("EXPLAIN")):
         return "Error: Only read-only queries (SELECT, WITH, EXPLAIN) are permitted.", True
 
     for forbidden in ("INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "DETACH"):
         if re.search(rf"\b{forbidden}\b", norm):
             return f"Error: Mutating statement '{forbidden}' is forbidden.", True
 
-    con = get_fts_db(vault)
-    sync_fts_index(vault, con)
+    cache_dir = vault / ".akatsuki"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    db_path = cache_dir / "index.db"
+
+    con_w = get_fts_db(vault)
+    sync_fts_index(vault, con_w)
+    con_w.close()
 
     try:
-        cur = con.execute(clean_sql)
+        con_ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10.0)
+        con_ro.row_factory = sqlite3.Row
+        cur = con_ro.execute(clean_sql)
         rows = [dict(r) for r in cur.fetchall()]
+        con_ro.close()
         return json.dumps(rows, indent=2, default=str), False
     except Exception as e:
-        return f"SQL Error: {str(e)}", True
+        return f"SQL Error: {e!s}", True
 
 
 def calculate_blast_radius(vault: Path, target: str) -> tuple[str, bool]:
@@ -930,20 +1067,20 @@ def calculate_blast_radius(vault: Path, target: str) -> tuple[str, bool]:
     t_stem = Path(t).stem
 
     cur = con.execute(
-        "SELECT source_rel, relation_type FROM relations WHERE target_stem = ? OR target_stem LIKE ?",
-        (t_stem, f"%{t_stem}%"),
+        "SELECT source_rel, relation_type FROM relations WHERE target_stem = ?",
+        (t_stem,),
     )
     upstream = cur.fetchall()
 
     cur = con.execute(
-        "SELECT target_stem, relation_type FROM relations WHERE source_rel LIKE ? OR source_rel LIKE ?",
-        (f"%{t_stem}.md", f"%{t_stem}/%"),
+        "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ?",
+        (f"{t_stem}.md", f"%/{t_stem}.md", f"%/{t_stem}/%"),
     )
     downstream = cur.fetchall()
 
     cur = con.execute(
-        "SELECT name, ports, host, network, rel_path FROM services WHERE name = ? OR host = ? OR container_prefix LIKE ?",
-        (t_stem, t_stem, f"%{t_stem}%"),
+        "SELECT name, ports, host, network, rel_path FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ?",
+        (t_stem, t_stem, f"%/{t_stem}.md"),
     )
     svcs = cur.fetchall()
 
@@ -965,11 +1102,176 @@ def calculate_blast_radius(vault: Path, target: str) -> tuple[str, bool]:
     out.append("\n## 🔌 Boundary Sinks (Containers, Ports & Networks)")
     if svcs:
         for s in svcs:
-            out.append(f"- **Service `{s['name']}`**: Ports: `{s['ports']}`, Host: `{s['host']}`, Network: `{s['network']}`")
+            out.append(
+                f"- **Service `{s['name']}`**: Ports: `{s['ports']}`, Host: `{s['host']}`, Network: `{s['network']}`"
+            )
     else:
         out.append("- *No discrete container/port allocation mapped.*")
 
     return "\n".join(out), False
+
+
+def _render_tree_lines(nodes: list[dict], prefix: str = "") -> list[str]:
+    """Render tree nodes recursively into ASCII/Markdown tree lines with cycle detection."""
+    lines = []
+    for i, node in enumerate(nodes):
+        is_last = i == len(nodes) - 1
+        connector = "└── " if is_last else "├── "
+        rel_str = f"[{node.get('rel_type')}] " if node.get("rel_type") else ""
+        cycle_str = " ↺ (cycle)" if node.get("cycle") else ""
+        node_display = f"**{node['stem']}**"
+        if node.get("rel_path") and node["rel_path"] != f"{node['stem']}.md":
+            node_display += f" (`{node['rel_path']}`)"
+        lines.append(f"{prefix}{connector}{rel_str}{node_display}{cycle_str}")
+
+        children = node.get("children", [])
+        if children:
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            lines.extend(_render_tree_lines(children, child_prefix))
+    return lines
+
+
+def traverse_graph(vault: Path, target: str, depth: int = 2, direction: str = "both") -> tuple[str, bool, dict]:
+    """Recursively map and traverse the knowledge graph around target up to N hops."""
+    con = get_fts_db(vault)
+    sync_fts_index(vault, con)
+
+    t = target.strip()
+    if t.endswith(".md"):
+        t = t[:-3]
+    t_stem = Path(t).stem
+
+    try:
+        depth = int(depth)
+    except (ValueError, TypeError):
+        depth = 2
+    depth = max(1, min(depth, 5))
+
+    direction = direction.lower().strip() if direction else "both"
+    if direction not in ("both", "down", "up"):
+        direction = "both"
+
+    def _resolve_stem_rel_path(stem: str) -> str:
+        cur = con.execute("SELECT rel_path FROM entities WHERE stem = ? LIMIT 1", (stem,))
+        row = cur.fetchone()
+        if row and row["rel_path"]:
+            return row["rel_path"]
+        return f"{stem}.md"
+
+    def _traverse_down(current_stem: str, current_depth: int, ancestors: set[str]) -> list[dict]:
+        if current_depth >= depth:
+            return []
+        cur = con.execute(
+            "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ?",
+            (f"{current_stem}.md", f"%/{current_stem}.md", f"%/{current_stem}/%"),
+        )
+        children = []
+        for row in cur.fetchall():
+            target_stem = row["target_stem"]
+            rel_type = row["relation_type"]
+            is_cycle = target_stem in ancestors
+            child_node = {
+                "stem": target_stem,
+                "rel_path": _resolve_stem_rel_path(target_stem),
+                "rel_type": rel_type,
+                "cycle": is_cycle,
+                "children": [],
+            }
+            if not is_cycle:
+                child_node["children"] = _traverse_down(target_stem, current_depth + 1, ancestors | {target_stem})
+            children.append(child_node)
+        return children
+
+    def _traverse_up(current_stem: str, current_depth: int, ancestors: set[str]) -> list[dict]:
+        if current_depth >= depth:
+            return []
+        cur = con.execute(
+            "SELECT source_rel, relation_type FROM relations WHERE target_stem = ?",
+            (current_stem,),
+        )
+        children = []
+        for row in cur.fetchall():
+            src_rel = row["source_rel"]
+            src_stem = Path(src_rel).stem
+            rel_type = row["relation_type"]
+            is_cycle = src_stem in ancestors
+            child_node = {
+                "stem": src_stem,
+                "rel_path": src_rel,
+                "rel_type": rel_type,
+                "cycle": is_cycle,
+                "children": [],
+            }
+            if not is_cycle:
+                child_node["children"] = _traverse_up(src_stem, current_depth + 1, ancestors | {src_stem})
+            children.append(child_node)
+        return children
+
+    downstream_tree = []
+    if direction in ("both", "down"):
+        downstream_tree = _traverse_down(t_stem, 0, {t_stem})
+
+    upstream_tree = []
+    if direction in ("both", "up"):
+        upstream_tree = _traverse_up(t_stem, 0, {t_stem})
+
+    # Sinks for target and direct 1-hop neighborhood
+    all_stems = {t_stem}
+    for c in downstream_tree:
+        all_stems.add(c["stem"])
+    for c in upstream_tree:
+        all_stems.add(c["stem"])
+
+    sinks = []
+    for s in sorted(all_stems):
+        cur = con.execute(
+            "SELECT name, ports, host, network, rel_path FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ?",
+            (s, s, f"%/{s}.md"),
+        )
+        for row in cur.fetchall():
+            sinks.append(dict(row))
+
+    json_payload = {
+        "target": t_stem,
+        "rel_path": _resolve_stem_rel_path(t_stem),
+        "depth": depth,
+        "direction": direction,
+        "downstream": downstream_tree,
+        "upstream": upstream_tree,
+        "boundary_sinks": sinks,
+    }
+
+    out = [f"# 🗺️ Knowledge Map: `{t_stem}` (depth: {depth}, direction: {direction})\n"]
+
+    if direction in ("both", "down"):
+        out.append("## ⬇️ Downstream Dependencies (Required by Target)")
+        if downstream_tree:
+            out.append(f"- **{t_stem}**")
+            out.extend(_render_tree_lines(downstream_tree, prefix="  "))
+        else:
+            out.append(f"- *No downstream dependencies detected within depth {depth}.*")
+        out.append("")
+
+    if direction in ("both", "up"):
+        out.append("## ⬆️ Upstream Dependents (Affected Services / Entry Points)")
+        if upstream_tree:
+            out.append(f"- **{t_stem}**")
+            out.extend(_render_tree_lines(upstream_tree, prefix="  "))
+        else:
+            out.append(f"- *No upstream dependents detected within depth {depth}.*")
+        out.append("")
+
+    out.append("## 🔌 Boundary Sinks (Containers, Ports & Networks)")
+    if sinks:
+        for sk in sinks:
+            ports_str = f", Ports: `{sk['ports']}`" if sk.get("ports") else ""
+            host_str = f", Host: `{sk['host']}`" if sk.get("host") else ""
+            net_str = f", Network: `{sk['network']}`" if sk.get("network") else ""
+            out.append(f"- **Service `{sk['name']}`** ({sk.get('rel_path', '')}){ports_str}{host_str}{net_str}")
+    else:
+        out.append("- *No discrete container/port allocation mapped.*")
+
+    return "\n".join(out), False, json_payload
 
 
 def run_verification_tests(vault: Path, note_filter: str | None = None) -> tuple[str, bool]:
@@ -1006,39 +1308,45 @@ def run_verification_tests(vault: Path, note_filter: str | None = None) -> tuple
                 text=True,
                 timeout=5,
             )
-            ok = (res.returncode == 0)
+            ok = res.returncode == 0
             if ok:
                 passed += 1
             else:
                 failed += 1
-            results.append({
-                "source": src,
-                "command": cmd,
-                "exit_code": res.returncode,
-                "passed": ok,
-                "stdout": res.stdout.strip(),
-                "stderr": res.stderr.strip(),
-            })
+            results.append(
+                {
+                    "source": src,
+                    "command": cmd,
+                    "exit_code": res.returncode,
+                    "passed": ok,
+                    "stdout": res.stdout.strip(),
+                    "stderr": res.stderr.strip(),
+                }
+            )
         except subprocess.TimeoutExpired:
             failed += 1
-            results.append({
-                "source": src,
-                "command": cmd,
-                "exit_code": 124,
-                "passed": False,
-                "stdout": "",
-                "stderr": "Command timed out after 5 seconds",
-            })
+            results.append(
+                {
+                    "source": src,
+                    "command": cmd,
+                    "exit_code": 124,
+                    "passed": False,
+                    "stdout": "",
+                    "stderr": "Command timed out after 5 seconds",
+                }
+            )
         except Exception as e:
             failed += 1
-            results.append({
-                "source": src,
-                "command": cmd,
-                "exit_code": 1,
-                "passed": False,
-                "stdout": "",
-                "stderr": str(e),
-            })
+            results.append(
+                {
+                    "source": src,
+                    "command": cmd,
+                    "exit_code": 1,
+                    "passed": False,
+                    "stdout": "",
+                    "stderr": str(e),
+                }
+            )
 
     out = [f"Ran {total} verification assertion(s): {passed} PASSED, {failed} FAILED\n"]
     for res in results:
@@ -1155,19 +1463,19 @@ def lint_vault(vault: Path) -> tuple[str, bool]:
         if f.suffix in (".yml", ".yaml"):
             try:
                 if HAVE_PYYAML:
-                    with open(f, "r", encoding="utf-8") as yf:
+                    with open(f, encoding="utf-8") as yf:
                         yaml.safe_load(yf)
             except Exception as e:
                 errors.append(f"'{rel}': YAML syntax error: {e}")
         elif f.suffix == ".json":
             try:
-                with open(f, "r", encoding="utf-8") as jf:
+                with open(f, encoding="utf-8") as jf:
                     json.load(jf)
             except Exception as e:
                 errors.append(f"'{rel}': JSON syntax error: {e}")
         elif f.suffix == ".py":
             try:
-                with open(f, "r", encoding="utf-8") as pf:
+                with open(f, encoding="utf-8") as pf:
                     ast.parse(pf.read(), filename=str(f))
             except Exception as e:
                 errors.append(f"'{rel}': Python syntax error: {e}")
@@ -1195,9 +1503,7 @@ def lint_vault(vault: Path) -> tuple[str, bool]:
 def verify_links(vault: Path) -> tuple[bool, list[tuple[str, str]]]:
     """Verify all wikilinks, markdown links, and note connectivity across the vault."""
     files = list(vault.glob("**/*.md"))
-    valid_files = [
-        f for f in files if not str(f.relative_to(vault)).startswith(("_templates", "."))
-    ]
+    valid_files = [f for f in files if not str(f.relative_to(vault)).startswith(("_templates", "."))]
 
     stems = {f.stem.lower(): f for f in valid_files}
     rels = {str(f.relative_to(vault).with_suffix("")).lower(): f for f in valid_files}
@@ -1223,7 +1529,10 @@ def verify_links(vault: Path) -> tuple[bool, list[tuple[str, str]]]:
         # 1. Wikilinks [[target|display]]
         for m in re.findall(r"(?<!\\)\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]", clean_text):
             tgt = m.strip()
-            tgt_clean = tgt[:-3] if tgt.endswith(".md") else tgt
+            target_no_anchor = tgt.split("#")[0].strip()
+            if not target_no_anchor:
+                continue
+            tgt_clean = target_no_anchor[:-3] if target_no_anchor.endswith(".md") else target_no_anchor
             target_key = tgt_clean.lower()
             cand = rels.get(target_key) or stems.get(Path(tgt_clean).stem.lower())
             if cand is not None:
@@ -1268,7 +1577,12 @@ def verify_links(vault: Path) -> tuple[bool, list[tuple[str, str]]]:
         "60-Scripts": "60-Scripts/Scripts-MOC.md",
     }
     for rel, inbounds in inbound_links.items():
-        if rel in root_anchors or rel in domain_mocs.values() or rel == "40-Systems/ADRs/ADRs-MOC.md":
+        if (
+            rel in root_anchors
+            or rel.startswith("01-Daily/")
+            or rel in domain_mocs.values()
+            or rel == "40-Systems/ADRs/ADRs-MOC.md"
+        ):
             continue
         domain = rel.split("/")[0] if "/" in rel else ""
         parent_moc = domain_mocs.get(domain)
@@ -1288,9 +1602,7 @@ def reconcile_vault(vault: Path, dry_run: bool = False) -> tuple[str, bool]:
     actions = []
 
     files = list(vault.glob("**/*.md"))
-    valid_files = [
-        f for f in files if not str(f.relative_to(vault)).startswith(("_templates", "."))
-    ]
+    valid_files = [f for f in files if not str(f.relative_to(vault)).startswith(("_templates", "."))]
 
     # 1. Check strict YAML frontmatter quoting
     for f in valid_files:
@@ -1315,8 +1627,7 @@ def reconcile_vault(vault: Path, dry_run: bool = False) -> tuple[str, bool]:
                 val = v.strip()
                 # Check for unquoted scalar with colon-space
                 if ": " in val and not (
-                    (val.startswith('"') and val.endswith('"'))
-                    or (val.startswith("'") and val.endswith("'"))
+                    (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'"))
                 ):
                     escaped_val = val.replace('"', '\\"')
                     new_fm_lines.append(f'{k}: "{escaped_val}"')
@@ -1329,7 +1640,7 @@ def reconcile_vault(vault: Path, dry_run: bool = False) -> tuple[str, bool]:
             f.write_text(new_content, encoding="utf-8")
 
     # 2. Reconcile unindexed notes to domain MOCs
-    ok, issues = verify_links(vault)
+    _ok, issues = verify_links(vault)
     unindexed = [item for item in issues if item[1].startswith("Unindexed note")]
 
     domain_mocs = {
@@ -1342,14 +1653,32 @@ def reconcile_vault(vault: Path, dry_run: bool = False) -> tuple[str, bool]:
         "60-Scripts": "60-Scripts/Scripts-MOC.md",
     }
 
-    for rel, issue in unindexed:
+    for rel, _issue in unindexed:
         domain = rel.split("/")[0] if "/" in rel else ""
         parent_moc_rel = domain_mocs.get(domain)
         if not parent_moc_rel:
             continue
         moc_path = vault / parent_moc_rel
         if not moc_path.exists():
-            continue
+            if not dry_run:
+                moc_path.parent.mkdir(parents=True, exist_ok=True)
+                domain_name = domain.split("-")[-1] if "-" in domain else domain
+                today_str = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
+                moc_init = (
+                    f"---\n"
+                    f'title: "{domain_name} MOC"\n'
+                    f"date: {today_str}\n"
+                    f"type: moc\n"
+                    f"tags: [moc]\n"
+                    f'summary: "Master Map of Content for {domain}"\n'
+                    f"---\n\n"
+                    f"# 🗺️ {domain_name} MOC\n\n"
+                    f"## 📌 Domain Entities\n\n"
+                    f"## 🔗 Related Notes\n- [[INDEX]]\n"
+                )
+                moc_path.write_text(moc_init, encoding="utf-8")
+            actions.append(f"Scaffolded missing MOC '{parent_moc_rel}'")
+
         stem = Path(rel).stem
         note_file = vault / rel
         note_title = stem
@@ -1365,10 +1694,10 @@ def reconcile_vault(vault: Path, dry_run: bool = False) -> tuple[str, bool]:
         if note_summary:
             entry += f": {note_summary}"
 
-        actions.append(f"Appended unindexed note '{rel}' to {parent_moc_rel}")
-        if not dry_run:
-            moc_text = moc_path.read_text(encoding="utf-8")
-            if entry not in moc_text and f"[[{rel[:-3]}" not in moc_text:
+        moc_text = moc_path.read_text(encoding="utf-8") if moc_path.exists() else ""
+        if entry not in moc_text and f"[[{rel[:-3]}" not in moc_text:
+            actions.append(f"Appended unindexed note '{rel}' to {parent_moc_rel}")
+            if not dry_run:
                 if "\n## 🔗" in moc_text:
                     parts = moc_text.split("\n## 🔗", 1)
                     new_moc = parts[0].rstrip() + f"\n\n{entry}\n\n## 🔗" + parts[1]
@@ -1383,8 +1712,7 @@ def reconcile_vault(vault: Path, dry_run: bool = False) -> tuple[str, bool]:
         )
     prefix = "[DRY-RUN] " if dry_run else ""
     return (
-        f"{prefix}Reconciled {len(actions)} item(s):\n"
-        + "\n".join(f"  - {a}" for a in actions),
+        f"{prefix}Reconciled {len(actions)} item(s):\n" + "\n".join(f"  - {a}" for a in actions),
         False,
     )
 
@@ -1398,10 +1726,10 @@ def ensure_daily_note(vault: Path, date_str: str) -> Path:
     if not daily_note.exists():
         template_file = vault / "_templates" / "daily-template.md"
         if template_file.exists():
-            content = template_file.read_text(encoding="utf-8").replace(
-                "{{date}}", date_str
-            )
+            content = template_file.read_text(encoding="utf-8").replace("{{date}}", date_str)
         else:
+            has_operator = (vault / "OPERATOR.md").exists() or (vault / "00-Meta" / "OPERATOR.md").exists()
+            operator_entry = "- [[OPERATOR]]\n" if has_operator else ""
             content = f"""---
 title: "{date_str}"
 date: {date_str}
@@ -1414,18 +1742,17 @@ summary: "Daily log and activity ledger for {date_str}"
 # 📅 {date_str}
 
 ## 🎯 Active Horizon & Daily Focus
-- [ ] 
+- [ ]
 
 ## 📝 Work Log & Session Notes
-- 
+-
 
 ## 💡 Insights, Architecture & Reflections
-- 
+-
 
 ## 🔗 Related Notes & Context
 - [[INDEX]]
-- [[OPERATOR]]
-"""
+{operator_entry}"""
         daily_note.write_text(content, encoding="utf-8")
 
     return daily_note
@@ -1439,22 +1766,25 @@ class VaultLock:
         self._fd = None
 
     def __enter__(self):
-        self._fd = open(self.lock_path, "a")
-        fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
+        try:
+            self._fd = open(self.lock_path, "a")
+            if HAVE_FCNTL:
+                fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            pass
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._fd:
             try:
-                fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+                if HAVE_FCNTL:
+                    fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
                 self._fd.close()
             except Exception:
                 pass
 
 
-def append_work_log(
-    vault: Path, project: str, summary: str, device: str | None = None
-) -> str:
+def append_work_log(vault: Path, project: str, summary: str, device: str | None = None) -> str:
     """Append a timestamped work log entry to today's daily note under kernel lock."""
     now = datetime.datetime.now().astimezone()
     date_str = now.strftime("%Y-%m-%d")
@@ -1487,11 +1817,7 @@ def append_work_log(
             else:
                 lines = tail.splitlines(keepends=True)
                 at = next(
-                    (
-                        i
-                        for i, ln in enumerate(lines)
-                        if ln.startswith("#") and len(ln) - len(ln.lstrip("#")) <= 2
-                    ),
+                    (i for i, ln in enumerate(lines) if ln.startswith("#") and len(ln) - len(ln.lstrip("#")) <= 2),
                     len(lines),
                 )
                 body = lines[:at]
@@ -1525,8 +1851,11 @@ def validate_note_content(content: str) -> tuple[bool, str]:
     if len(parts) < 3:
         return False, "Note frontmatter is not closed with '---'."
     fm, _ = parse_frontmatter(content)
+    note_type = str(fm.get("type", "note"))
     required = ["title", "date", "type", "tags", "summary"]
-    missing = [f for f in required if f not in fm]
+    if note_type == "project":
+        required.append("status")
+    missing = [f for f in required if f not in fm or not fm.get(f)]
     if missing:
         return False, f"Missing required frontmatter field(s): {', '.join(missing)}"
     return True, "Valid"
@@ -1578,26 +1907,21 @@ def auto_heal_frontmatter(content: str, rel_path: str) -> str:
     updated_val = fm.get("updated", now_iso)
     updated_by_val = fm.get("updated_by", dev)
 
-    fm_lines = [
-        "---",
-        f'title: "{title}"',
-        f"date: {date_val}",
-        f"type: {type_val}",
-        "tags:",
-    ]
-    for t in tags:
-        fm_lines.append(f"  - {t}")
-    fm_lines.append(f'summary: "{summary_val}"')
-    fm_lines.append(f'updated: "{updated_val}"')
-    fm_lines.append(f'updated_by: "{updated_by_val}"')
-    fm_lines.append("---\n")
+    merged_fm = dict(fm)
+    merged_fm["title"] = title
+    merged_fm["date"] = date_val
+    merged_fm["type"] = type_val
+    if type_val == "project" and "status" not in merged_fm:
+        merged_fm["status"] = "active"
+    merged_fm["tags"] = tags
+    merged_fm["summary"] = summary_val
+    merged_fm["updated"] = updated_val
+    merged_fm["updated_by"] = updated_by_val
 
-    return "\n".join(fm_lines) + body.lstrip()
+    return dump_frontmatter(merged_fm, body.lstrip())
 
 
-def append_section_to_note(
-    vault: Path, rel_path: str, heading: str, content_to_append: str
-) -> tuple[str, bool]:
+def append_section_to_note(vault: Path, rel_path: str, heading: str, content_to_append: str) -> tuple[str, bool]:
     """Safely append content under a specific heading inside an existing note."""
     clean_rel = rel_path.strip()
     if clean_rel.startswith("/") or clean_rel.startswith("~"):
@@ -1628,46 +1952,37 @@ def append_section_to_note(
 
         matched_idx = -1
         target_clean = normalize_heading(heading)
-        for i, (lvl, title, line_no) in enumerate(headings):
+        for i, (_lvl, title, _line_no) in enumerate(headings):
             if target_clean == normalize_heading(title) or heading.lower() == title.lower():
                 matched_idx = i
                 break
 
         if matched_idx == -1:
             ranked = []
-            for i, (lvl, title, line_no) in enumerate(headings):
+            for i, (_lvl, title, _line_no) in enumerate(headings):
                 norm = normalize_heading(title)
                 if target_clean in norm or heading.lower() in title.lower():
                     ranked.append((len(norm) - len(target_clean), i))
             if ranked:
                 matched_idx = min(ranked)[1]
 
+        insert_text = re.sub(r"\n{3,}", "\n\n", content_to_append.strip()).strip()
+        insert_lines = insert_text.splitlines()
+
         if matched_idx != -1:
-            match_lvl, match_title, match_line_no = headings[matched_idx]
+            match_lvl, _match_title, _match_line_no = headings[matched_idx]
             end_line_idx = len(lines)
-            for next_lvl, next_title, next_line_no in headings[matched_idx + 1 :]:
+            for next_lvl, _next_title, next_line_no in headings[matched_idx + 1 :]:
                 if next_lvl <= match_lvl:
                     end_line_idx = next_line_no - 1
                     break
 
-            insert_lines = content_to_append.strip().splitlines()
             prefix = [""] if (end_line_idx > 0 and lines[end_line_idx - 1].strip() != "") else []
             suffix = [""]
-            new_lines = (
-                lines[:end_line_idx]
-                + prefix
-                + insert_lines
-                + suffix
-                + lines[end_line_idx:]
-            )
-            merged = "\n".join(new_lines).strip() + "\n"
-            boundary = "\n".join(insert_lines)
-            if boundary.strip():
-                collapsed = re.sub(r"\n{3,}", "\n\n", boundary).strip()
-                merged = merged.replace(boundary, collapsed, 1)
-            new_content = merged
+            new_lines = lines[:end_line_idx] + prefix + insert_lines + suffix + lines[end_line_idx:]
+            new_content = "\n".join(new_lines).strip() + "\n"
         else:
-            new_content = orig_content.rstrip() + f"\n\n## {heading}\n{content_to_append.strip()}\n"
+            new_content = orig_content.rstrip() + f"\n\n## {heading}\n{insert_text}\n"
 
         fm, body = parse_frontmatter(new_content)
         if fm:
@@ -1798,7 +2113,8 @@ def list_notes_in_vault(vault: Path, domain: str | None = None) -> list[dict]:
 
 def cli_search(args):
     vault = get_vault()
-    results = search_vault(vault, args.query, domain=args.domain, limit=args.limit)
+    with_graph = getattr(args, "with_graph", False)
+    results = search_vault(vault, args.query, domain=args.domain, limit=args.limit, with_graph=with_graph)
     if not results:
         print(f"No notes found matching '{args.query}'.")
         return
@@ -1810,6 +2126,15 @@ def cli_search(args):
             print(f"   Summary: {r['summary']}")
         if r["snippet"]:
             print(f"   Excerpt: {r['snippet']}")
+        if r.get("graph"):
+            g = r["graph"]
+            print("   Connected Graph:")
+            if g.get("upstream"):
+                print(f"     - Upstream: {', '.join(g['upstream'])}")
+            if g.get("downstream"):
+                print(f"     - Downstream: {', '.join(g['downstream'])}")
+            if g.get("services"):
+                print(f"     - Boundary: {', '.join(g['services'])}")
         print()
 
 
@@ -1877,6 +2202,17 @@ def cli_blast(args):
         print(out, file=sys.stderr)
         sys.exit(1)
     print(out)
+
+
+def cli_map(args):
+    vault = get_vault()
+    text_out, is_err, json_data = traverse_graph(vault, args.target, depth=args.depth, direction=args.direction)
+    if getattr(args, "json", False):
+        print(json.dumps(json_data, indent=2))
+    else:
+        print(text_out)
+    if is_err:
+        sys.exit(1)
 
 
 def cli_test(args):
@@ -2055,6 +2391,10 @@ MCP_TOOLS = [
                     "type": "integer",
                     "description": "Maximum number of search results to return (default: 10).",
                 },
+                "with_graph": {
+                    "type": "boolean",
+                    "description": "If true, attaches 1-hop upstream dependents, downstream dependencies, and service/port boundary allocations to each search result.",
+                },
             },
             "required": ["query"],
         },
@@ -2133,6 +2473,29 @@ MCP_TOOLS = [
                     "type": "string",
                     "description": "Component or note stem (e.g. 'Dokploy-Traefik', 'TanriZarAtmaz', 'bountools').",
                 }
+            },
+            "required": ["target"],
+        },
+    },
+    {
+        "name": "akatsuki_map",
+        "description": "Recursively traverse and map the knowledge graph around a target note up to N hops, identifying upstream dependents, downstream dependencies, and container/service boundaries.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Target note stem, filename, or service name to map from.",
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Traversal depth in hops (default: 2, range: 1-5).",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["both", "down", "up"],
+                    "description": "Graph traversal direction: 'both', 'down' (dependencies), or 'up' (dependents). Defaults to 'both'.",
+                },
             },
             "required": ["target"],
         },
@@ -2299,6 +2662,19 @@ MCP_TOOLS = [
             },
         },
     },
+    {
+        "name": "akatsuki_reconcile",
+        "description": "Auto-reconcile unindexed notes and strict YAML frontmatter quoting across the akatsuki vault.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Simulate reconciliation without writing changes (default: false).",
+                }
+            },
+        },
+    },
 ]
 
 
@@ -2308,16 +2684,26 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
         query = args.get("query", "")
         domain = args.get("domain")
         limit = args.get("limit", 10)
-        results = search_vault(vault, query, domain=domain, limit=limit)
+        with_graph = bool(args.get("with_graph", False))
+        results = search_vault(vault, query, domain=domain, limit=limit, with_graph=with_graph)
         if not results:
             return f"No notes found in akatsuki matching '{query}'.", False
         out = [f"Found {len(results)} matching note(s) using Okapi BM25:"]
         for r in results:
-            out.append(
-                f"\n- **{r['title']}** (`{r['rel_path']}`) [BM25 score: {r['score']}]: {r['summary']}"
-            )
+            out.append(f"\n- **{r['title']}** (`{r['rel_path']}`) [BM25 score: {r['score']}]: {r['summary']}")
             if r["snippet"]:
                 out.append(f"    Excerpt: {r['snippet']}")
+            if r.get("graph"):
+                g = r["graph"]
+                g_parts = []
+                if g.get("upstream"):
+                    g_parts.append(f"Upstream: {', '.join(g['upstream'])}")
+                if g.get("downstream"):
+                    g_parts.append(f"Downstream: {', '.join(g['downstream'])}")
+                if g.get("services"):
+                    g_parts.append(f"Boundary: {', '.join(g['services'])}")
+                if g_parts:
+                    out.append(f"    Graph: {' | '.join(g_parts)}")
         return "\n".join(out), False
 
     elif name == "akatsuki_read":
@@ -2370,6 +2756,15 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
             return "Error: Missing parameter 'target'.", True
         return calculate_blast_radius(vault, target)
 
+    elif name == "akatsuki_map":
+        target = args.get("target", "")
+        if not target:
+            return "Error: Missing parameter 'target'.", True
+        depth = args.get("depth", 2)
+        direction = args.get("direction", "both")
+        text_out, is_err, _ = traverse_graph(vault, target, depth=depth, direction=direction)
+        return text_out, is_err
+
     elif name == "akatsuki_test":
         note = args.get("note")
         return run_verification_tests(vault, note_filter=note)
@@ -2412,7 +2807,9 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
     elif name == "akatsuki_projects":
         con = get_fts_db(vault)
         sync_fts_index(vault, con)
-        cur = con.execute("SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'")
+        cur = con.execute(
+            "SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'"
+        )
         rows = [dict(r) for r in cur.fetchall()]
         if rows:
             return json.dumps(rows, indent=2, default=str), False
@@ -2478,6 +2875,13 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
                 out.append(f"  Summary: {n['summary']}")
         return "\n".join(out), False
 
+    elif name == "akatsuki_reconcile":
+        dry_run = args.get("dry_run", False)
+        if isinstance(dry_run, str):
+            dry_run = dry_run.lower() in ("true", "1", "yes")
+        res, is_err = reconcile_vault(vault, dry_run=dry_run)
+        return res, is_err
+
     return f"Unknown tool: {name}", True
 
 
@@ -2485,7 +2889,7 @@ MCP_RESOURCES = [
     {
         "uri": "akatsuki://services",
         "name": "Live Services Catalog",
-        "description": "Active containerized services, port allocations, and ingress routing from TanriZarAtmaz.",
+        "description": "Active containerized services, port allocations, and ingress routing.",
         "mimeType": "application/json",
     },
     {
@@ -2521,18 +2925,16 @@ def handle_mcp_resource_read(uri: str) -> tuple[str, bool]:
     elif uri == "akatsuki://projects":
         con = get_fts_db(vault)
         sync_fts_index(vault, con)
-        cur = con.execute("SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'")
+        cur = con.execute(
+            "SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'"
+        )
         rows = [dict(r) for r in cur.fetchall()]
         return json.dumps(rows, indent=2, default=str), False
     elif uri == "akatsuki://operator":
         f = vault / "OPERATOR.md"
         if not f.exists():
             f = vault / "00-Meta" / "OPERATOR.md"
-        return (
-            (f.read_text(encoding="utf-8"), False)
-            if f.exists()
-            else ("OPERATOR note not found.", True)
-        )
+        return (f.read_text(encoding="utf-8"), False) if f.exists() else ("OPERATOR note not found.", True)
     elif uri == "akatsuki://daily":
         today = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
         daily_note = ensure_daily_note(vault, today)
@@ -2573,7 +2975,7 @@ def dispatch_single_request(req: dict) -> dict | None:
                     "tools": {},
                     "resources": {"subscribe": False, "listChanged": False},
                 },
-                "serverInfo": {"name": "akatsuki", "version": "3.0.0"},
+                "serverInfo": {"name": "akatsuki", "version": "0.1.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -2618,12 +3020,8 @@ def dispatch_single_request(req: dict) -> dict | None:
         try:
             text_out, is_err = handle_mcp_resource_read(uri)
         except Exception as e:
-            text_out, is_err = f"Error reading resource '{uri}': {str(e)}", True
-        mime = (
-            "application/json"
-            if uri in ("akatsuki://services", "akatsuki://projects")
-            else "text/markdown"
-        )
+            text_out, is_err = f"Error reading resource '{uri}': {e!s}", True
+        mime = "application/json" if uri in ("akatsuki://services", "akatsuki://projects") else "text/markdown"
         if is_err:
             return {
                 "jsonrpc": "2.0",
@@ -2633,11 +3031,7 @@ def dispatch_single_request(req: dict) -> dict | None:
         return {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {
-                "contents": [
-                    {"uri": uri, "mimeType": mime, "text": text_out}
-                ]
-            },
+            "result": {"contents": [{"uri": uri, "mimeType": mime, "text": text_out}]},
         }
     elif method == "tools/call":
         tool_name = params.get("name")
@@ -2666,7 +3060,7 @@ def dispatch_single_request(req: dict) -> dict | None:
                     "content": [
                         {
                             "type": "text",
-                            "text": f"Exception in {tool_name}: {str(e)}",
+                            "text": f"Exception in {tool_name}: {e!s}",
                         }
                     ],
                     "isError": True,
@@ -2720,11 +3114,13 @@ def run_mcp_server():
                         batch_resps.append(single_resp)
                 except Exception as e:
                     item_id = item.get("id") if isinstance(item, dict) else None
-                    batch_resps.append({
-                        "jsonrpc": "2.0",
-                        "id": item_id,
-                        "error": {"code": -32603, "message": f"Internal server error: {e}"},
-                    })
+                    batch_resps.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": item_id,
+                            "error": {"code": -32603, "message": f"Internal server error: {e}"},
+                        }
+                    )
             if batch_resps:
                 sys.stdout.write(json.dumps(batch_resps) + "\n")
                 sys.stdout.flush()
@@ -2803,25 +3199,126 @@ def cli_init(args: argparse.Namespace) -> None:
             encoding="utf-8",
         )
 
+    today_str = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
+
     agents_md = target / "AGENTS.md"
     if not agents_md.exists():
         agents_md.write_text(
-            "# AGENTS.md — System Protocol & Living Architecture Invariants\n\n"
-            "## Core Invariants\n"
-            "- **Architecture at the Boundary**: Keep system contracts explicit and strict.\n"
-            "- **Living Invariant Verification**: All assertions under `bash:verify` must evaluate to exit code 0.\n"
-            "- **Telegraphic Caveman Logging**: Append timestamped ledger entries to daily notes upon completing tasks.\n",
+            f"---\n"
+            f'title: "System Protocol & Living Architecture Invariants"\n'
+            f"date: {today_str}\n"
+            f"type: agent\n"
+            f"tags:\n"
+            f"  - protocol\n"
+            f"  - architecture\n"
+            f"  - invariants\n"
+            f'summary: "Master architectural protocol and invariants for autonomous agents."\n'
+            f"---\n\n"
+            f"# AGENTS.md — System Protocol & Living Architecture Invariants\n\n"
+            f"## Core Invariants\n"
+            f"- **Architecture at the Boundary**: Keep system contracts explicit and strict.\n"
+            f"- **Living Invariant Verification**: All assertions under `bash:verify` must evaluate to exit code 0.\n"
+            f"- **Telegraphic Caveman Logging**: Append timestamped ledger entries to daily notes upon completing tasks.\n",
+            encoding="utf-8",
+        )
+
+    operator_md = target / "OPERATOR.md"
+    if not operator_md.exists():
+        operator_md.write_text(
+            f"---\n"
+            f'title: "Operator Profile & Machine Specs"\n'
+            f"date: {today_str}\n"
+            f"type: system\n"
+            f"tags:\n"
+            f"  - operator\n"
+            f"  - telemetry\n"
+            f'summary: "Operator environment, hardware telemetry, and communication contracts."\n'
+            f"---\n\n"
+            f"# 👤 Operator Profile & Machine Specs\n\n"
+            f"## 💻 Hardware & Environment Telemetry\n"
+            f"- Host: Local Machine\n"
+            f"- Role: Autonomous Agent Execution Substrate\n",
+            encoding="utf-8",
+        )
+
+    projects_moc = target / "20-Projects" / "Projects-MOC.md"
+    if not projects_moc.exists():
+        projects_moc.write_text(
+            f"---\n"
+            f'title: "Projects MOC"\n'
+            f"date: {today_str}\n"
+            f"type: moc\n"
+            f"tags:\n"
+            f"  - moc\n"
+            f"  - projects\n"
+            f'summary: "Master Map of Content for active software projects and repositories."\n'
+            f"---\n\n"
+            f"# 📁 Projects MOC\n\n"
+            f"## 📌 Tracked Projects\n\n"
+            f"## 🔗 Related Notes\n"
+            f"- [[INDEX]]\n",
+            encoding="utf-8",
+        )
+
+    systems_moc = target / "40-Systems" / "Systems-MOC.md"
+    if not systems_moc.exists():
+        systems_moc.write_text(
+            f"---\n"
+            f'title: "Systems MOC"\n'
+            f"date: {today_str}\n"
+            f"type: moc\n"
+            f"tags:\n"
+            f"  - moc\n"
+            f"  - systems\n"
+            f'summary: "Master Map of Content for infrastructure topology, host systems, and ADRs."\n'
+            f"---\n\n"
+            f"# 🖥️ Systems MOC\n\n"
+            f"## 📌 Systems & Services\n\n"
+            f"## 🔗 Related Notes\n"
+            f"- [[INDEX]]\n",
+            encoding="utf-8",
+        )
+
+    daily_moc = target / "01-Daily" / "Daily-MOC.md"
+    if not daily_moc.exists():
+        daily_moc.write_text(
+            f"---\n"
+            f'title: "Daily MOC"\n'
+            f"date: {today_str}\n"
+            f"type: moc\n"
+            f"tags:\n"
+            f"  - moc\n"
+            f"  - daily\n"
+            f'summary: "Master Map of Content for operational worklogs and session history."\n'
+            f"---\n\n"
+            f"# 📅 Daily MOC\n\n"
+            f"## 📌 Daily Ledgers\n\n"
+            f"## 🔗 Related Notes\n"
+            f"- [[INDEX]]\n",
             encoding="utf-8",
         )
 
     index_md = target / "INDEX.md"
     if not index_md.exists():
-        today_str = datetime.date.today().isoformat()
         index_md.write_text(
-            f"---\ntitle: Living System Catalog\ndate: {today_str}\ntype: index\nsummary: Master index of living systems architecture.\n---\n\n"
-            "# 🏛️ Living System Catalog\n\n"
-            "## 📌 Overview\n"
-            "Central catalog and index for systems architecture, service contracts, and operational ledgers.\n",
+            f"---\n"
+            f'title: "Living System Catalog"\n'
+            f"date: {today_str}\n"
+            f"type: index\n"
+            f"tags:\n"
+            f"  - catalog\n"
+            f"  - index\n"
+            f'summary: "Master index of living systems architecture, projects, and operational ledgers."\n'
+            f"---\n\n"
+            f"# 🏛️ Living System Catalog\n\n"
+            f"## 📌 Overview\n"
+            f"Central catalog and index for systems architecture, service contracts, and operational ledgers.\n\n"
+            f"## 🗺️ Maps of Content (MOCs)\n"
+            f"- [[20-Projects/Projects-MOC|Projects MOC]]\n"
+            f"- [[40-Systems/Systems-MOC|Systems MOC]]\n"
+            f"- [[01-Daily/Daily-MOC|Daily MOC]]\n"
+            f"- [[AGENTS|System Protocols & Invariants]]\n"
+            f"- [[OPERATOR|Operator Profile]]\n",
             encoding="utf-8",
         )
 
@@ -2868,6 +3365,9 @@ def main():
         ],
     )
     p_search.add_argument("--limit", "-n", type=int, default=10)
+    p_search.add_argument(
+        "--with-graph", "-g", action="store_true", help="Attach 1-hop graph relations and boundary sinks"
+    )
 
     # read / cat
     p_read = subparsers.add_parser("read", aliases=["cat"], help="Read an akatsuki note or section")
@@ -2891,6 +3391,18 @@ def main():
     # blast
     p_blast = subparsers.add_parser("blast", help="Calculate architectural blast radius")
     p_blast.add_argument("target", help="Component, service, or system name")
+
+    # map
+    p_map = subparsers.add_parser("map", help="Recursively map knowledge graph around a target note")
+    p_map.add_argument("target", help="Component, note stem, or service name")
+    p_map.add_argument("--depth", "-d", type=int, default=2, help="Traversal depth in hops (1-5, default: 2)")
+    p_map.add_argument(
+        "--direction",
+        choices=["both", "down", "up"],
+        default="both",
+        help="Traversal direction: both, down (dependencies), or up (dependents)",
+    )
+    p_map.add_argument("--json", action="store_true", help="Output raw JSON graph structure")
 
     # test
     p_test = subparsers.add_parser("test", help="Execute machine-verifiable assertion blocks")
@@ -2935,7 +3447,9 @@ def main():
     p_write.add_argument("path", help="Relative path inside vault (e.g. 20-Projects/app.md, 50-Configs/traefik.yml)")
     p_write.add_argument("--file", "-f", help="Source file to read content from (defaults to stdin)")
     p_write.add_argument("--overwrite", action="store_true", help="Overwrite if exists")
-    p_write.add_argument("--raw", action="store_true", help="Write raw content without forcing .md extension or frontmatter enforcement")
+    p_write.add_argument(
+        "--raw", action="store_true", help="Write raw content without forcing .md extension or frontmatter enforcement"
+    )
 
     # services
     subparsers.add_parser("services", help="Print active services catalog and container allocations")
@@ -2958,7 +3472,9 @@ def main():
 
     # reconcile
     p_reconcile = subparsers.add_parser("reconcile", help="Auto-reconcile unindexed notes and strict YAML across vault")
-    p_reconcile.add_argument("--dry-run", "-n", action="store_true", help="Simulate reconciliation without writing changes")
+    p_reconcile.add_argument(
+        "--dry-run", "-n", action="store_true", help="Simulate reconciliation without writing changes"
+    )
 
     # mcp
     subparsers.add_parser("mcp", help="Run as Model Context Protocol (MCP) server on stdio")
@@ -2983,6 +3499,8 @@ def main():
         cli_query(args)
     elif args.command == "blast":
         cli_blast(args)
+    elif args.command == "map":
+        cli_map(args)
     elif args.command == "test":
         cli_test(args)
     elif args.command == "set":

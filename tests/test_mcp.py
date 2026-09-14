@@ -1,8 +1,31 @@
+import shutil
+import tempfile
 import unittest
-from akatsuki.core import dispatch_single_request, MCP_TOOLS, MCP_RESOURCES
+from pathlib import Path
+
+import akatsuki.core as core
+from akatsuki.core import dispatch_single_request, write_note
 
 
 class TestAkatsukiMCP(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.test_dir = tempfile.mkdtemp()
+        cls.vault = Path(cls.test_dir)
+        (cls.vault / "01-Daily").mkdir(parents=True, exist_ok=True)
+        (cls.vault / "20-Projects").mkdir(parents=True, exist_ok=True)
+        write_note(
+            cls.vault,
+            "20-Projects/Dokploy-Traefik.md",
+            "---\ntitle: Dokploy Traefik\ntype: project\nstatus: live\ntags: [proxy]\nsummary: Traefik edge router\n---\n# Dokploy Traefik\n\nRouting specification.\n",
+        )
+        core.CURRENT_VAULT_OVERRIDE = cls.vault
+
+    @classmethod
+    def tearDownClass(cls):
+        core.CURRENT_VAULT_OVERRIDE = None
+        shutil.rmtree(cls.test_dir, ignore_errors=True)
+
     def test_mcp_initialize(self):
         req = {
             "jsonrpc": "2.0",
@@ -20,12 +43,13 @@ class TestAkatsukiMCP(unittest.TestCase):
         res = dispatch_single_request(req)
         self.assertEqual(res["id"], 2)
         tools = res["result"]["tools"]
-        self.assertTrue(len(tools) >= 15)
+        self.assertTrue(len(tools) >= 16)
         tool_names = [t["name"] for t in tools]
         self.assertIn("akatsuki_search", tool_names)
         self.assertIn("akatsuki_read", tool_names)
         self.assertIn("akatsuki_contract", tool_names)
         self.assertIn("akatsuki_test", tool_names)
+        self.assertIn("akatsuki_reconcile", tool_names)
 
     def test_mcp_resources_list(self):
         req = {"jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {}}
@@ -77,6 +101,20 @@ class TestAkatsukiMCP(unittest.TestCase):
         self.assertEqual(res["id"], 6)
         self.assertIn("error", res)
         self.assertEqual(res["error"]["code"], -32602)
+
+    def test_mcp_reconcile_call(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "akatsuki_reconcile",
+                "arguments": {"dry_run": True},
+            },
+        }
+        res = dispatch_single_request(req)
+        self.assertEqual(res["id"], 7)
+        self.assertFalse(res["result"]["isError"])
 
 
 if __name__ == "__main__":

@@ -7,13 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from akatsuki.core import (
-    get_machine_id,
     append_work_log,
-    write_note,
-    set_note_property,
-    parse_frontmatter,
     get_fts_db,
+    get_machine_id,
+    parse_frontmatter,
+    set_note_property,
     sync_fts_index,
+    write_note,
 )
 
 
@@ -74,7 +74,10 @@ class TestDeviceTrackingAndFrontmatter(unittest.TestCase):
             # Check daily log entry created by auto-mutation logging
             now_str = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
             daily_file = self.vault / "01-Daily" / f"{now_str}.md"
-            self.assertIn("[node-beta]: [akatsuki] create 20-Projects/test-project.md -> exit 0", daily_file.read_text(encoding="utf-8"))
+            self.assertIn(
+                "[node-beta]: [akatsuki] create 20-Projects/test-project.md -> exit 0",
+                daily_file.read_text(encoding="utf-8"),
+            )
 
         # Test set_note_property
         with patch.dict(os.environ, {"AKATSUKI_HOST": "node-gamma"}):

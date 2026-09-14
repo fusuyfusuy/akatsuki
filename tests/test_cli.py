@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from akatsuki.core import resolve_vault_path, cli_init, parse_frontmatter
+from akatsuki.core import (
+    cli_init,
+    lint_vault,
+    parse_frontmatter,
+    resolve_vault_path,
+    verify_links,
+)
 
 
 class TestAkatsukiCLI(unittest.TestCase):
@@ -23,10 +29,17 @@ class TestAkatsukiCLI(unittest.TestCase):
         target = Path(self.test_dir)
         self.assertTrue((target / ".akatsuki").is_dir())
         self.assertTrue((target / "AGENTS.md").is_file())
+        self.assertTrue((target / "OPERATOR.md").is_file())
         self.assertTrue((target / "INDEX.md").is_file())
-        self.assertTrue((target / "01-Daily").is_dir())
-        self.assertTrue((target / "40-Systems").is_dir())
+        self.assertTrue((target / "20-Projects" / "Projects-MOC.md").is_file())
+        self.assertTrue((target / "40-Systems" / "Systems-MOC.md").is_file())
+        self.assertTrue((target / "01-Daily" / "Daily-MOC.md").is_file())
         self.assertTrue((target / ".gitignore").is_file())
+
+        msg, is_err = lint_vault(target)
+        self.assertFalse(is_err, f"Lint failed on fresh init: {msg}")
+        ok, issues = verify_links(target)
+        self.assertTrue(ok, f"Verify links failed on fresh init: {issues}")
 
     def test_vault_resolution_explicit(self):
         custom_path = Path(self.test_dir) / "custom"

@@ -24,16 +24,17 @@ KERNEL:
 ## SYNOPSIS
 
 ```shell
-akatsuki search   <query> [--domain <domain>] [--limit <N>] [--json]
+akatsuki search   <query> [--domain <domain>] [--limit <N>] [--with-graph] [--json]
 akatsuki contract <note> [--json]
 akatsuki read     <note> [--section <sec>] [--budget <N>] [--json]
 akatsuki get      <key> [--json]
 akatsuki query    <sql> [--json]
 akatsuki blast    <target> [--json]
+akatsuki map      <target> [--depth <N>] [--direction up|down|both] [--json]
 akatsuki test     [<note>] [--json]
 akatsuki set      <note> --key <key> --value <val> [--json]
 akatsuki append   <note> --heading <heading> --content <content> [--json]
-akatsuki write    <path> --content <content> [--overwrite] [--json]
+akatsuki write    <path> --content <content> [--overwrite] [--raw] [--json]
 akatsuki services [--json]
 akatsuki projects [--json]
 akatsuki daily    [--date <YYYY-MM-DD>] [--json]
@@ -49,19 +50,20 @@ akatsuki mcp      [--vault <dir>]
 ## AGENT LIFECYCLE PIPELINE
 
 ```text
-ORIENT -> CONTRACT -> BLAST -> MUTATE -> VERIFY -> LOG
+ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
 ```
 
 1. **TURN-0 (Inbound Orientation)**:
    - Live Topology & Ports: `akatsuki services` | MCP: `akatsuki_services()`
    - Project Stacks: `akatsuki projects` | MCP: `akatsuki_projects()`
-   - Knowledge Search: `akatsuki search "<topic>"` | MCP: `akatsuki_search(query="<topic>")`
+   - Knowledge Search: `akatsuki search "<topic>" [--with-graph]` | MCP: `akatsuki_search(query="<topic>", with_graph=True)`
 2. **CONTRACT (Token-Dense Slicing)**:
    - `akatsuki contract <note>` | MCP: `akatsuki_contract(note="<note>")`
    - Slices pure machine-actionable boundaries (ports, network, relations, invariants, verifications), eliminating 70–90% narrative token bloat.
-3. **BLAST (Pre-Mutation Safety Gate)**:
-   - `akatsuki blast <target>` | MCP: `akatsuki_blast(target="<target>")`
-   - Maps upstream dependents, downstream dependencies, and boundary sinks across infrastructure and services before applying changes.
+3. **MAP / BLAST (Pre-Mutation Safety Gate)**:
+   - Recursive Map: `akatsuki map <target> [--depth 2]` | MCP: `akatsuki_map(target="<target>", depth=2)`
+   - Blast Radius: `akatsuki blast <target>` | MCP: `akatsuki_blast(target="<target>")`
+   - Recursively maps upstream dependents, downstream dependencies, and boundary sinks across infrastructure and services before applying changes.
 4. **MUTATE (Structured Updates)**:
    - Property update: `akatsuki set <note> --key K --value V` | MCP: `akatsuki_set(note, key, value)`
    - Section append: `akatsuki append <note> --heading H --content C` | MCP: `akatsuki_append_section(note, heading, content)`
@@ -79,11 +81,12 @@ ORIENT -> CONTRACT -> BLAST -> MUTATE -> VERIFY -> LOG
 
 ### `search` — Okapi BM25 Knowledge Search
 ```shell
-akatsuki search <query> [--domain <domain>] [--limit <N>] [--json]
+akatsuki search <query> [--domain <domain>] [--limit <N>] [--with-graph] [--json]
 ```
 - Full-text search over SQLite FTS5 index with `unicode61` tokenizer and morphological suffix expansion.
 - `--domain <dir>`: Restrict search (e.g. `20-Projects`, `40-Systems`).
 - `--limit <N>`: Truncate matches to fit token budgets (default: 10).
+- `--with-graph`, `-g`: Attach immediate 1-hop upstream dependents, downstream dependencies, and container/port allocations directly to search results.
 
 ### `contract` — Boundary Contract Slicing
 ```shell
@@ -112,6 +115,14 @@ akatsuki query <sql> [--json]  # Read-only SQL query against SQLite index
 akatsuki blast <target> [--json]
 ```
 - Calculates upstream dependents, downstream dependencies, and boundary sinks for services, containers, or host nodes.
+
+### `map` — Recursive Knowledge & Boundary Graph Traversal
+```shell
+akatsuki map <target> [--depth <N>] [--direction up|down|both] [--json]
+```
+- Recursively maps upstream dependents, downstream dependencies, and boundary container/port allocations up to $N$ hops ($1 \le N \le 5$, default: 2).
+- Automatically handles cycles with `↺ (cycle)` annotations.
+- Outputs an ASCII/Markdown tree or machine-readable JSON via `--json`.
 
 ### `test` — Invariant Verification Runner
 ```shell
@@ -158,23 +169,25 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`
 
 | MCP Tool | CLI Equivalent | Key Arguments |
 | :--- | :--- | :--- |
-| `akatsuki_search` | `akatsuki search` | `query`, `domain`, `limit` |
+| `akatsuki_search` | `akatsuki search` | `query`, `domain`, `limit`, `with_graph` |
 | `akatsuki_contract` | `akatsuki contract` | `note` |
 | `akatsuki_read` | `akatsuki read` | `note`, `section`, `budget` |
 | `akatsuki_get` | `akatsuki get` | `key` |
 | `akatsuki_query` | `akatsuki query` | `sql` |
 | `akatsuki_blast` | `akatsuki blast` | `target` |
+| `akatsuki_map` | `akatsuki map` | `target`, `depth`, `direction` |
 | `akatsuki_test` | `akatsuki test` | `note` |
 | `akatsuki_set` | `akatsuki set` | `note`, `key`, `value` |
 | `akatsuki_append_section` | `akatsuki append` | `note`, `heading`, `content` |
-| `akatsuki_write_note` | `akatsuki write` | `path`, `content`, `overwrite` |
+| `akatsuki_write_note` | `akatsuki write` | `path`, `content`, `overwrite`, `raw` |
 | `akatsuki_services` | `akatsuki services`| *(none)* |
 | `akatsuki_projects` | `akatsuki projects`| *(none)* |
 | `akatsuki_daily` | `akatsuki daily` | `date` |
 | `akatsuki_record_log` | `akatsuki log` | `project`, `summary`, `device` |
 | `akatsuki_lint` | `akatsuki lint` | *(none)* |
 | `akatsuki_verify` | `akatsuki verify` | *(none)* |
-| `akatsuki_list_notes` | *(internal)* | `domain` |
+| `akatsuki_reconcile` | `akatsuki reconcile` | `dry_run` |
+| `akatsuki_list_notes` | `akatsuki list` | `domain` |
 
 ---
 
