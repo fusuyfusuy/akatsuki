@@ -26,14 +26,24 @@ As AI coding swarms and autonomous agents (`Antigravity`, `Claude Code`, `pi`, `
 
 ### 1. Installation
 
-Install via pip or uv:
-
+**Option A: Standard Installation (Pure Standard Library, Zero Dependencies)**
+Runs with pure in-process Okapi BM25 ranking, instant startup, zero dependencies:
 ```bash
 # Via pip
 pip install git+https://github.com/fusuyfusuy/akatsuki.git
 
 # Or via uv tool
 uv tool install git+https://github.com/fusuyfusuy/akatsuki.git
+```
+
+**Option B: With Semantic Vector Embeddings & Hybrid RRF Search (Optional Extra)**
+Equips Akatsuki with local offline semantic search powered by `intfloat/multilingual-e5-small` (384D) clamped safely to 2 CPU threads:
+```bash
+# Via pip
+pip install "akatsuki[embeddings] @ git+https://github.com/fusuyfusuy/akatsuki.git"
+
+# Or via uv tool with lightweight CPU PyTorch wheel:
+uv tool install --editable /path/to/akatsuki --with sentence-transformers --with torch --extra-index-url https://download.pytorch.org/whl/cpu --force
 ```
 
 ### 2. Bootstrap a Living Memory Vault
@@ -48,7 +58,7 @@ cd ./knowledge-base
 This creates the standard Akatsuki vault structure:
 ```
 knowledge-base/
-├── .akatsuki/          # Local SQLite BM25 search index and locks
+├── .akatsuki/          # Local SQLite BM25 + vector search index and locks (gitignored)
 ├── .gitignore          # Pre-configured multi-machine ignores
 ├── AGENTS.md           # Master architectural protocol and invariants
 ├── INDEX.md            # Auto-maintained catalog and domain index
@@ -61,14 +71,20 @@ knowledge-base/
 ### 3. Basic CLI Commands
 
 ```bash
-# Search notes using Okapi BM25 ranking
-akatsuki search "docker swarm routing"
+# Hybrid Search (Okapi BM25 + Dense Semantic Vectors via RRF, k=60)
+akatsuki search "docker swarm routing" --mode hybrid
+
+# Pure lexical BM25 search
+akatsuki search "docker swarm routing" --mode bm25
+
+# Pure semantic vector search
+akatsuki search "hardware specifications of primary host" --mode vector
 
 # Read a note or specific section with token budget packing
 akatsuki read "Cluster-Topology" --section "Private Network Routing"
 
 # Calculate blast radius for a service before making changes
-akatsuki blast bountools
+akatsuki blast auth-service
 
 # Run living invariant checks across system documentation
 akatsuki test

@@ -188,6 +188,45 @@ class TestMapAndSearch(unittest.TestCase):
         finally:
             core.CURRENT_VAULT_OVERRIDE = None
 
+    def test_search_vault_modes(self):
+        # 1. BM25 mode
+        res_bm25 = search_vault(self.vault, "Node Alpha", mode="bm25")
+        self.assertTrue(len(res_bm25) > 0)
+        self.assertEqual(res_bm25[0]["stem"], "node_a")
+
+        # 2. Hybrid mode (default)
+        res_hybrid = search_vault(self.vault, "processor", mode="hybrid")
+        self.assertTrue(len(res_hybrid) > 0)
+        self.assertEqual(res_hybrid[0]["stem"], "node_b")
+
+    def test_mcp_search_hybrid_and_vault_params(self):
+        import akatsuki.core as core
+
+        core.CURRENT_VAULT_OVERRIDE = self.vault
+        try:
+            req = {
+                "jsonrpc": "2.0",
+                "id": 103,
+                "method": "tools/call",
+                "params": {
+                    "name": "akatsuki_search",
+                    "arguments": {
+                        "query": "terminal sink",
+                        "mode": "hybrid",
+                        "vault": "akatsuki",
+                        "with_graph": False,
+                    },
+                },
+            }
+            res = dispatch_single_request(req)
+            self.assertEqual(res["id"], 103)
+            self.assertFalse(res["result"]["isError"])
+            text = res["result"]["content"][0]["text"]
+            self.assertIn("Mode: hybrid", text)
+            self.assertIn("node_e.md", text)
+        finally:
+            core.CURRENT_VAULT_OVERRIDE = None
+
 
 if __name__ == "__main__":
     unittest.main()

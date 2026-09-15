@@ -19,12 +19,13 @@ KERNEL:
     2_PURITY:     Pure Markdown & Strict YAML — zero Obsidian plugin lock-in
     3_BUDGETING:  Token-Bounded Reads (contract > read --budget > full read)
     4_INTEGRITY:  Zero Orphan Notes — wikilink resolution verify == exit 0
+    5_OPTIONAL_ML: Zero-dep core; `akatsuki[embeddings]` (sentence-transformers, torch), CPU threads <= 2, local ephemeral vectors.db
 ```
 
 ## SYNOPSIS
 
 ```shell
-akatsuki search   <query> [--domain <domain>] [--limit <N>] [--with-graph] [--json]
+akatsuki search   <query> [--domain <domain>] [--limit <N>] [--mode hybrid|bm25|vector] [--with-graph] [--json]
 akatsuki contract <note> [--json]
 akatsuki read     <note> [--section <sec>] [--budget <N>] [--json]
 akatsuki get      <key> [--json]
@@ -56,7 +57,7 @@ ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
 1. **TURN-0 (Inbound Orientation)**:
    - Live Topology & Ports: `akatsuki services` | MCP: `akatsuki_services()`
    - Project Stacks: `akatsuki projects` | MCP: `akatsuki_projects()`
-   - Knowledge Search: `akatsuki search "<topic>" [--with-graph]` | MCP: `akatsuki_search(query="<topic>", with_graph=True)`
+   - Knowledge Search: `akatsuki search "<topic>" [--mode hybrid] [--with-graph]` | MCP: `akatsuki_search(query="<topic>", mode="hybrid", with_graph=True)`
 2. **CONTRACT (Token-Dense Slicing)**:
    - `akatsuki contract <note>` | MCP: `akatsuki_contract(note="<note>")`
    - Slices pure machine-actionable boundaries (ports, network, relations, invariants, verifications), eliminating 70–90% narrative token bloat.
@@ -79,13 +80,18 @@ ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
 
 ## SUBCOMMAND SPECIFICATIONS
 
-### `search` — Okapi BM25 Knowledge Search
+### `search` — Hybrid BM25 & Dense Vector Search
 ```shell
-akatsuki search <query> [--domain <domain>] [--limit <N>] [--with-graph] [--json]
+akatsuki search <query> [--domain <domain>] [--limit <N>] [--mode hybrid|bm25|vector] [--with-graph] [--json]
 ```
-- Full-text search over SQLite FTS5 index with `unicode61` tokenizer and morphological suffix expansion.
-- `--domain <dir>`: Restrict search (e.g. `20-Projects`, `40-Systems`).
-- `--limit <N>`: Truncate matches to fit token budgets (default: 10).
+- **Retrieval Modes** (`--mode`, `-m`):
+  - `hybrid` (default): Fuses Okapi BM25 keyword rankings and dense semantic embeddings via Reciprocal Rank Fusion (RRF, $k=60$).
+  - `bm25`: Fast full-text search over SQLite FTS5 with `unicode61` tokenizer, column weighting (title 10 / tags 5 / summary 5 / body 1), and morphological suffix expansion.
+  - `vector`: Pure cosine similarity over local 384-dimensional dense vectors (`multilingual-e5-small`).
+- **Incremental Metadata Caching**: Maintains `.akatsuki/vectors.db` tracking `(rel_path, mtime, size)`. Unchanged notes skip inference in $<5\text{ ms}$; zero-cost re-indexing on subsequent queries.
+- **Activity & Work Log Recall**: Work logs deposited via `akatsuki log` are parsed with contextual breadcrumbs (`[Document: ...]`, `[Breadcrumb: ...]`), enabling conceptual queries against past tasks without needing exact commit hashes.
+- `--domain <dir>`: Restrict search (e.g. `20-Projects`, `40-Systems`, `01-Daily`, `30-Agents`).
+- `--limit <N>`, `-n`: Truncate matches to fit token budgets (default: 10).
 - `--with-graph`, `-g`: Attach immediate 1-hop upstream dependents, downstream dependencies, and container/port allocations directly to search results.
 
 ### `contract` — Boundary Contract Slicing
@@ -107,7 +113,7 @@ akatsuki read <note> [--section <sec>] [--budget <N>] [--json]
 akatsuki get <key> [--json]    # Sub-millisecond O(1) exact property getter
 akatsuki query <sql> [--json]  # Read-only SQL query against SQLite index
 ```
-- `get`: Fast dot-path access (e.g. `services.bountools.ports`, `entities.filament.repo`, `systems.TanriZarAtmaz-Host.status`).
+- `get`: Fast dot-path access (e.g. `services.api.ports`, `entities.service.repo`, `systems.primary-host.status`).
 - `query`: Direct SQL querying against index tables (`entities`, `services`, `relations`, `invariants`, `verifications`).
 
 ### `blast` — Dependency & Ripple Analysis
@@ -169,7 +175,7 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`
 
 | MCP Tool | CLI Equivalent | Key Arguments |
 | :--- | :--- | :--- |
-| `akatsuki_search` | `akatsuki search` | `query`, `domain`, `limit`, `with_graph` |
+| `akatsuki_search` | `akatsuki search` | `query`, `mode`, `domain`, `limit`, `with_graph` |
 | `akatsuki_contract` | `akatsuki contract` | `note` |
 | `akatsuki_read` | `akatsuki read` | `note`, `section`, `budget` |
 | `akatsuki_get` | `akatsuki get` | `key` |

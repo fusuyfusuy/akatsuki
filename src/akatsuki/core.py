@@ -22,10 +22,12 @@ try:
 except ImportError:
     HAVE_FCNTL = False
 import json
+import math
 import os
 import re
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -694,14 +696,510 @@ def build_fts_clause(words: list[str], op: str = "AND") -> str:
     return f" {op} ".join(groups)
 
 
+# ---------------------------------------------------------------------------
+# Semantic Vector Embeddings & Hybrid Retrieval Subsystem
+# ---------------------------------------------------------------------------
+
+DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-small"
+DEFAULT_EMBED_DIM = 384
+DEFAULT_EMBED_BATCH_SIZE = 32
+MAX_CHUNK_CHARS = 1800
+
+_EMBED_MODEL_INSTANCE = None
+
+
+def normalize_vector(v: list[float]) -> list[float]:
+    """Normalize vector to unit length (L2 norm = 1.0)."""
+    norm = math.sqrt(sum(x * x for x in v))
+    if norm == 0.0:
+        return v
+    return [x / norm for x in v]
+
+
+def dot_product(v1: list[float], v2: tuple[float, ...]) -> float:
+    """Compute dot product of two unit vectors (cosine similarity)."""
+    return sum(a * b for a, b in zip(v1, v2, strict=True))
+
+
+def pack_vector(v: list[float]) -> bytes:
+    """Pack float array into compact binary blob."""
+    return struct.pack(f"{len(v)}f", *v)
+
+
+def unpack_vector(blob: bytes, dim: int) -> tuple[float, ...]:
+    """Unpack binary blob back into float tuple."""
+    return struct.unpack(f"{dim}f", blob)
+
+
+def get_external_embed_python() -> Path | None:
+    """Locate an external virtual environment with torch/sentence_transformers if available."""
+    env_py = os.environ.get("AKATSUKI_EMBED_PYTHON")
+    if env_py and Path(env_py).is_file():
+        return Path(env_py)
+
+    kb_env = os.environ.get("KNOWLEDGE_BASE_DIR")
+    if kb_env and (Path(kb_env) / ".venv" / "bin" / "python").is_file():
+        return Path(kb_env) / ".venv" / "bin" / "python"
+
+    candidates = [
+        Path.home() / "configs" / "knowledge-base" / ".venv" / "bin" / "python",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def get_embed_model(model_name: str = DEFAULT_EMBED_MODEL):
+    """Lazy-load SentenceTransformer model on CPU clamped to 2 threads."""
+    global _EMBED_MODEL_INSTANCE
+    if _EMBED_MODEL_INSTANCE is not None:
+        return _EMBED_MODEL_INSTANCE
+
+    try:
+        import torch
+        from sentence_transformers import SentenceTransformer
+    except ImportError as e:
+        raise RuntimeError("SentenceTransformers/PyTorch not installed in this Python environment.") from e
+
+    torch.set_num_threads(2)
+    _EMBED_MODEL_INSTANCE = SentenceTransformer(model_name, device="cpu")
+    return _EMBED_MODEL_INSTANCE
+
+
+def encode_texts(
+    texts: list[str],
+    model_name: str = DEFAULT_EMBED_MODEL,
+    batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
+) -> list[list[float]]:
+    """Encode document chunks locally applying the E5 'passage: ' prefix."""
+    try:
+        model = get_embed_model(model_name)
+        prefixed = [f"passage: {t}" if not t.startswith("passage: ") else t for t in texts]
+        raw = model.encode(prefixed, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False)
+        return [vec.tolist() for vec in raw]
+    except RuntimeError:
+        ext_py = get_external_embed_python()
+        if ext_py and sys.executable != str(ext_py):
+            code = (
+                "from sentence_transformers import SentenceTransformer; "
+                "import torch, json, sys; "
+                "torch.set_num_threads(2); "
+                f"m = SentenceTransformer({model_name!r}, device='cpu'); "
+                "texts = json.loads(sys.stdin.read()); "
+                "prefixed = [f'passage: {t}' for t in texts]; "
+                "vecs = m.encode(prefixed, batch_size=32, normalize_embeddings=True, show_progress_bar=False); "
+                "print(json.dumps([v.tolist() for v in vecs]))"
+            )
+            res = subprocess.run(
+                [str(ext_py), "-c", code],
+                input=json.dumps(texts),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(res.stdout)
+        raise
+
+
+def encode_query(query: str, model_name: str = DEFAULT_EMBED_MODEL) -> list[float]:
+    """Encode search query applying the E5 'query: ' prefix."""
+    try:
+        model = get_embed_model(model_name)
+        prefixed = f"query: {query.strip()}"
+        raw = model.encode([prefixed], normalize_embeddings=True, show_progress_bar=False)
+        return raw[0].tolist()
+    except RuntimeError:
+        ext_py = get_external_embed_python()
+        if ext_py and sys.executable != str(ext_py):
+            code = (
+                "from sentence_transformers import SentenceTransformer; "
+                "import torch, json; "
+                "torch.set_num_threads(2); "
+                f"m = SentenceTransformer({model_name!r}, device='cpu'); "
+                f"raw = m.encode(['query: ' + {query.strip()!r}], normalize_embeddings=True, show_progress_bar=False); "
+                "print(json.dumps(raw[0].tolist()))"
+            )
+            res = subprocess.run([str(ext_py), "-c", code], capture_output=True, text=True, check=True)
+            return json.loads(res.stdout)
+        raise
+
+
+def get_vectors_db(vault: Path) -> sqlite3.Connection:
+    """Connect to vault SQLite vector database, initializing schema if needed."""
+    cache_dir = vault / ".akatsuki"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    db_path = cache_dir / "vectors.db"
+    con = sqlite3.connect(str(db_path), timeout=30.0)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+
+    con.execute("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, val TEXT);")
+    cur = con.execute("SELECT val FROM schema_meta WHERE key = 'version';")
+    row = cur.fetchone()
+    if not row or row["val"] != "1":
+        con.execute("DROP TABLE IF EXISTS note_vectors;")
+        con.execute("DROP TABLE IF EXISTS file_meta;")
+        con.execute("""
+            CREATE TABLE file_meta (
+                rel_path TEXT PRIMARY KEY,
+                mtime REAL NOT NULL,
+                size INTEGER NOT NULL,
+                chunk_count INTEGER NOT NULL DEFAULT 1,
+                indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        con.execute("""
+            CREATE TABLE note_vectors (
+                chunk_id TEXT PRIMARY KEY,
+                rel_path TEXT NOT NULL,
+                stem TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                display_title TEXT NOT NULL,
+                display_summary TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                breadcrumb TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                total_chunks INTEGER NOT NULL,
+                preview TEXT NOT NULL,
+                vector_blob BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                model_name TEXT NOT NULL
+            );
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_vectors_rel_path ON note_vectors(rel_path);")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_vectors_domain ON note_vectors(domain);")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_vectors_stem ON note_vectors(stem);")
+        con.execute("INSERT OR REPLACE INTO schema_meta (key, val) VALUES ('version', '1');")
+        con.commit()
+
+    return con
+
+
+def chunk_akatsuki_note(
+    rel_path: str,
+    text: str,
+    stem: str,
+    domain: str,
+    max_chunk_chars: int = MAX_CHUNK_CHARS,
+) -> list[dict]:
+    """Split markdown note into hierarchical chunks with contextual breadcrumbs and metadata."""
+    fm, body = parse_frontmatter(text)
+    display_title = str(fm.get("title") or stem)
+    display_summary = str(fm.get("summary") or "")
+    tags = fm.get("tags") or ""
+    if isinstance(tags, list):
+        tags_str = " ".join(str(t) for t in tags)
+    else:
+        tags_str = str(tags)
+
+    cleaned_body = body.strip()
+    if not cleaned_body:
+        return [
+            {
+                "chunk_id": f"{rel_path}#0",
+                "rel_path": rel_path,
+                "stem": stem,
+                "domain": domain,
+                "display_title": display_title,
+                "display_summary": display_summary,
+                "tags": tags_str,
+                "breadcrumb": display_title,
+                "chunk_index": 0,
+                "total_chunks": 1,
+                "preview": display_summary or display_title,
+                "embed_text": f"[Document: {display_title}] [Domain: {domain}] [Path: {rel_path}] [Tags: {tags_str}]\n\n{display_summary}",
+            }
+        ]
+
+    # Split by markdown headings
+    sections: list[tuple[str, list[str]]] = []
+    current_breadcrumb = display_title
+    current_lines: list[str] = []
+
+    for line in cleaned_body.splitlines():
+        h_match = re.match(r"^(#{1,4})\s+(.*)$", line)
+        if h_match:
+            if current_lines:
+                sections.append((current_breadcrumb, current_lines))
+                current_lines = []
+            heading_title = re.sub(r"[\*\_\[\]\#]", "", h_match.group(2)).strip()
+            current_breadcrumb = f"{display_title} > {heading_title}"
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        sections.append((current_breadcrumb, current_lines))
+
+    raw_chunks: list[tuple[str, str]] = []
+    accumulated: list[str] = []
+    chunk_breadcrumb = display_title
+    current_size = 0
+
+    for bcrumb, slines in sections:
+        sec_text = "\n".join(slines).strip()
+        sec_len = len(sec_text)
+
+        if sec_len > max_chunk_chars:
+            if accumulated:
+                raw_chunks.append((chunk_breadcrumb, "\n\n".join(accumulated)))
+                accumulated = []
+                current_size = 0
+            paragraphs = sec_text.split("\n\n")
+            p_acc: list[str] = []
+            p_size = 0
+            for para in paragraphs:
+                p = para.strip()
+                if not p:
+                    continue
+                if p_size + len(p) > max_chunk_chars and p_acc:
+                    raw_chunks.append((bcrumb, "\n\n".join(p_acc)))
+                    p_acc = [p]
+                    p_size = len(p)
+                else:
+                    p_acc.append(p)
+                    p_size += len(p)
+            if p_acc:
+                raw_chunks.append((bcrumb, "\n\n".join(p_acc)))
+            chunk_breadcrumb = bcrumb
+            continue
+
+        if current_size + sec_len > max_chunk_chars and accumulated:
+            raw_chunks.append((chunk_breadcrumb, "\n\n".join(accumulated)))
+            accumulated = [sec_text]
+            chunk_breadcrumb = bcrumb
+            current_size = sec_len
+        else:
+            if not accumulated:
+                chunk_breadcrumb = bcrumb
+            accumulated.append(sec_text)
+            current_size += sec_len
+
+    if accumulated:
+        raw_chunks.append((chunk_breadcrumb, "\n\n".join(accumulated)))
+
+    if not raw_chunks:
+        raw_chunks.append((display_title, cleaned_body))
+
+    total_chunks = len(raw_chunks)
+    chunks = []
+    for i, (bcrumb, ctext) in enumerate(raw_chunks):
+        chunk_id = f"{rel_path}#{i}"
+        header_lines = [
+            f"[Document: {display_title}]",
+            f"[Domain: {domain}]",
+            f"[Path: {rel_path}]",
+        ]
+        if tags_str:
+            header_lines.append(f"[Tags: {tags_str}]")
+        if display_summary:
+            header_lines.append(f"[Summary: {display_summary}]")
+        header_lines.append(f"[Breadcrumb: {bcrumb}]")
+        header_lines.append(f"[Chunk: {i + 1} of {total_chunks}]")
+
+        embed_text = "\n".join(header_lines) + "\n\n" + ctext
+        first_lines = [ln.strip() for ln in ctext.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        preview = " ".join(first_lines)[:250] if first_lines else ctext[:250].strip()
+
+        chunks.append(
+            {
+                "chunk_id": chunk_id,
+                "rel_path": rel_path,
+                "stem": stem,
+                "domain": domain,
+                "display_title": display_title,
+                "display_summary": display_summary,
+                "tags": tags_str,
+                "breadcrumb": bcrumb,
+                "chunk_index": i,
+                "total_chunks": total_chunks,
+                "preview": preview,
+                "embed_text": embed_text,
+            }
+        )
+
+    return chunks
+
+
+def sync_vectors_index(
+    vault: Path,
+    con: sqlite3.Connection | None = None,
+    model_name: str = DEFAULT_EMBED_MODEL,
+) -> dict:
+    """Incrementally synchronize SQLite vector database using file metadata (mtime, size)."""
+    close_con = False
+    if con is None:
+        con = get_vectors_db(vault)
+        close_con = True
+
+    try:
+        cur = con.execute("SELECT rel_path, mtime, size FROM file_meta")
+        indexed = {row["rel_path"]: (row["mtime"], row["size"]) for row in cur.fetchall()}
+
+        current_files = {}
+        for f in vault.glob("**/*.md"):
+            rel = str(f.relative_to(vault))
+            if rel.startswith("_templates") or rel.startswith(".") or "/." in rel:
+                continue
+            try:
+                stat = f.stat()
+                current_files[rel] = (f, stat.st_mtime, stat.st_size)
+            except Exception:
+                continue
+
+        # 1. Prune deleted notes
+        deleted = set(indexed.keys()) - set(current_files.keys())
+        for d in deleted:
+            con.execute("DELETE FROM note_vectors WHERE rel_path = ?", (d,))
+            con.execute("DELETE FROM file_meta WHERE rel_path = ?", (d,))
+
+        # 2. Check which notes are new or modified
+        to_embed: list[tuple[str, Path, float, int]] = []
+        for rel, (f, mtime, size) in current_files.items():
+            prev = indexed.get(rel)
+            if prev is not None and prev[0] == mtime and prev[1] == size:
+                continue
+            to_embed.append((rel, f, mtime, size))
+
+        if not to_embed and not deleted:
+            return {"added": 0, "updated": 0, "deleted": 0, "unchanged": len(current_files)}
+
+        chunks_to_encode: list[dict] = []
+        file_chunk_map: dict[str, tuple[float, int, int]] = {}
+
+        for rel, f, mtime, size in to_embed:
+            try:
+                text = f.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            stem = f.stem
+            domain = rel.split("/")[0] if "/" in rel else ""
+            n_chunks = chunk_akatsuki_note(rel, text, stem, domain)
+            chunks_to_encode.extend(n_chunks)
+            file_chunk_map[rel] = (mtime, size, len(n_chunks))
+
+        if chunks_to_encode:
+            texts = [c["embed_text"] for c in chunks_to_encode]
+            vectors = encode_texts(texts, model_name=model_name)
+
+            for c, vec in zip(chunks_to_encode, vectors, strict=True):
+                blob = pack_vector(vec)
+                con.execute(
+                    """INSERT OR REPLACE INTO note_vectors (
+                        chunk_id, rel_path, stem, domain, display_title, display_summary,
+                        tags, breadcrumb, chunk_index, total_chunks, preview, vector_blob, dim, model_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        c["chunk_id"],
+                        c["rel_path"],
+                        c["stem"],
+                        c["domain"],
+                        c["display_title"],
+                        c["display_summary"],
+                        c["tags"],
+                        c["breadcrumb"],
+                        c["chunk_index"],
+                        c["total_chunks"],
+                        c["preview"],
+                        blob,
+                        len(vec),
+                        model_name,
+                    ),
+                )
+
+            for rel, (mtime, size, count) in file_chunk_map.items():
+                con.execute(
+                    "INSERT OR REPLACE INTO file_meta (rel_path, mtime, size, chunk_count) VALUES (?, ?, ?, ?)",
+                    (rel, mtime, size, count),
+                )
+
+        con.commit()
+        return {
+            "added": len([r for r, _, _, _ in to_embed if r not in indexed]),
+            "updated": len([r for r, _, _, _ in to_embed if r in indexed]),
+            "deleted": len(deleted),
+            "unchanged": len(current_files) - len(to_embed),
+        }
+    finally:
+        if close_con:
+            con.close()
+
+
+def search_vectors_akatsuki(
+    vault: Path,
+    query: str,
+    domain: str | None = None,
+    limit: int = 10,
+    con: sqlite3.Connection | None = None,
+    model_name: str = DEFAULT_EMBED_MODEL,
+) -> list[dict]:
+    """Search Akatsuki vectors by cosine similarity, aggregating at document level."""
+    close_con = False
+    if con is None:
+        con = get_vectors_db(vault)
+        close_con = True
+
+    try:
+        sync_vectors_index(vault, con, model_name=model_name)
+        q_vec = encode_query(query, model_name=model_name)
+
+        sql = "SELECT chunk_id, rel_path, stem, domain, display_title, display_summary, breadcrumb, preview, vector_blob, dim FROM note_vectors"
+        params: list[object] = []
+        if domain:
+            sql += " WHERE domain = ?"
+            params.append(domain)
+
+        cur = con.execute(sql, params)
+        rows = cur.fetchall()
+        if not rows:
+            return []
+
+        doc_best: dict[str, dict] = {}
+        for r in rows:
+            rel = r["rel_path"]
+            dim = r["dim"]
+            vec = unpack_vector(r["vector_blob"], dim)
+            sim = dot_product(q_vec, vec)
+
+            prev = doc_best.get(rel)
+            if prev is None or sim > prev["similarity"]:
+                doc_best[rel] = {
+                    "rel_path": rel,
+                    "stem": r["stem"],
+                    "domain": r["domain"],
+                    "title": r["display_title"],
+                    "summary": r["display_summary"],
+                    "similarity": sim,
+                    "breadcrumb": r["breadcrumb"],
+                    "snippet": r["preview"],
+                    "vault": "akatsuki",
+                }
+
+        results = sorted(doc_best.values(), key=lambda x: x["similarity"], reverse=True)[:limit]
+        for r in results:
+            r["score"] = round(r["similarity"], 4)
+            r["matches"] = [(1, r["snippet"])] if r["snippet"] else []
+        return results
+    finally:
+        if close_con:
+            con.close()
+
+
 def search_vault(
     vault: Path,
     query: str,
     domain: str | None = None,
     limit: int | str = 10,
     with_graph: bool = False,
+    mode: str = "hybrid",
 ) -> list[dict]:
-    """Search notes in vault using Okapi BM25 ranking over SQLite FTS5 index, optionally augmenting with 1-hop graph relations."""
+    """Search notes in Akatsuki vault.
+    Modes:
+      - 'hybrid': BM25 + dense semantic vectors via Reciprocal Rank Fusion (RRF, k=60, default).
+      - 'bm25': Pure lexical Okapi BM25 ranking over SQLite FTS5 index.
+      - 'vector': Pure semantic dense vector retrieval over multilingual-e5-small (384D).
+    """
     clean_query = query.strip()
     if not clean_query:
         return []
@@ -711,61 +1209,123 @@ def search_vault(
             limit = int(limit)
         except (ValueError, TypeError):
             limit = 10
-
-    con = get_fts_db(vault)
-    sync_fts_index(vault, con)
-
-    words = re.findall(r"\w+", clean_query)
-    if not words:
-        return []
-
-    if clean_query.startswith('"') and clean_query.endswith('"') and len(clean_query) > 2:
-        phrase = clean_query.strip('"').replace('"', '""')
-        queries_to_try = [f'"{phrase}"']
     else:
-        and_query = build_fts_clause(words, op="AND")
-        or_query = build_fts_clause(words, op="OR")
-        queries_to_try = [and_query]
-        if len(words) > 1:
-            queries_to_try.append(or_query)
+        limit = 10
 
-    domain_clause = "AND domain = ?" if domain else ""
-    sql = f"""
-        SELECT rel_path, stem, domain, title, summary,
-               bm25(notes_fts, 0, 0, 0, 10.0, 5.0, 5.0, 1.0) as score,
-               snippet(notes_fts, 6, '**', '**', '...', 12) as snippet
-        FROM notes_fts
-        WHERE notes_fts MATCH ? {domain_clause}
-        ORDER BY score
-        LIMIT ?
-    """
+    def _run_akatsuki_bm25(cand_limit: int) -> list[dict]:
+        con = get_fts_db(vault)
+        sync_fts_index(vault, con)
 
-    rows = []
-    for q_candidate in queries_to_try:
-        params = (q_candidate, domain, limit) if domain else (q_candidate, limit)
+        words = re.findall(r"\w+", clean_query)
+        if not words:
+            return []
+
+        if clean_query.startswith('"') and clean_query.endswith('"') and len(clean_query) > 2:
+            phrase = clean_query.strip('"').replace('"', '""')
+            queries_to_try = [f'"{phrase}"']
+        else:
+            and_query = build_fts_clause(words, op="AND")
+            or_query = build_fts_clause(words, op="OR")
+            queries_to_try = [and_query]
+            if len(words) > 1:
+                queries_to_try.append(or_query)
+
+        domain_clause = "AND domain = ?" if domain else ""
+        sql = f"""
+            SELECT rel_path, stem, domain, title, summary,
+                   bm25(notes_fts, 0, 0, 0, 10.0, 5.0, 5.0, 1.0) as score,
+                   snippet(notes_fts, 6, '**', '**', '...', 12) as snippet
+            FROM notes_fts
+            WHERE notes_fts MATCH ? {domain_clause}
+            ORDER BY score
+            LIMIT ?
+        """
+
+        rows = []
+        for q_candidate in queries_to_try:
+            params = (q_candidate, domain, cand_limit) if domain else (q_candidate, cand_limit)
+            try:
+                cur = con.execute(sql, params)
+                rows = cur.fetchall()
+                if rows:
+                    break
+            except Exception:
+                continue
+
+        ak_results = []
+        for r in rows:
+            snip = r["snippet"].strip() if r["snippet"] else ""
+            ak_results.append(
+                {
+                    "rel_path": r["rel_path"],
+                    "stem": r["stem"],
+                    "domain": r["domain"],
+                    "title": r["title"],
+                    "summary": r["summary"],
+                    "score": round(abs(r["score"]), 3),
+                    "snippet": snip,
+                    "matches": [(1, snip)] if snip else [],
+                }
+            )
+        return ak_results
+
+    # Mode: bm25
+    if mode == "bm25":
+        results = _run_akatsuki_bm25(limit)
+
+    # Mode: vector
+    elif mode == "vector":
         try:
-            cur = con.execute(sql, params)
-            rows = cur.fetchall()
-            if rows:
-                break
+            vec_hits = search_vectors_akatsuki(vault, clean_query, domain=domain, limit=limit)
         except Exception:
-            continue
+            vec_hits = []
+        results = sorted(vec_hits, key=lambda x: x.get("score", 0.0), reverse=True)[:limit]
 
-    results = []
-    for r in rows:
-        snip = r["snippet"].strip() if r["snippet"] else ""
-        item = {
-            "rel_path": r["rel_path"],
-            "stem": r["stem"],
-            "domain": r["domain"],
-            "title": r["title"],
-            "summary": r["summary"],
-            "score": round(abs(r["score"]), 3),
-            "snippet": snip,
-            "matches": [(1, snip)] if snip else [],
-        }
-        if with_graph:
-            s_stem = r["stem"]
+    # Mode: hybrid (default)
+    else:
+        cand_limit = max(limit * 2, 20)
+        bm25_hits = _run_akatsuki_bm25(cand_limit)
+        try:
+            vec_hits = search_vectors_akatsuki(vault, clean_query, domain=domain, limit=cand_limit)
+        except Exception:
+            vec_hits = []
+
+        if not vec_hits:
+            results = bm25_hits[:limit]
+        elif not bm25_hits:
+            results = vec_hits[:limit]
+        else:
+            k = 60.0
+            rrf_scores: dict[str, float] = {}
+            doc_map: dict[str, dict] = {}
+
+            for rank, h in enumerate(bm25_hits, 1):
+                key = h["rel_path"]
+                rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (k + rank)
+                doc_map[key] = dict(h)
+
+            for rank, h in enumerate(vec_hits, 1):
+                key = h["rel_path"]
+                rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (k + rank)
+                if key not in doc_map:
+                    doc_map[key] = dict(h)
+                else:
+                    if h.get("snippet") and not doc_map[key].get("snippet"):
+                        doc_map[key]["snippet"] = h["snippet"]
+                    if h.get("breadcrumb"):
+                        doc_map[key]["breadcrumb"] = h["breadcrumb"]
+
+            sorted_keys = sorted(rrf_scores.keys(), key=lambda kd: rrf_scores[kd], reverse=True)[:limit]
+            results = []
+            for sk in sorted_keys:
+                item = doc_map[sk]
+                item["score"] = round(rrf_scores[sk], 4)
+                results.append(item)
+
+    if with_graph and results:
+        con = get_fts_db(vault)
+        for item in results:
+            s_stem = item["stem"]
             cur_up = con.execute(
                 "SELECT source_rel, relation_type FROM relations WHERE target_stem = ? LIMIT 5",
                 (s_stem,),
@@ -789,8 +1349,6 @@ def search_vault(
                 "downstream": down_rows,
                 "services": svc_rows,
             }
-
-        results.append(item)
 
     return results
 
@@ -1597,7 +2155,7 @@ def verify_links(vault: Path) -> tuple[bool, list[tuple[str, str]]]:
     return len(issues) == 0, issues
 
 
-def reconcile_vault(vault: Path, dry_run: bool = False) -> tuple[str, bool]:
+def reconcile_vault(vault: Path, dry_run: bool = False, with_vectors: bool = False) -> tuple[str, bool]:
     """Scan vault, auto-quote strict YAML fields, and auto-append unindexed notes to parent MOCs."""
     actions = []
 
@@ -1704,6 +2262,16 @@ def reconcile_vault(vault: Path, dry_run: bool = False) -> tuple[str, bool]:
                 else:
                     new_moc = moc_text.rstrip() + f"\n\n{entry}\n"
                 moc_path.write_text(new_moc, encoding="utf-8")
+
+    if not dry_run and with_vectors:
+        try:
+            vec_res = sync_vectors_index(vault)
+            if vec_res.get("added") or vec_res.get("updated") or vec_res.get("deleted"):
+                actions.append(
+                    f"Synchronized vector embeddings (+{vec_res['added']}, ~{vec_res['updated']}, -{vec_res['deleted']})"
+                )
+        except Exception:
+            pass
 
     if not actions:
         return (
@@ -2114,14 +2682,24 @@ def list_notes_in_vault(vault: Path, domain: str | None = None) -> list[dict]:
 def cli_search(args):
     vault = get_vault()
     with_graph = getattr(args, "with_graph", False)
-    results = search_vault(vault, args.query, domain=args.domain, limit=args.limit, with_graph=with_graph)
+    mode = getattr(args, "mode", "hybrid")
+    results = search_vault(
+        vault,
+        args.query,
+        domain=args.domain,
+        limit=args.limit,
+        with_graph=with_graph,
+        mode=mode,
+    )
     if not results:
         print(f"No notes found matching '{args.query}'.")
         return
 
-    print(f"Found {len(results)} note(s) matching '{args.query}' [Okapi BM25]:\n")
+    print(f"Found {len(results)} note(s) matching '{args.query}' [{mode.upper()}]:\n")
     for r in results:
-        print(f"📄 {r['title']} ({r['rel_path']}) [BM25: {r['score']}]")
+        print(f"📄 {r['title']} ({r['rel_path']}) [Score: {r['score']}]")
+        if r.get("breadcrumb"):
+            print(f"   Section: {r['breadcrumb']}")
         if r["summary"]:
             print(f"   Summary: {r['summary']}")
         if r["snippet"]:
@@ -2364,28 +2942,22 @@ def cli_write(args):
 MCP_TOOLS = [
     {
         "name": "akatsuki_search",
-        "description": "Search notes, architecture specifications, and infrastructure configs in akatsuki using Okapi BM25 ranking, morphological suffix expansion, and excerpt snippets.",
+        "description": "Search notes, architecture specifications, and infrastructure configs using hybrid BM25 + dense semantic vector fusion, with optional 1-hop graph relations.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search terms, topic, or exact phrase in quotes.",
+                    "description": "Search terms, topic, natural language query, or exact phrase in quotes.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["hybrid", "bm25", "vector"],
+                    "description": "Retrieval mode: 'hybrid' (Okapi BM25 + dense semantic vectors via RRF, default), 'bm25' (pure lexical), or 'vector' (dense embeddings).",
                 },
                 "domain": {
                     "type": "string",
-                    "enum": [
-                        "00-Meta",
-                        "01-Daily",
-                        "20-Projects",
-                        "30-Agents",
-                        "40-Systems",
-                        "50-Configs",
-                        "60-Scripts",
-                        "90-Reference",
-                        "90-Database",
-                    ],
-                    "description": "Optional domain directory to restrict search scope.",
+                    "description": "Optional domain directory filter (e.g. '40-Systems', '20-Projects', '30-Agents', '01-Daily').",
                 },
                 "limit": {
                     "type": "integer",
@@ -2407,7 +2979,7 @@ MCP_TOOLS = [
             "properties": {
                 "note": {
                     "type": "string",
-                    "description": "Note title, stem, or relative path (e.g. 'Dokploy-Traefik', '20-Projects/bountools').",
+                    "description": "Note title, stem, or relative path (e.g. 'gateway-ingress', '20-Projects/auth-service').",
                 },
                 "section": {
                     "type": "string",
@@ -2429,7 +3001,7 @@ MCP_TOOLS = [
             "properties": {
                 "note": {
                     "type": "string",
-                    "description": "Note title, stem, or relative path (e.g. 'bountools', 'Dokploy-Traefik').",
+                    "description": "Note title, stem, or relative path (e.g. 'auth-service', 'gateway-ingress').",
                 }
             },
             "required": ["note"],
@@ -2437,13 +3009,13 @@ MCP_TOOLS = [
     },
     {
         "name": "akatsuki_get",
-        "description": "O(1) exact property getter. Query sub-properties like 'services.bountools.ports', 'entities.filament.repo', or '40-Systems/TanriZarAtmaz-Host.host'.",
+        "description": "O(1) exact property getter. Query sub-properties like 'services.api.ports', 'entities.service.repo', or '40-Systems/primary-host.host'.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "Dot-separated keypath (e.g. 'services.bountools.ports', 'entities.filament.repo').",
+                    "description": "Dot-separated keypath (e.g. 'services.api.ports', 'entities.service.repo').",
                 }
             },
             "required": ["key"],
@@ -2457,7 +3029,7 @@ MCP_TOOLS = [
             "properties": {
                 "sql": {
                     "type": "string",
-                    "description": "Read-only SQL query (e.g. 'SELECT name, ports, host FROM services WHERE host = \"TanriZarAtmaz\"').",
+                    "description": "Read-only SQL query (e.g. 'SELECT name, ports, host FROM services WHERE host = \"prod-01\"').",
                 }
             },
             "required": ["sql"],
@@ -2471,7 +3043,7 @@ MCP_TOOLS = [
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "Component or note stem (e.g. 'Dokploy-Traefik', 'TanriZarAtmaz', 'bountools').",
+                    "description": "Component or note stem (e.g. 'ingress-router', 'primary-host', 'auth-service').",
                 }
             },
             "required": ["target"],
@@ -2521,7 +3093,7 @@ MCP_TOOLS = [
             "properties": {
                 "note": {
                     "type": "string",
-                    "description": "Note title, stem, or relative path (e.g. '20-Projects/bountools').",
+                    "description": "Note title, stem, or relative path (e.g. '20-Projects/auth-service').",
                 },
                 "key": {
                     "type": "string",
@@ -2685,13 +3257,23 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
         domain = args.get("domain")
         limit = args.get("limit", 10)
         with_graph = bool(args.get("with_graph", False))
-        results = search_vault(vault, query, domain=domain, limit=limit, with_graph=with_graph)
+        mode = args.get("mode", "hybrid")
+        results = search_vault(
+            vault,
+            query,
+            domain=domain,
+            limit=limit,
+            with_graph=with_graph,
+            mode=mode,
+        )
         if not results:
-            return f"No notes found in akatsuki matching '{query}'.", False
-        out = [f"Found {len(results)} matching note(s) using Okapi BM25:"]
+            return f"No notes found matching '{query}'.", False
+        out = [f"Found {len(results)} matching note(s) [Mode: {mode}]:"]
         for r in results:
-            out.append(f"\n- **{r['title']}** (`{r['rel_path']}`) [BM25 score: {r['score']}]: {r['summary']}")
-            if r["snippet"]:
+            out.append(f"\n- **{r['title']}** (`{r['rel_path']}`) [Score: {r['score']}]: {r['summary']}")
+            if r.get("breadcrumb"):
+                out.append(f"    Section: {r['breadcrumb']}")
+            if r.get("snippet"):
                 out.append(f"    Excerpt: {r['snippet']}")
             if r.get("graph"):
                 g = r["graph"]
@@ -3330,7 +3912,7 @@ def cli_init(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="akatsuki",
         description="Universal CLI and MCP Gateway for the akatsuki Agent Memory Substrate",
@@ -3338,6 +3920,7 @@ def main():
     parser.add_argument(
         "--vault",
         "-V",
+        dest="vault_path",
         help="Path to Akatsuki vault (defaults to $AKATSUKI_VAULT or auto-discovered)",
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -3366,6 +3949,13 @@ def main():
     )
     p_search.add_argument("--limit", "-n", type=int, default=10)
     p_search.add_argument(
+        "--mode",
+        "-m",
+        choices=["hybrid", "bm25", "vector"],
+        default="hybrid",
+        help="Retrieval mode: hybrid (BM25 + Vector, default), bm25, or vector",
+    )
+    p_search.add_argument(
         "--with-graph", "-g", action="store_true", help="Attach 1-hop graph relations and boundary sinks"
     )
 
@@ -3382,7 +3972,7 @@ def main():
 
     # get
     p_get = subparsers.add_parser("get", help="O(1) exact property getter")
-    p_get.add_argument("keypath", help="Keypath (e.g. services.bountools.ports, entities.filament.repo)")
+    p_get.add_argument("keypath", help="Keypath (e.g. services.api.ports, entities.service.repo)")
 
     # query
     p_query = subparsers.add_parser("query", help="Execute read-only SQL against SQLite index")
@@ -3479,11 +4069,16 @@ def main():
     # mcp
     subparsers.add_parser("mcp", help="Run as Model Context Protocol (MCP) server on stdio")
 
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     global CURRENT_VAULT_OVERRIDE
-    if args.vault:
-        CURRENT_VAULT_OVERRIDE = Path(args.vault).expanduser().resolve()
+    if getattr(args, "vault_path", None):
+        CURRENT_VAULT_OVERRIDE = Path(args.vault_path).expanduser().resolve()
 
     if args.command == "init":
         cli_init(args)

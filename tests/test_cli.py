@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from akatsuki.core import (
+    build_parser,
     cli_init,
     lint_vault,
     parse_frontmatter,
@@ -58,6 +59,21 @@ class TestAkatsukiCLI(unittest.TestCase):
         meta, body = parse_frontmatter(content)
         self.assertEqual(meta.get("title"), "Hello World")
         self.assertEqual(body.strip(), "Body text here")
+
+    def test_search_cli_argparse(self):
+        parser = build_parser()
+
+        # Root --vault specifies vault_path
+        args = parser.parse_args(["--vault", "/tmp/custom_vault", "search", "docker", "--mode", "vector"])
+        self.assertEqual(args.vault_path, "/tmp/custom_vault")
+        self.assertEqual(args.query, "docker")
+        self.assertEqual(args.mode, "vector")
+
+        # Search subcommand defaults
+        args = parser.parse_args(["search", "test"])
+        self.assertIsNone(args.vault_path)
+        self.assertEqual(args.query, "test")
+        self.assertEqual(args.mode, "hybrid")
 
 
 if __name__ == "__main__":

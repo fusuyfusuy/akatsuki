@@ -37,6 +37,12 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+embeddings = [
+    "sentence-transformers",
+    "torch",
+]
+
 [project.urls]
 Homepage = "https://github.com/fusuyfusuy/akatsuki"
 Repository = "https://github.com/fusuyfusuy/akatsuki"
