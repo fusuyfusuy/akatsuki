@@ -90,12 +90,15 @@ class TestDeviceTrackingAndFrontmatter(unittest.TestCase):
 
             # Check SQLite DB
             db = get_fts_db(self.vault)
-            sync_fts_index(self.vault, db)
-            cur = db.execute("SELECT stem, updated_by, status FROM entities WHERE stem = 'test-project'")
-            row = cur.fetchone()
-            self.assertIsNotNone(row)
-            self.assertEqual(row["updated_by"], "node-gamma")
-            self.assertEqual(row["status"], "maintenance")
+            try:
+                sync_fts_index(self.vault, db)
+                cur = db.execute("SELECT stem, updated_by, status FROM entities WHERE stem = 'test-project'")
+                row = cur.fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row["updated_by"], "node-gamma")
+                self.assertEqual(row["status"], "maintenance")
+            finally:
+                db.close()
 
 
 if __name__ == "__main__":

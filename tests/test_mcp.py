@@ -1,10 +1,11 @@
+import json
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
 import akatsuki.core as core
-from akatsuki.core import dispatch_single_request, write_note
+from akatsuki.core import VaultLock, dispatch_single_request, write_note
 
 
 class TestAkatsukiMCP(unittest.TestCase):
@@ -115,6 +116,57 @@ class TestAkatsukiMCP(unittest.TestCase):
         res = dispatch_single_request(req)
         self.assertEqual(res["id"], 7)
         self.assertFalse(res["result"]["isError"])
+
+    def test_mcp_blast_json_format(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "akatsuki_blast",
+                "arguments": {"target": "Dokploy-Traefik", "format": "json"},
+            },
+        }
+        res = dispatch_single_request(req)
+        self.assertEqual(res["id"], 8)
+        self.assertFalse(res["result"]["isError"])
+        payload = json.loads(res["result"]["content"][0]["text"])
+        self.assertEqual(payload["target"], "Dokploy-Traefik")
+        self.assertIn("upstream", payload)
+        self.assertIn("downstream", payload)
+        self.assertIn("boundary_sinks", payload)
+
+    def test_mcp_map_json_format(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "akatsuki_map",
+                "arguments": {"target": "Dokploy-Traefik", "format": "json"},
+            },
+        }
+        res = dispatch_single_request(req)
+        self.assertEqual(res["id"], 9)
+        self.assertFalse(res["result"]["isError"])
+        payload = json.loads(res["result"]["content"][0]["text"])
+        self.assertEqual(payload["target"], "Dokploy-Traefik")
+        self.assertIn("downstream", payload)
+        self.assertIn("upstream", payload)
+        self.assertIn("boundary_sinks", payload)
+
+    def test_vault_lock_hardening(self):
+        # A valid vault directory should lock and unlock cleanly
+        with VaultLock(self.vault):
+            self.assertTrue((self.vault / ".akatsuki.lock").exists())
+
+        # An uncreatable path (e.g. under a regular file treated as a dir) should raise RuntimeError
+        dummy_file = self.vault / "dummy_file.txt"
+        dummy_file.write_text("hello", encoding="utf-8")
+        bad_vault = dummy_file / "subfolder"
+        with self.assertRaises(RuntimeError):
+            with VaultLock(bad_vault):
+                pass
 
 
 if __name__ == "__main__":

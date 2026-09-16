@@ -73,6 +73,9 @@ class TestMapAndSearch(unittest.TestCase):
         )
 
     def tearDown(self):
+        import akatsuki.core as core
+
+        core.CURRENT_VAULT_OVERRIDE = None
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_traverse_graph_depth_1_down(self):

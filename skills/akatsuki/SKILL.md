@@ -15,7 +15,7 @@ KERNEL:
   BINARY: ~/.local/bin/akatsuki (CLI) | akatsuki mcp (JSON-RPC stdio)
   VAULT:  ~/configs/knowledge-base/akatsuki (or $AKATSUKI_VAULT)
   INVARIANTS:
-    1_TELEMETRY:  Telegraphic Caveman (<140 chars; No articles/copulas/pronouns)
+    1_TELEMETRY:  Telegraphic Caveman (<= 280 chars soft limit; No articles/copulas/pronouns)
     2_PURITY:     Pure Markdown & Strict YAML — zero Obsidian plugin lock-in
     3_BUDGETING:  Token-Bounded Reads (contract > read --budget > full read)
     4_INTEGRITY:  Zero Orphan Notes — wikilink resolution verify == exit 0
@@ -74,7 +74,7 @@ ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
    - Enforces strict schema conformance, valid frontmatter, and bidirectional wikilink closure across the entire vault.
 6. **LOG (Outbound Telemetry)**:
    - `akatsuki log --project <proj> --summary "<verb> <target> -> <delta>; <evidence>"`
-   - Enforces telegraphic caveman syntax (<140 chars). Injects timestamped entry into today's daily log under kernel lock.
+   - Enforces telegraphic caveman syntax (<= 280 chars soft limit). Injects timestamped entry into today's daily log under kernel lock.
 
 ---
 
@@ -204,7 +204,7 @@ Work log summaries MUST follow this exact schema:
 ```text
 [proj] <verb> <target> -> <delta>; <evidence/exit>
 ```
-* **Rules**: Strictly $<140$ chars. Omit articles (`a`, `an`, `the`), copulas (`is`, `was`), and pronouns (`I`, `we`).
+* **Rules**: Soft limit $\le 280$ chars. Omit articles (`a`, `an`, `the`), copulas (`is`, `was`), and pronouns (`I`, `we`).
 * **Example**: `[dokploy] update traefik-cert -> renew wildcard SAN; exit 0`
 * **Example**: `[filament] patch scraper -> fix selector drift on product grid; smoke test pass`
 

@@ -14,6 +14,7 @@ Pure Agent Memory Substrate:
 import argparse
 import ast
 import datetime
+from contextlib import contextmanager
 
 try:
     import fcntl
@@ -479,6 +480,16 @@ def get_fts_db(vault: Path) -> sqlite3.Connection:
         con.commit()
 
     return con
+
+
+@contextmanager
+def fts_db_context(vault: Path):
+    """Context manager for SQLite FTS connection, ensuring safe closure."""
+    con = get_fts_db(vault)
+    try:
+        yield con
+    finally:
+        con.close()
 
 
 def sync_fts_index(vault: Path, con: sqlite3.Connection) -> None:
@@ -1213,61 +1224,61 @@ def search_vault(
         limit = 10
 
     def _run_akatsuki_bm25(cand_limit: int) -> list[dict]:
-        con = get_fts_db(vault)
-        sync_fts_index(vault, con)
+        with fts_db_context(vault) as con:
+            sync_fts_index(vault, con)
 
-        words = re.findall(r"\w+", clean_query)
-        if not words:
-            return []
+            words = re.findall(r"\w+", clean_query)
+            if not words:
+                return []
 
-        if clean_query.startswith('"') and clean_query.endswith('"') and len(clean_query) > 2:
-            phrase = clean_query.strip('"').replace('"', '""')
-            queries_to_try = [f'"{phrase}"']
-        else:
-            and_query = build_fts_clause(words, op="AND")
-            or_query = build_fts_clause(words, op="OR")
-            queries_to_try = [and_query]
-            if len(words) > 1:
-                queries_to_try.append(or_query)
+            if clean_query.startswith('"') and clean_query.endswith('"') and len(clean_query) > 2:
+                phrase = clean_query.strip('"').replace('"', '""')
+                queries_to_try = [f'"{phrase}"']
+            else:
+                and_query = build_fts_clause(words, op="AND")
+                or_query = build_fts_clause(words, op="OR")
+                queries_to_try = [and_query]
+                if len(words) > 1:
+                    queries_to_try.append(or_query)
 
-        domain_clause = "AND domain = ?" if domain else ""
-        sql = f"""
-            SELECT rel_path, stem, domain, title, summary,
-                   bm25(notes_fts, 0, 0, 0, 10.0, 5.0, 5.0, 1.0) as score,
-                   snippet(notes_fts, 6, '**', '**', '...', 12) as snippet
-            FROM notes_fts
-            WHERE notes_fts MATCH ? {domain_clause}
-            ORDER BY score
-            LIMIT ?
-        """
+            domain_clause = "AND domain = ?" if domain else ""
+            sql = f"""
+                SELECT rel_path, stem, domain, title, summary,
+                       bm25(notes_fts, 0, 0, 0, 10.0, 5.0, 5.0, 1.0) as score,
+                       snippet(notes_fts, 6, '**', '**', '...', 12) as snippet
+                FROM notes_fts
+                WHERE notes_fts MATCH ? {domain_clause}
+                ORDER BY score
+                LIMIT ?
+            """
 
-        rows = []
-        for q_candidate in queries_to_try:
-            params = (q_candidate, domain, cand_limit) if domain else (q_candidate, cand_limit)
-            try:
-                cur = con.execute(sql, params)
-                rows = cur.fetchall()
-                if rows:
-                    break
-            except Exception:
-                continue
+            rows = []
+            for q_candidate in queries_to_try:
+                params = (q_candidate, domain, cand_limit) if domain else (q_candidate, cand_limit)
+                try:
+                    cur = con.execute(sql, params)
+                    rows = cur.fetchall()
+                    if rows:
+                        break
+                except Exception:
+                    continue
 
-        ak_results = []
-        for r in rows:
-            snip = r["snippet"].strip() if r["snippet"] else ""
-            ak_results.append(
-                {
-                    "rel_path": r["rel_path"],
-                    "stem": r["stem"],
-                    "domain": r["domain"],
-                    "title": r["title"],
-                    "summary": r["summary"],
-                    "score": round(abs(r["score"]), 3),
-                    "snippet": snip,
-                    "matches": [(1, snip)] if snip else [],
-                }
-            )
-        return ak_results
+            ak_results = []
+            for r in rows:
+                snip = r["snippet"].strip() if r["snippet"] else ""
+                ak_results.append(
+                    {
+                        "rel_path": r["rel_path"],
+                        "stem": r["stem"],
+                        "domain": r["domain"],
+                        "title": r["title"],
+                        "summary": r["summary"],
+                        "score": round(abs(r["score"]), 3),
+                        "snippet": snip,
+                        "matches": [(1, snip)] if snip else [],
+                    }
+                )
+            return ak_results
 
     # Mode: bm25
     if mode == "bm25":
@@ -1323,32 +1334,32 @@ def search_vault(
                 results.append(item)
 
     if with_graph and results:
-        con = get_fts_db(vault)
-        for item in results:
-            s_stem = item["stem"]
-            cur_up = con.execute(
-                "SELECT source_rel, relation_type FROM relations WHERE target_stem = ? LIMIT 5",
-                (s_stem,),
-            )
-            up_rows = [f"{row['source_rel']} ({row['relation_type']})" for row in cur_up.fetchall()]
+        with fts_db_context(vault) as con:
+            for item in results:
+                s_stem = item["stem"]
+                cur_up = con.execute(
+                    "SELECT source_rel, relation_type FROM relations WHERE target_stem = ? LIMIT 5",
+                    (s_stem,),
+                )
+                up_rows = [f"{row['source_rel']} ({row['relation_type']})" for row in cur_up.fetchall()]
 
-            cur_down = con.execute(
-                "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ? LIMIT 5",
-                (f"{s_stem}.md", f"%/{s_stem}.md", f"%/{s_stem}/%"),
-            )
-            down_rows = [f"{row['target_stem']} ({row['relation_type']})" for row in cur_down.fetchall()]
+                cur_down = con.execute(
+                    "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ? LIMIT 5",
+                    (f"{s_stem}.md", f"%/{s_stem}.md", f"%/{s_stem}/%"),
+                )
+                down_rows = [f"{row['target_stem']} ({row['relation_type']})" for row in cur_down.fetchall()]
 
-            cur_svcs = con.execute(
-                "SELECT name, ports, host, network FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ? LIMIT 3",
-                (s_stem, s_stem, f"%/{s_stem}.md"),
-            )
-            svc_rows = [f"{s['name']}" + (f" (:{s['ports']})" if s["ports"] else "") for s in cur_svcs.fetchall()]
+                cur_svcs = con.execute(
+                    "SELECT name, ports, host, network FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ? LIMIT 3",
+                    (s_stem, s_stem, f"%/{s_stem}.md"),
+                )
+                svc_rows = [f"{s['name']}" + (f" (:{s['ports']})" if s["ports"] else "") for s in cur_svcs.fetchall()]
 
-            item["graph"] = {
-                "upstream": up_rows,
-                "downstream": down_rows,
-                "services": svc_rows,
-            }
+                item["graph"] = {
+                    "upstream": up_rows,
+                    "downstream": down_rows,
+                    "services": svc_rows,
+                }
 
     return results
 
@@ -1522,49 +1533,50 @@ def extract_note_contract(vault: Path, note_query: str) -> tuple[str, bool]:
 
 def get_keypath(vault: Path, keypath: str) -> tuple[str, bool]:
     """Retrieve exact property or entity at keypath."""
-    con = get_fts_db(vault)
-    sync_fts_index(vault, con)
-
     parts = [p.strip() for p in keypath.split(".") if p.strip()]
     if not parts:
         return "Error: Empty keypath.", True
 
     category = parts[0]
-    if category == "services" and len(parts) >= 2:
-        svc_name = parts[1]
-        cur = con.execute("SELECT * FROM services WHERE name = ? OR name LIKE ?", (svc_name, f"{svc_name}%"))
-        row = cur.fetchone()
-        if not row:
-            return f"Error: Service '{svc_name}' not found.", True
-        data = dict(row)
-        if len(parts) == 2:
-            return json.dumps(data, indent=2, default=str), False
-        prop = parts[2]
-        if prop in data:
-            val = data[prop]
-            try:
-                val = json.loads(val)
-            except Exception:
-                pass
-            return (json.dumps(val, default=str) if not isinstance(val, str) else val), False
-        return f"Error: Property '{prop}' not found in service '{svc_name}'.", True
+    if category in ("services", "entities") and len(parts) >= 2:
+        with fts_db_context(vault) as con:
+            sync_fts_index(vault, con)
 
-    elif category == "entities" and len(parts) >= 2:
-        ent_stem = parts[1]
-        cur = con.execute("SELECT * FROM entities WHERE stem = ? OR rel_path = ?", (ent_stem, ent_stem))
-        row = cur.fetchone()
-        if not row:
-            return f"Error: Entity '{ent_stem}' not found.", True
-        meta = json.loads(row["metadata_json"])
-        if len(parts) == 2:
-            return json.dumps(meta, indent=2, default=str), False
-        curr: object = meta
-        for k in parts[2:]:
-            if isinstance(curr, dict) and k in curr:
-                curr = curr[k]
-            else:
-                return f"Error: Property '{k}' not found in '{keypath}'.", True
-        return (json.dumps(curr, default=str) if not isinstance(curr, str) else curr), False
+            if category == "services":
+                svc_name = parts[1]
+                cur = con.execute("SELECT * FROM services WHERE name = ? OR name LIKE ?", (svc_name, f"{svc_name}%"))
+                row = cur.fetchone()
+                if not row:
+                    return f"Error: Service '{svc_name}' not found.", True
+                data = dict(row)
+                if len(parts) == 2:
+                    return json.dumps(data, indent=2, default=str), False
+                prop = parts[2]
+                if prop in data:
+                    val = data[prop]
+                    try:
+                        val = json.loads(val)
+                    except Exception:
+                        pass
+                    return (json.dumps(val, default=str) if not isinstance(val, str) else val), False
+                return f"Error: Property '{prop}' not found in service '{svc_name}'.", True
+
+            elif category == "entities":
+                ent_stem = parts[1]
+                cur = con.execute("SELECT * FROM entities WHERE stem = ? OR rel_path = ?", (ent_stem, ent_stem))
+                row = cur.fetchone()
+                if not row:
+                    return f"Error: Entity '{ent_stem}' not found.", True
+                meta = json.loads(row["metadata_json"])
+                if len(parts) == 2:
+                    return json.dumps(meta, indent=2, default=str), False
+                curr: object = meta
+                for k in parts[2:]:
+                    if isinstance(curr, dict) and k in curr:
+                        curr = curr[k]
+                    else:
+                        return f"Error: Property '{k}' not found in '{keypath}'.", True
+                return (json.dumps(curr, default=str) if not isinstance(curr, str) else curr), False
 
     # Otherwise resolve note by stem/path
     note_file = resolve_note_file(vault, category)
@@ -1599,48 +1611,68 @@ def execute_sql_query(vault: Path, sql: str) -> tuple[str, bool]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     db_path = cache_dir / "index.db"
 
-    con_w = get_fts_db(vault)
-    sync_fts_index(vault, con_w)
-    con_w.close()
+    with fts_db_context(vault) as con_w:
+        sync_fts_index(vault, con_w)
 
+    con_ro = None
     try:
         con_ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10.0)
         con_ro.row_factory = sqlite3.Row
         cur = con_ro.execute(clean_sql)
         rows = [dict(r) for r in cur.fetchall()]
-        con_ro.close()
         return json.dumps(rows, indent=2, default=str), False
     except Exception as e:
         return f"SQL Error: {e!s}", True
+    finally:
+        if con_ro is not None:
+            con_ro.close()
 
 
-def calculate_blast_radius(vault: Path, target: str) -> tuple[str, bool]:
+def calculate_blast_radius(vault: Path, target: str, as_json: bool = False) -> tuple[str, bool]:
     """Calculate upstream dependents, downstream dependencies, and boundary sinks for a target."""
-    con = get_fts_db(vault)
-    sync_fts_index(vault, con)
+    with fts_db_context(vault) as con:
+        sync_fts_index(vault, con)
 
-    t = target.strip()
-    if t.endswith(".md"):
-        t = t[:-3]
-    t_stem = Path(t).stem
+        t = target.strip()
+        if t.endswith(".md"):
+            t = t[:-3]
+        t_stem = Path(t).stem
 
-    cur = con.execute(
-        "SELECT source_rel, relation_type FROM relations WHERE target_stem = ?",
-        (t_stem,),
-    )
-    upstream = cur.fetchall()
+        cur = con.execute(
+            "SELECT source_rel, relation_type FROM relations WHERE target_stem = ?",
+            (t_stem,),
+        )
+        upstream = cur.fetchall()
 
-    cur = con.execute(
-        "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ?",
-        (f"{t_stem}.md", f"%/{t_stem}.md", f"%/{t_stem}/%"),
-    )
-    downstream = cur.fetchall()
+        cur = con.execute(
+            "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ?",
+            (f"{t_stem}.md", f"%/{t_stem}.md", f"%/{t_stem}/%"),
+        )
+        downstream = cur.fetchall()
 
-    cur = con.execute(
-        "SELECT name, ports, host, network, rel_path FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ?",
-        (t_stem, t_stem, f"%/{t_stem}.md"),
-    )
-    svcs = cur.fetchall()
+        cur = con.execute(
+            "SELECT name, ports, host, network, rel_path FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ?",
+            (t_stem, t_stem, f"%/{t_stem}.md"),
+        )
+        svcs = cur.fetchall()
+
+    if as_json:
+        data = {
+            "target": t_stem,
+            "upstream": [{"source_rel": r["source_rel"], "relation_type": r["relation_type"]} for r in upstream],
+            "downstream": [{"target_stem": r["target_stem"], "relation_type": r["relation_type"]} for r in downstream],
+            "boundary_sinks": [
+                {
+                    "name": s["name"],
+                    "ports": s["ports"],
+                    "host": s["host"],
+                    "network": s["network"],
+                    "rel_path": s["rel_path"],
+                }
+                for s in svcs
+            ],
+        }
+        return json.dumps(data, indent=2, default=str), False
 
     out = [f"# 💥 Architectural Blast Radius: `{t_stem}`\n"]
     out.append("## ⬆️ Upstream Dependents (Affected Services / Entry Points)")
@@ -1691,9 +1723,6 @@ def _render_tree_lines(nodes: list[dict], prefix: str = "") -> list[str]:
 
 def traverse_graph(vault: Path, target: str, depth: int = 2, direction: str = "both") -> tuple[str, bool, dict]:
     """Recursively map and traverse the knowledge graph around target up to N hops."""
-    con = get_fts_db(vault)
-    sync_fts_index(vault, con)
-
     t = target.strip()
     if t.endswith(".md"):
         t = t[:-3]
@@ -1709,95 +1738,98 @@ def traverse_graph(vault: Path, target: str, depth: int = 2, direction: str = "b
     if direction not in ("both", "down", "up"):
         direction = "both"
 
-    def _resolve_stem_rel_path(stem: str) -> str:
-        cur = con.execute("SELECT rel_path FROM entities WHERE stem = ? LIMIT 1", (stem,))
-        row = cur.fetchone()
-        if row and row["rel_path"]:
-            return row["rel_path"]
-        return f"{stem}.md"
+    with fts_db_context(vault) as con:
+        sync_fts_index(vault, con)
 
-    def _traverse_down(current_stem: str, current_depth: int, ancestors: set[str]) -> list[dict]:
-        if current_depth >= depth:
-            return []
-        cur = con.execute(
-            "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ?",
-            (f"{current_stem}.md", f"%/{current_stem}.md", f"%/{current_stem}/%"),
-        )
-        children = []
-        for row in cur.fetchall():
-            target_stem = row["target_stem"]
-            rel_type = row["relation_type"]
-            is_cycle = target_stem in ancestors
-            child_node = {
-                "stem": target_stem,
-                "rel_path": _resolve_stem_rel_path(target_stem),
-                "rel_type": rel_type,
-                "cycle": is_cycle,
-                "children": [],
-            }
-            if not is_cycle:
-                child_node["children"] = _traverse_down(target_stem, current_depth + 1, ancestors | {target_stem})
-            children.append(child_node)
-        return children
+        def _resolve_stem_rel_path(stem: str) -> str:
+            cur = con.execute("SELECT rel_path FROM entities WHERE stem = ? LIMIT 1", (stem,))
+            row = cur.fetchone()
+            if row and row["rel_path"]:
+                return row["rel_path"]
+            return f"{stem}.md"
 
-    def _traverse_up(current_stem: str, current_depth: int, ancestors: set[str]) -> list[dict]:
-        if current_depth >= depth:
-            return []
-        cur = con.execute(
-            "SELECT source_rel, relation_type FROM relations WHERE target_stem = ?",
-            (current_stem,),
-        )
-        children = []
-        for row in cur.fetchall():
-            src_rel = row["source_rel"]
-            src_stem = Path(src_rel).stem
-            rel_type = row["relation_type"]
-            is_cycle = src_stem in ancestors
-            child_node = {
-                "stem": src_stem,
-                "rel_path": src_rel,
-                "rel_type": rel_type,
-                "cycle": is_cycle,
-                "children": [],
-            }
-            if not is_cycle:
-                child_node["children"] = _traverse_up(src_stem, current_depth + 1, ancestors | {src_stem})
-            children.append(child_node)
-        return children
+        def _traverse_down(current_stem: str, current_depth: int, ancestors: set[str]) -> list[dict]:
+            if current_depth >= depth:
+                return []
+            cur = con.execute(
+                "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ?",
+                (f"{current_stem}.md", f"%/{current_stem}.md", f"%/{current_stem}/%"),
+            )
+            children = []
+            for row in cur.fetchall():
+                target_stem = row["target_stem"]
+                rel_type = row["relation_type"]
+                is_cycle = target_stem in ancestors
+                child_node = {
+                    "stem": target_stem,
+                    "rel_path": _resolve_stem_rel_path(target_stem),
+                    "rel_type": rel_type,
+                    "cycle": is_cycle,
+                    "children": [],
+                }
+                if not is_cycle:
+                    child_node["children"] = _traverse_down(target_stem, current_depth + 1, ancestors | {target_stem})
+                children.append(child_node)
+            return children
 
-    downstream_tree = []
-    if direction in ("both", "down"):
-        downstream_tree = _traverse_down(t_stem, 0, {t_stem})
+        def _traverse_up(current_stem: str, current_depth: int, ancestors: set[str]) -> list[dict]:
+            if current_depth >= depth:
+                return []
+            cur = con.execute(
+                "SELECT source_rel, relation_type FROM relations WHERE target_stem = ?",
+                (current_stem,),
+            )
+            children = []
+            for row in cur.fetchall():
+                src_rel = row["source_rel"]
+                src_stem = Path(src_rel).stem
+                rel_type = row["relation_type"]
+                is_cycle = src_stem in ancestors
+                child_node = {
+                    "stem": src_stem,
+                    "rel_path": src_rel,
+                    "rel_type": rel_type,
+                    "cycle": is_cycle,
+                    "children": [],
+                }
+                if not is_cycle:
+                    child_node["children"] = _traverse_up(src_stem, current_depth + 1, ancestors | {src_stem})
+                children.append(child_node)
+            return children
 
-    upstream_tree = []
-    if direction in ("both", "up"):
-        upstream_tree = _traverse_up(t_stem, 0, {t_stem})
+        downstream_tree = []
+        if direction in ("both", "down"):
+            downstream_tree = _traverse_down(t_stem, 0, {t_stem})
 
-    # Sinks for target and direct 1-hop neighborhood
-    all_stems = {t_stem}
-    for c in downstream_tree:
-        all_stems.add(c["stem"])
-    for c in upstream_tree:
-        all_stems.add(c["stem"])
+        upstream_tree = []
+        if direction in ("both", "up"):
+            upstream_tree = _traverse_up(t_stem, 0, {t_stem})
 
-    sinks = []
-    for s in sorted(all_stems):
-        cur = con.execute(
-            "SELECT name, ports, host, network, rel_path FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ?",
-            (s, s, f"%/{s}.md"),
-        )
-        for row in cur.fetchall():
-            sinks.append(dict(row))
+        # Sinks for target and direct 1-hop neighborhood
+        all_stems = {t_stem}
+        for c in downstream_tree:
+            all_stems.add(c["stem"])
+        for c in upstream_tree:
+            all_stems.add(c["stem"])
 
-    json_payload = {
-        "target": t_stem,
-        "rel_path": _resolve_stem_rel_path(t_stem),
-        "depth": depth,
-        "direction": direction,
-        "downstream": downstream_tree,
-        "upstream": upstream_tree,
-        "boundary_sinks": sinks,
-    }
+        sinks = []
+        for s in sorted(all_stems):
+            cur = con.execute(
+                "SELECT name, ports, host, network, rel_path FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ?",
+                (s, s, f"%/{s}.md"),
+            )
+            for row in cur.fetchall():
+                sinks.append(dict(row))
+
+        json_payload = {
+            "target": t_stem,
+            "rel_path": _resolve_stem_rel_path(t_stem),
+            "depth": depth,
+            "direction": direction,
+            "downstream": downstream_tree,
+            "upstream": upstream_tree,
+            "boundary_sinks": sinks,
+        }
 
     out = [f"# 🗺️ Knowledge Map: `{t_stem}` (depth: {depth}, direction: {direction})\n"]
 
@@ -1834,19 +1866,20 @@ def traverse_graph(vault: Path, target: str, depth: int = 2, direction: str = "b
 
 def run_verification_tests(vault: Path, note_filter: str | None = None) -> tuple[str, bool]:
     """Execute machine-verifiable bash:verify assertion blocks in notes."""
-    con = get_fts_db(vault)
-    sync_fts_index(vault, con)
+    with fts_db_context(vault) as con:
+        sync_fts_index(vault, con)
 
-    if note_filter:
-        stem = Path(note_filter).stem
-        cur = con.execute(
-            "SELECT source_rel, command FROM verifications WHERE source_rel LIKE ? OR source_rel LIKE ?",
-            (f"%{stem}.md", f"%{stem}%"),
-        )
-    else:
-        cur = con.execute("SELECT source_rel, command FROM verifications")
+        if note_filter:
+            stem = Path(note_filter).stem
+            cur = con.execute(
+                "SELECT source_rel, command FROM verifications WHERE source_rel LIKE ? OR source_rel LIKE ?",
+                (f"%{stem}.md", f"%{stem}%"),
+            )
+        else:
+            cur = con.execute("SELECT source_rel, command FROM verifications")
 
-    rows = cur.fetchall()
+        rows = cur.fetchall()
+
     if not rows:
         return "No machine verification blocks (```bash:verify) found in target.", False
 
@@ -1952,8 +1985,8 @@ def set_note_property(vault: Path, rel_path: str, keypath: str, value_str: str) 
         os.replace(tmp_file, note_file)
 
         try:
-            db = get_fts_db(vault)
-            sync_fts_index(vault, db)
+            with fts_db_context(vault) as db:
+                sync_fts_index(vault, db)
         except Exception:
             pass
 
@@ -1968,11 +2001,11 @@ def set_note_property(vault: Path, rel_path: str, keypath: str, value_str: str) 
 
 def lint_vault(vault: Path) -> tuple[str, bool]:
     """Validate that all notes comply with strict machine schemas."""
-    con = get_fts_db(vault)
-    sync_fts_index(vault, con)
+    with fts_db_context(vault) as con:
+        sync_fts_index(vault, con)
 
-    cur = con.execute("SELECT rel_path, stem, type, metadata_json FROM entities")
-    rows = cur.fetchall()
+        cur = con.execute("SELECT rel_path, stem, type, metadata_json FROM entities")
+        rows = cur.fetchall()
     errors = []
 
     required_by_type = {
@@ -2335,11 +2368,18 @@ class VaultLock:
 
     def __enter__(self):
         try:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
             self._fd = open(self.lock_path, "a")
             if HAVE_FCNTL:
                 fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
+        except Exception as e:
+            if self._fd:
+                try:
+                    self._fd.close()
+                except Exception:
+                    pass
+                self._fd = None
+            raise RuntimeError(f"VaultLock acquisition failed for {self.lock_path}: {e}") from e
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -2347,9 +2387,9 @@ class VaultLock:
             try:
                 if HAVE_FCNTL:
                     fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+            finally:
                 self._fd.close()
-            except Exception:
-                pass
+                self._fd = None
 
 
 def append_work_log(vault: Path, project: str, summary: str, device: str | None = None) -> str:
@@ -2563,8 +2603,8 @@ def append_section_to_note(vault: Path, rel_path: str, heading: str, content_to_
         os.replace(tmp_file, target_file)
 
         try:
-            db = get_fts_db(vault)
-            sync_fts_index(vault, db)
+            with fts_db_context(vault) as db:
+                sync_fts_index(vault, db)
         except Exception:
             pass
 
@@ -2626,8 +2666,8 @@ def write_note(
 
         if not is_raw:
             try:
-                db = get_fts_db(vault)
-                sync_fts_index(vault, db)
+                with fts_db_context(vault) as db:
+                    sync_fts_index(vault, db)
             except Exception:
                 pass
 
@@ -2775,7 +2815,8 @@ def cli_query(args):
 
 def cli_blast(args):
     vault = get_vault()
-    out, is_err = calculate_blast_radius(vault, args.target)
+    as_json = getattr(args, "json", False)
+    out, is_err = calculate_blast_radius(vault, args.target, as_json=as_json)
     if is_err:
         print(out, file=sys.stderr)
         sys.exit(1)
@@ -2838,10 +2879,10 @@ def cli_append(args):
 
 def cli_services(args):
     vault = get_vault()
-    con = get_fts_db(vault)
-    sync_fts_index(vault, con)
-    cur = con.execute("SELECT name, container_prefix, ports, replicas, role, host, network FROM services")
-    rows = [dict(r) for r in cur.fetchall()]
+    with fts_db_context(vault) as con:
+        sync_fts_index(vault, con)
+        cur = con.execute("SELECT name, container_prefix, ports, replicas, role, host, network FROM services")
+        rows = [dict(r) for r in cur.fetchall()]
     if rows:
         print(json.dumps(rows, indent=2, default=str))
         return
@@ -2852,10 +2893,12 @@ def cli_services(args):
 
 def cli_projects(args):
     vault = get_vault()
-    con = get_fts_db(vault)
-    sync_fts_index(vault, con)
-    cur = con.execute("SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'")
-    rows = [dict(r) for r in cur.fetchall()]
+    with fts_db_context(vault) as con:
+        sync_fts_index(vault, con)
+        cur = con.execute(
+            "SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'"
+        )
+        rows = [dict(r) for r in cur.fetchall()]
     if rows:
         print(json.dumps(rows, indent=2, default=str))
         return
@@ -2886,9 +2929,6 @@ def cli_log(args):
     device = getattr(args, "device", None)
     res = append_work_log(vault, args.project, args.summary, device=device)
     print(res)
-    ok, broken = verify_links(vault)
-    if not ok:
-        print(f"Warning: {len(broken)} link/graph issue(s) detected in vault.", file=sys.stderr)
 
 
 def cli_verify(args):
@@ -3044,7 +3084,12 @@ MCP_TOOLS = [
                 "target": {
                     "type": "string",
                     "description": "Component or note stem (e.g. 'ingress-router', 'primary-host', 'auth-service').",
-                }
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "json"],
+                    "description": "Output format: 'text' (human markdown tree) or 'json' (structured machine payload). Defaults to 'text'.",
+                },
             },
             "required": ["target"],
         },
@@ -3067,6 +3112,11 @@ MCP_TOOLS = [
                     "type": "string",
                     "enum": ["both", "down", "up"],
                     "description": "Graph traversal direction: 'both', 'down' (dependencies), or 'up' (dependents). Defaults to 'both'.",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "json"],
+                    "description": "Output format: 'text' (human markdown tree) or 'json' (structured machine payload). Defaults to 'text'.",
                 },
             },
             "required": ["target"],
@@ -3169,7 +3219,7 @@ MCP_TOOLS = [
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Punchy summary of changes made, commit hashes, or test results.",
+                    "description": "Punchy telegraphic summary of changes made (<280 chars soft limit), commit hashes, or test results.",
                 },
                 "device": {
                     "type": "string",
@@ -3336,7 +3386,9 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
         target = args.get("target", "")
         if not target:
             return "Error: Missing parameter 'target'.", True
-        return calculate_blast_radius(vault, target)
+        fmt = args.get("format", "text")
+        as_json = fmt == "json" or bool(args.get("json", False))
+        return calculate_blast_radius(vault, target, as_json=as_json)
 
     elif name == "akatsuki_map":
         target = args.get("target", "")
@@ -3344,7 +3396,11 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
             return "Error: Missing parameter 'target'.", True
         depth = args.get("depth", 2)
         direction = args.get("direction", "both")
-        text_out, is_err, _ = traverse_graph(vault, target, depth=depth, direction=direction)
+        fmt = args.get("format", "text")
+        as_json = fmt == "json" or bool(args.get("json", False))
+        text_out, is_err, json_data = traverse_graph(vault, target, depth=depth, direction=direction)
+        if as_json:
+            return json.dumps(json_data, indent=2, default=str), is_err
         return text_out, is_err
 
     elif name == "akatsuki_test":
@@ -3375,10 +3431,10 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
         return res, is_err
 
     elif name == "akatsuki_services":
-        con = get_fts_db(vault)
-        sync_fts_index(vault, con)
-        cur = con.execute("SELECT name, container_prefix, ports, replicas, role, host, network FROM services")
-        rows = [dict(r) for r in cur.fetchall()]
+        with fts_db_context(vault) as con:
+            sync_fts_index(vault, con)
+            cur = con.execute("SELECT name, container_prefix, ports, replicas, role, host, network FROM services")
+            rows = [dict(r) for r in cur.fetchall()]
         if rows:
             return json.dumps(rows, indent=2, default=str), False
         catalog = vault / "40-Systems" / "Services-Catalog.md"
@@ -3387,12 +3443,12 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
         return "Services-Catalog.md not found in vault.", True
 
     elif name == "akatsuki_projects":
-        con = get_fts_db(vault)
-        sync_fts_index(vault, con)
-        cur = con.execute(
-            "SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'"
-        )
-        rows = [dict(r) for r in cur.fetchall()]
+        with fts_db_context(vault) as con:
+            sync_fts_index(vault, con)
+            cur = con.execute(
+                "SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'"
+            )
+            rows = [dict(r) for r in cur.fetchall()]
         if rows:
             return json.dumps(rows, indent=2, default=str), False
         moc = vault / "20-Projects" / "Projects-MOC.md"
@@ -3499,18 +3555,18 @@ def handle_mcp_resource_read(uri: str) -> tuple[str, bool]:
     """Resolve and read an akatsuki:// resource URI."""
     vault = get_vault()
     if uri == "akatsuki://services":
-        con = get_fts_db(vault)
-        sync_fts_index(vault, con)
-        cur = con.execute("SELECT name, container_prefix, ports, replicas, role, host, network FROM services")
-        rows = [dict(r) for r in cur.fetchall()]
+        with fts_db_context(vault) as con:
+            sync_fts_index(vault, con)
+            cur = con.execute("SELECT name, container_prefix, ports, replicas, role, host, network FROM services")
+            rows = [dict(r) for r in cur.fetchall()]
         return json.dumps(rows, indent=2, default=str), False
     elif uri == "akatsuki://projects":
-        con = get_fts_db(vault)
-        sync_fts_index(vault, con)
-        cur = con.execute(
-            "SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'"
-        )
-        rows = [dict(r) for r in cur.fetchall()]
+        with fts_db_context(vault) as con:
+            sync_fts_index(vault, con)
+            cur = con.execute(
+                "SELECT stem, title, status, repo, host, network, summary FROM entities WHERE type = 'project'"
+            )
+            rows = [dict(r) for r in cur.fetchall()]
         return json.dumps(rows, indent=2, default=str), False
     elif uri == "akatsuki://operator":
         f = vault / "OPERATOR.md"
@@ -3981,6 +4037,7 @@ def build_parser() -> argparse.ArgumentParser:
     # blast
     p_blast = subparsers.add_parser("blast", help="Calculate architectural blast radius")
     p_blast.add_argument("target", help="Component, service, or system name")
+    p_blast.add_argument("--json", action="store_true", help="Output structured JSON blast radius payload")
 
     # map
     p_map = subparsers.add_parser("map", help="Recursively map knowledge graph around a target note")
@@ -4054,7 +4111,7 @@ def build_parser() -> argparse.ArgumentParser:
     # log
     p_log = subparsers.add_parser("log", help="Deposit a work log entry into today's note")
     p_log.add_argument("--project", "-p", default="", help="Project or repo name")
-    p_log.add_argument("--summary", "-s", required=True, help="Summary of work or commit hash")
+    p_log.add_argument("--summary", "-s", required=True, help="Punchy telegraphic summary (<280 chars soft limit)")
     p_log.add_argument("--device", "-d", default=None, help="Device/hostname identifier (defaults to current host)")
 
     # verify

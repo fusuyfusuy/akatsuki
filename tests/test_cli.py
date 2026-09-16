@@ -20,6 +20,9 @@ class TestAkatsukiCLI(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
 
     def tearDown(self):
+        import akatsuki.core as core
+
+        core.CURRENT_VAULT_OVERRIDE = None
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_init_scaffolding(self):
@@ -74,6 +77,38 @@ class TestAkatsukiCLI(unittest.TestCase):
         self.assertIsNone(args.vault_path)
         self.assertEqual(args.query, "test")
         self.assertEqual(args.mode, "hybrid")
+
+    def test_blast_cli_argparse(self):
+        parser = build_parser()
+        args = parser.parse_args(["blast", "auth-service", "--json"])
+        self.assertEqual(args.target, "auth-service")
+        self.assertTrue(args.json)
+
+    def test_cli_log_execution(self):
+        import datetime
+
+        import akatsuki.core as core
+        from akatsuki.core import cli_log
+
+        vault_path = Path(self.test_dir)
+        (vault_path / "01-Daily").mkdir(parents=True, exist_ok=True)
+        core.CURRENT_VAULT_OVERRIDE = vault_path
+
+        class LogArgs:
+            project = "test-proj"
+            summary = "patch kernel -> upgrade lock; exit 0"
+            device = "test-box"
+
+        try:
+            cli_log(LogArgs())
+            now_str = datetime.date.today().isoformat()
+            daily = vault_path / "01-Daily" / f"{now_str}.md"
+            self.assertTrue(daily.exists())
+            self.assertIn(
+                "[test-box]: [test-proj] patch kernel -> upgrade lock; exit 0", daily.read_text(encoding="utf-8")
+            )
+        finally:
+            core.CURRENT_VAULT_OVERRIDE = None
 
 
 if __name__ == "__main__":
