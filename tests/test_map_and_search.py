@@ -1,7 +1,11 @@
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+
+os.environ["AKATSUKI_TESTING"] = "1"
+os.environ["AKATSUKI_DISABLE_HOST_EMBED"] = "1"
 
 from akatsuki.core import (
     dispatch_single_request,

@@ -25,24 +25,25 @@ KERNEL:
 ## SYNOPSIS
 
 ```shell
-akatsuki search   <query> [--domain <domain>] [--limit <N>] [--mode hybrid|bm25|vector] [--with-graph] [--json]
+akatsuki search   <query> [--domain <domain>] [--limit <N>] [--mode hybrid|bm25|vector] [--with-graph] [--compact] [--json]
 akatsuki contract <note> [--json]
 akatsuki read     <note> [--section <sec>] [--budget <N>] [--json]
 akatsuki get      <key> [--json]
 akatsuki query    <sql> [--json]
 akatsuki blast    <target> [--json]
 akatsuki map      <target> [--depth <N>] [--direction up|down|both] [--json]
-akatsuki test     [<note>] [--json]
+akatsuki test     [<note>] [--dry-run] [--json]
 akatsuki set      <note> --key <key> --value <val> [--json]
 akatsuki append   <note> --heading <heading> --content <content> [--json]
+akatsuki replace  <note> --heading <heading> --content <content> [--json]
 akatsuki write    <path> --content <content> [--overwrite] [--raw] [--json]
 akatsuki services [--json]
 akatsuki projects [--json]
 akatsuki daily    [--date <YYYY-MM-DD>] [--json]
-akatsuki log      --project <proj> --summary <sum> [--device <dev>]
+akatsuki log      --project <proj> --summary <sum> [--device <dev>] [--json]
 akatsuki lint     [--json]
 akatsuki verify   [--json]
-akatsuki reconcile [--dry-run]
+akatsuki reconcile [--dry-run] [--json]
 akatsuki mcp      [--vault <dir>]
 ```
 
@@ -185,6 +186,7 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`
 | `akatsuki_test` | `akatsuki test` | `note` |
 | `akatsuki_set` | `akatsuki set` | `note`, `key`, `value` |
 | `akatsuki_append_section` | `akatsuki append` | `note`, `heading`, `content` |
+| `akatsuki_replace_section` | `akatsuki replace` | `note`, `heading`, `content` |
 | `akatsuki_write_note` | `akatsuki write` | `path`, `content`, `overwrite`, `raw` |
 | `akatsuki_services` | `akatsuki services`| *(none)* |
 | `akatsuki_projects` | `akatsuki projects`| *(none)* |

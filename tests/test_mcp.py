@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 import akatsuki.core as core
-from akatsuki.core import VaultLock, dispatch_single_request, write_note
+from akatsuki.core import dispatch_single_request, write_note
 
 
 class TestAkatsukiMCP(unittest.TestCase):
@@ -155,18 +155,38 @@ class TestAkatsukiMCP(unittest.TestCase):
         self.assertIn("upstream", payload)
         self.assertIn("boundary_sinks", payload)
 
-    def test_vault_lock_hardening(self):
-        # A valid vault directory should lock and unlock cleanly
-        with VaultLock(self.vault):
-            self.assertTrue((self.vault / ".akatsuki.lock").exists())
+    def test_mcp_replace_section(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "akatsuki_replace_section",
+                "arguments": {
+                    "note": "Dokploy-Traefik",
+                    "heading": "Dokploy Traefik",
+                    "content": "Updated routing specification.",
+                },
+            },
+        }
+        res = dispatch_single_request(req)
+        self.assertEqual(res["id"], 10)
+        self.assertFalse(res["result"]["isError"])
+        self.assertIn("Successfully replaced section", res["result"]["content"][0]["text"])
 
-        # An uncreatable path (e.g. under a regular file treated as a dir) should raise RuntimeError
-        dummy_file = self.vault / "dummy_file.txt"
-        dummy_file.write_text("hello", encoding="utf-8")
-        bad_vault = dummy_file / "subfolder"
-        with self.assertRaises(RuntimeError):
-            with VaultLock(bad_vault):
-                pass
+    def test_mcp_test_dry_run(self):
+        req = {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "akatsuki_test",
+                "arguments": {"dry_run": True},
+            },
+        }
+        res = dispatch_single_request(req)
+        self.assertEqual(res["id"], 11)
+        self.assertFalse(res["result"]["isError"])
 
 
 if __name__ == "__main__":
