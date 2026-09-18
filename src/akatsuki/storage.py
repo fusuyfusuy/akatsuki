@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import re
 import socket
 import sys
 from pathlib import Path
@@ -18,6 +19,11 @@ if HAVE_FCNTL:
 
 if HAVE_PYYAML:
     import yaml
+
+
+class VaultNotFoundError(RuntimeError):
+    """Raised when the Akatsuki vault cannot be found or resolved."""
+    pass
 
 
 def get_machine_id() -> str:
@@ -44,7 +50,7 @@ def _yaml_format_scalar(val: object) -> str:
         or s.lower() in ("true", "false", "yes", "no", "null", "none")
     )
     if needs_quotes:
-        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
         return f'"{escaped}"'
     return s
 
@@ -59,14 +65,20 @@ def dump_frontmatter(fm: dict, body: str) -> str:
             if isinstance(v, list):
                 new_fm_lines.append(f"{k}:")
                 for item in v:
-                    new_fm_lines.append(f"  - {_yaml_format_scalar(item)}")
+                    if isinstance(item, dict):
+                        new_fm_lines.append(f"  - {json.dumps(item, default=str)}")
+                    else:
+                        new_fm_lines.append(f"  - {_yaml_format_scalar(item)}")
             elif isinstance(v, dict):
                 new_fm_lines.append(f"{k}:")
                 for sub_k, sub_v in v.items():
                     if isinstance(sub_v, list):
                         new_fm_lines.append(f"  {sub_k}:")
                         for sub_item in sub_v:
-                            new_fm_lines.append(f"    - {_yaml_format_scalar(sub_item)}")
+                            if isinstance(sub_item, dict):
+                                new_fm_lines.append(f"    - {json.dumps(sub_item, default=str)}")
+                            else:
+                                new_fm_lines.append(f"    - {_yaml_format_scalar(sub_item)}")
                     elif isinstance(sub_v, dict):
                         new_fm_lines.append(f"  {sub_k}: {json.dumps(sub_v, default=str)}")
                     else:
@@ -166,40 +178,52 @@ def resolve_vault_path(explicit_path: str | Path | None = None) -> Path:
 def get_vault() -> Path:
     vault = resolve_vault_path()
     if not vault.exists():
-        sys.stderr.write(
+        raise VaultNotFoundError(
             f"Error: akatsuki vault path not found at {vault}\n"
-            "Set $AKATSUKI_VAULT, specify --vault, or run 'akatsuki init' to bootstrap a new vault.\n"
+            "Set $AKATSUKI_VAULT, specify --vault, or run 'akatsuki init' to bootstrap a new vault."
         )
-        sys.exit(1)
     return vault
 
 
 def contained_path(vault: Path, rel_path: str) -> Path | None:
     """Resolve rel_path strictly inside the vault. Returns None on escape or root."""
     clean = rel_path.strip()
-    if not clean or clean in (".", "./"):
+    if not clean or clean in (".", "./") or "\0" in clean:
         return None
-    candidate = Path(clean)
-    if candidate.is_absolute():
+    try:
+        candidate = Path(clean)
+        if candidate.is_absolute():
+            return None
+        # Disallow hidden directory writes (e.g. .git/hooks)
+        for part in candidate.parts[:-1]:
+            if part.startswith("."):
+                return None
+        vault = vault.resolve()
+        target = (vault / candidate).resolve()
+        if target == vault or not target.is_relative_to(vault):
+            return None
+        return target
+    except (ValueError, OSError):
         return None
-    vault = vault.resolve()
-    target = (vault / candidate).resolve()
-    if target == vault or vault not in target.parents:
-        return None
-    return target
 
 
 def parse_frontmatter(content: str) -> tuple[dict[str, object], str]:
     """Extract frontmatter and body from markdown content."""
-    if not content.startswith("---"):
+    lines = content.splitlines(keepends=True)
+    if not lines or not lines[0].startswith("---"):
         return {}, content
 
-    parts = content.split("---", 2)
-    if len(parts) < 3:
+    closing_idx = -1
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            closing_idx = i
+            break
+
+    if closing_idx == -1:
         return {}, content
 
-    fm_raw = parts[1]
-    body = parts[2]
+    fm_raw = "".join(lines[1:closing_idx])
+    body = "".join(lines[closing_idx + 1:])
 
     if HAVE_PYYAML:
         try:
@@ -328,12 +352,38 @@ def resolve_note_file(vault: Path, query: str) -> Path | None:
     if p_md is not None and p_md.is_file():
         return p_md
 
-    # 2. Match stem or path suffix within vault only
+    # 2. Fast index resolution if available
+    db_path = vault / ".akatsuki" / "index.db"
+    if db_path.exists():
+        try:
+            import sqlite3
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            try:
+                cur = con.execute(
+                    "SELECT rel_path FROM entities WHERE stem = ? COLLATE NOCASE OR stem = ? LIMIT 2",
+                    (q_stem, q_stem),
+                )
+                rows = cur.fetchall()
+                if len(rows) == 1:
+                    p = contained_path(vault, rows[0][0])
+                    if p and p.is_file():
+                        return p
+            finally:
+                con.close()
+        except Exception:
+            pass
+
+    # 3. Match stem or path suffix within vault, pruning ignored directories
     candidates = []
-    for f in vault.glob("**/*.md"):
-        rel = str(f.relative_to(vault).with_suffix(""))
-        if f.stem.lower() == q_stem.lower() or rel.lower() == q_stem.lower():
-            candidates.append(f)
+    ignored_dirs = {".git", ".akatsuki", ".venv", "node_modules", ".obsidian", "__pycache__", "_templates"}
+    for root, dirs, files in os.walk(vault):
+        dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
+        for file in files:
+            if file.endswith(".md"):
+                f = Path(root) / file
+                rel = str(f.relative_to(vault).with_suffix(""))
+                if f.stem.lower() == q_stem.lower() or rel.lower() == q_stem.lower():
+                    candidates.append(f)
 
     if len(candidates) == 1:
         return candidates[0]
@@ -379,11 +429,19 @@ class VaultLock:
                 self._fd = None
 
 
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def ensure_daily_note(vault: Path, date_str: str) -> Path:
     """Ensure the daily note for date_str exists, bootstrapping from template or default."""
+    if not DATE_RE.match(date_str):
+        raise ValueError(f"Invalid date_str for daily note: {date_str!r}. Expected YYYY-MM-DD.")
     daily_dir = vault / "01-Daily"
     daily_dir.mkdir(parents=True, exist_ok=True)
     daily_file = daily_dir / f"{date_str}.md"
+    target = contained_path(vault, f"01-Daily/{date_str}.md")
+    if not target:
+        raise ValueError(f"Path traversal detected in daily note date_str: {date_str!r}")
 
     if not daily_file.exists():
         template_file = vault / "_templates" / "Daily-Template.md"
@@ -409,7 +467,9 @@ def ensure_daily_note(vault: Path, date_str: str) -> Path:
                 f"- [ ] Establish daily operating horizon\n\n"
                 f"## 📝 Work Log & Session Notes\n"
             )
-        daily_file.write_text(content, encoding="utf-8")
+        tmp_file = daily_file.with_name(f".{daily_file.name}.tmp.{os.getpid()}")
+        tmp_file.write_text(content, encoding="utf-8")
+        os.replace(tmp_file, daily_file)
 
     return daily_file
 
@@ -418,17 +478,23 @@ def validate_note_content(content: str) -> tuple[bool, str]:
     """Validate that note content has required frontmatter fields."""
     if not content.startswith("---"):
         return False, "Note must start with YAML frontmatter delimiter '---'."
-    parts = content.split("---", 2)
-    if len(parts) < 3:
-        return False, "Note frontmatter is not closed with '---'."
     fm, _ = parse_frontmatter(content)
+    if not fm and not any(line.strip() == "---" for line in content.splitlines()[1:]):
+        return False, "Note frontmatter is not closed with '---'."
     note_type = str(fm.get("type", "note"))
-    required = ["title", "date", "type", "tags", "summary"]
-    if note_type == "project":
-        required.append("status")
+    required_by_type = {
+        "project": ["title", "date", "type", "tags", "summary", "status"],
+        "system": ["title", "date", "type", "tags", "summary"],
+        "daily": ["title", "date", "type", "tags", "summary"],
+        "agent": ["title", "date", "type", "tags", "summary"],
+        "config": ["title", "date", "type", "tags", "summary"],
+        "script": ["title", "date", "type", "tags", "summary"],
+    }
+    required = required_by_type.get(note_type, ["title", "date", "type", "summary"])
     missing = [f for f in required if f not in fm or not fm.get(f)]
     if missing:
         return False, f"Missing required frontmatter field(s): {', '.join(missing)}"
+    return True, "Valid"
     return True, "Valid"
 
 

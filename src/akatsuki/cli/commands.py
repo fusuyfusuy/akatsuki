@@ -26,6 +26,14 @@ from akatsuki.storage import get_vault, resolve_note_file
 from akatsuki.verify import lint_vault, reconcile_vault, run_verification_tests, verify_links
 
 
+def _emit_error(msg: str, as_json: bool = False, exit_code: int = 1):
+    if as_json:
+        print(json.dumps({"status": "error", "error": msg}, indent=2), file=sys.stderr)
+    else:
+        print(msg, file=sys.stderr)
+    sys.exit(exit_code)
+
+
 def cli_search(args):
     vault = get_vault()
     with_graph = getattr(args, "with_graph", False)
@@ -148,19 +156,18 @@ def cli_contract(args):
     as_json = getattr(args, "json", False)
     contract, is_err = extract_note_contract(vault, args.note, as_json=as_json)
     if is_err:
-        print(contract, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(contract, as_json=as_json)
     print(contract)
 
 
 def cli_get(args):
     vault = get_vault()
+    as_json = getattr(args, "json", False)
     val, is_err = get_keypath(vault, args.keypath)
     if is_err:
-        print(val, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(val, as_json=as_json)
 
-    if getattr(args, "json", False):
+    if as_json:
         try:
             parsed = json.loads(val)
         except Exception:
@@ -172,10 +179,10 @@ def cli_get(args):
 
 def cli_query(args):
     vault = get_vault()
+    as_json = getattr(args, "json", False)
     out, is_err = execute_sql_query(vault, args.sql)
     if is_err:
-        print(out, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(out, as_json=as_json)
     print(out)
 
 
@@ -184,15 +191,15 @@ def cli_blast(args):
     as_json = getattr(args, "json", False)
     out, is_err = calculate_blast_radius(vault, args.target, as_json=as_json)
     if is_err:
-        print(out, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(out, as_json=as_json)
     print(out)
 
 
 def cli_map(args):
     vault = get_vault()
+    as_json = getattr(args, "json", False)
     text_out, is_err, json_data = traverse_graph(vault, args.target, depth=args.depth, direction=args.direction)
-    if getattr(args, "json", False):
+    if as_json:
         print(json.dumps(json_data, indent=2))
     else:
         print(text_out)
@@ -212,10 +219,10 @@ def cli_test(args):
 
 def cli_set(args):
     vault = get_vault()
+    as_json = getattr(args, "json", False)
     msg, is_err = set_note_property(vault, args.note, args.key, args.value)
     if is_err:
-        print(msg, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(msg, as_json=as_json)
 
     if getattr(args, "json", False):
         print(
@@ -254,8 +261,7 @@ def cli_append(args):
 
     msg, is_err = append_section_to_note(vault, args.note, args.heading, content)
     if is_err:
-        print(msg, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(msg, as_json=getattr(args, "json", False))
 
     if getattr(args, "json", False):
         print(
@@ -276,16 +282,11 @@ def cli_replace(args):
 
     if not content or not content.strip():
         err_msg = "Error: No replacement content provided."
-        if getattr(args, "json", False):
-            print(json.dumps({"error": err_msg}, indent=2), file=sys.stderr)
-        else:
-            print(err_msg, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(err_msg, as_json=getattr(args, "json", False))
 
     msg, is_err = replace_section_in_note(vault, args.note, args.heading, content)
     if is_err:
-        print(msg, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(msg, as_json=getattr(args, "json", False))
 
     if getattr(args, "json", False):
         print(
@@ -403,10 +404,10 @@ def cli_verify(args):
 def cli_reconcile(args):
     vault = get_vault()
     as_json = getattr(args, "json", False)
-    out, is_err = reconcile_vault(vault, dry_run=args.dry_run)
+    with_vectors = getattr(args, "with_vectors", False)
+    out, is_err = reconcile_vault(vault, dry_run=args.dry_run, with_vectors=with_vectors)
     if is_err:
-        print(out, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(out, as_json=as_json)
 
     if as_json:
         print(json.dumps({"status": "ok", "success": True, "dry_run": args.dry_run, "report": out}, indent=2))
@@ -442,8 +443,7 @@ def cli_write(args):
     raw_flag = getattr(args, "raw", False)
     msg, is_err = write_note(vault, args.path, content, overwrite=args.overwrite, raw=raw_flag)
     if is_err:
-        print(msg, file=sys.stderr)
-        sys.exit(1)
+        _emit_error(msg, as_json=getattr(args, "json", False))
 
     if getattr(args, "json", False):
         print(

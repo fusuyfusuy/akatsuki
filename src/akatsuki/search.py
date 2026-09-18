@@ -296,15 +296,16 @@ def search_vault(
                 )
                 up_rows = [f"{row['source_rel']} ({row['relation_type']})" for row in cur_up.fetchall()]
 
+                rel_path = item["rel_path"]
                 cur_down = con.execute(
-                    "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? OR source_rel LIKE ? OR source_rel LIKE ? LIMIT 5",
-                    (f"{s_stem}.md", f"%/{s_stem}.md", f"%/{s_stem}/%"),
+                    "SELECT target_stem, relation_type FROM relations WHERE source_rel = ? LIMIT 5",
+                    (rel_path,),
                 )
                 down_rows = [f"{row['target_stem']} ({row['relation_type']})" for row in cur_down.fetchall()]
 
                 cur_svc = con.execute(
-                    "SELECT name, ports FROM services WHERE name = ? OR container_prefix = ? OR rel_path LIKE ? LIMIT 3",
-                    (s_stem, s_stem, f"%/{s_stem}.md"),
+                    "SELECT name, ports FROM services WHERE name = ? OR container_prefix = ? OR rel_path = ? LIMIT 3",
+                    (s_stem, s_stem, rel_path),
                 )
                 svc_rows = [
                     f"{row['name']}" + (f":{row['ports']}" if row["ports"] else "") for row in cur_svc.fetchall()

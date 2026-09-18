@@ -107,7 +107,12 @@ def encode_texts(
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=120.0,
             )
+            for line in reversed(res.stdout.splitlines()):
+                line = line.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    return json.loads(line)
             return json.loads(res.stdout)
         raise
 
@@ -124,19 +129,25 @@ def encode_query(query: str, model_name: str = DEFAULT_EMBED_MODEL) -> list[floa
         if ext_py and sys.executable != str(ext_py):
             code = (
                 "from sentence_transformers import SentenceTransformer; "
-                "import torch, json; "
+                "import torch, json, sys; "
                 "torch.set_num_threads(2); "
                 f"m = SentenceTransformer({model_name!r}, device='cpu'); "
-                f"q = {query.strip()!r}; "
+                "q = json.loads(sys.stdin.read()); "
                 "vec = m.encode(['query: ' + q], normalize_embeddings=True, show_progress_bar=False); "
                 "print(json.dumps(vec[0].tolist()))"
             )
             res = subprocess.run(
                 [str(ext_py), "-c", code],
+                input=json.dumps(query.strip()),
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=120.0,
             )
+            for line in reversed(res.stdout.splitlines()):
+                line = line.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    return json.loads(line)
             return json.loads(res.stdout)
         raise
 
@@ -303,15 +314,18 @@ def sync_vectors_index(
         indexed = {row["rel_path"]: (row["mtime"], row["size"]) for row in cur.fetchall()}
 
         current_files = {}
-        for f in vault.glob("**/*.md"):
-            rel = str(f.relative_to(vault))
-            if rel.startswith("_templates") or rel.startswith(".") or "/." in rel:
-                continue
-            try:
-                stat = f.stat()
-                current_files[rel] = (f, stat.st_mtime, stat.st_size)
-            except Exception:
-                continue
+        ignored_dirs = {".git", ".akatsuki", ".venv", "node_modules", ".obsidian", "__pycache__", "_templates"}
+        for root, dirs, files in os.walk(vault):
+            dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
+            for file in files:
+                if file.endswith(".md"):
+                    f = Path(root) / file
+                    rel = str(f.relative_to(vault))
+                    try:
+                        stat = f.stat()
+                        current_files[rel] = (f, stat.st_mtime, stat.st_size)
+                    except Exception:
+                        continue
 
         # 1. Prune deleted notes
         deleted = set(indexed.keys()) - set(current_files.keys())
@@ -348,6 +362,9 @@ def sync_vectors_index(
         if chunks_to_encode:
             texts_to_embed = [c["embed_text"] for c in chunks_to_encode]
             embeddings = encode_texts(texts_to_embed, model_name=model_name)
+
+            for rel in file_chunk_map:
+                con.execute("DELETE FROM note_vectors WHERE rel_path = ?", (rel,))
 
             for c, vec in zip(chunks_to_encode, embeddings, strict=True):
                 dim = len(vec)
@@ -413,7 +430,9 @@ def search_vectors_akatsuki(
         close_con = True
 
     try:
-        sync_vectors_index(vault, con, model_name=model_name)
+        cur_count = con.execute("SELECT COUNT(*) FROM file_meta")
+        if cur_count.fetchone()[0] == 0:
+            sync_vectors_index(vault, con, model_name=model_name)
         q_vec = encode_query(query, model_name=model_name)
 
         sql = "SELECT chunk_id, rel_path, stem, domain, display_title, display_summary, breadcrumb, preview, vector_blob, dim FROM note_vectors"

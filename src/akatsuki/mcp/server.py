@@ -81,7 +81,14 @@ def dispatch_single_request(req: dict) -> dict | None:
             text_out, is_err = handle_mcp_resource_read(uri)
         except Exception as e:
             text_out, is_err = f"Error reading resource '{uri}': {e!s}", True
-        mime = "application/json" if uri in ("akatsuki://services", "akatsuki://projects") else "text/markdown"
+        stripped = text_out.strip()
+        if uri in ("akatsuki://services", "akatsuki://projects") and (
+            (stripped.startswith("{") and stripped.endswith("}"))
+            or (stripped.startswith("[") and stripped.endswith("]"))
+        ):
+            mime = "application/json"
+        else:
+            mime = "text/markdown"
         if is_err:
             return {
                 "jsonrpc": "2.0",
@@ -185,7 +192,21 @@ def run_mcp_server():
                 sys.stdout.write(json.dumps(batch_resps) + "\n")
                 sys.stdout.flush()
         else:
-            resp = dispatch_single_request(req)
-            if resp is not None:
-                sys.stdout.write(json.dumps(resp) + "\n")
+            try:
+                resp = dispatch_single_request(req)
+                if resp is not None:
+                    sys.stdout.write(json.dumps(resp) + "\n")
+                    sys.stdout.flush()
+            except Exception as e:
+                item_id = req.get("id") if isinstance(req, dict) else None
+                sys.stdout.write(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": item_id,
+                            "error": {"code": -32603, "message": f"Internal server error: {e}"},
+                        }
+                    )
+                    + "\n"
+                )
                 sys.stdout.flush()

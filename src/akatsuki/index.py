@@ -1,6 +1,7 @@
 """SQLite index and relational store for Akatsuki."""
 
 import json
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -122,15 +123,18 @@ def sync_fts_index(vault: Path, con: sqlite3.Connection) -> None:
     indexed = {row["rel_path"]: (row["mtime"], row["size"]) for row in cur.fetchall()}
 
     current_files = {}
-    for f in vault.glob("**/*.md"):
-        rel = str(f.relative_to(vault))
-        if rel.startswith("_templates") or rel.startswith(".") or "/." in rel:
-            continue
-        try:
-            stat = f.stat()
-            current_files[rel] = (f, stat.st_mtime, stat.st_size)
-        except Exception:
-            continue
+    ignored_dirs = {".git", ".akatsuki", ".venv", "node_modules", ".obsidian", "__pycache__", "_templates"}
+    for root, dirs, files in os.walk(vault):
+        dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
+        for file in files:
+            if file.endswith(".md"):
+                f = Path(root) / file
+                rel = str(f.relative_to(vault))
+                try:
+                    stat = f.stat()
+                    current_files[rel] = (f, stat.st_mtime, stat.st_size)
+                except Exception:
+                    continue
 
     # Prune deleted files
     deleted_paths = set(indexed.keys()) - set(current_files.keys())
@@ -227,11 +231,13 @@ def sync_fts_index(vault: Path, con: sqlite3.Connection) -> None:
 
         # Wikilinks in body
         for m in re.findall(r"(?<!\\)\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]", body):
-            target_stem = Path(m.strip()).stem
-            con.execute(
-                "INSERT OR IGNORE INTO relations(source_rel, target_stem, relation_type) VALUES (?, ?, ?)",
-                (rel, target_stem, "references"),
-            )
+            clean_target = m.strip().split("#")[0].strip()
+            if clean_target:
+                target_stem = Path(clean_target).stem
+                con.execute(
+                    "INSERT OR IGNORE INTO relations(source_rel, target_stem, relation_type) VALUES (?, ?, ?)",
+                    (rel, target_stem, "references"),
+                )
 
         # 4. Index Invariants
         fm_invariants = fm.get("invariants")

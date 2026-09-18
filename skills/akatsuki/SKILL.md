@@ -43,7 +43,7 @@ akatsuki daily    [--date <YYYY-MM-DD>] [--json]
 akatsuki log      --project <proj> --summary <sum> [--device <dev>] [--json]
 akatsuki lint     [--json]
 akatsuki verify   [--json]
-akatsuki reconcile [--dry-run] [--json]
+akatsuki reconcile [--dry-run] [--with-vectors] [--json]
 akatsuki mcp      [--vault <dir>]
 ```
 
@@ -183,7 +183,7 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`
 | `akatsuki_query` | `akatsuki query` | `sql` |
 | `akatsuki_blast` | `akatsuki blast` | `target` |
 | `akatsuki_map` | `akatsuki map` | `target`, `depth`, `direction` |
-| `akatsuki_test` | `akatsuki test` | `note` |
+| `akatsuki_test` | `akatsuki test` | `note` (or `target`), `dry_run` |
 | `akatsuki_set` | `akatsuki set` | `note`, `key`, `value` |
 | `akatsuki_append_section` | `akatsuki append` | `note`, `heading`, `content` |
 | `akatsuki_replace_section` | `akatsuki replace` | `note`, `heading`, `content` |
@@ -194,7 +194,7 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`
 | `akatsuki_record_log` | `akatsuki log` | `project`, `summary`, `device` |
 | `akatsuki_lint` | `akatsuki lint` | *(none)* |
 | `akatsuki_verify` | `akatsuki verify` | *(none)* |
-| `akatsuki_reconcile` | `akatsuki reconcile` | `dry_run` |
+| `akatsuki_reconcile` | `akatsuki reconcile` | `dry_run`, `with_vectors` |
 | `akatsuki_list_notes` | `akatsuki list` | `domain` |
 
 ---

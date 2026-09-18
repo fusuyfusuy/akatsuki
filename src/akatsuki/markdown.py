@@ -10,6 +10,8 @@ def extract_headings(content: str) -> list[tuple[int, str, int]]:
     in_frontmatter = content.startswith("---")
     fm_dashes = 0
     in_code_fence = False
+    fence_char = None
+    fence_len = 0
 
     for idx, line in enumerate(lines, 1):
         stripped = line.strip()
@@ -20,9 +22,20 @@ def extract_headings(content: str) -> list[tuple[int, str, int]]:
                     in_frontmatter = False
             continue
 
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_code_fence = not in_code_fence
-            continue
+        if not in_code_fence:
+            m_fence = re.match(r"^(`{3,}|~{3,})", stripped)
+            if m_fence:
+                in_code_fence = True
+                fence_char = m_fence.group(1)[0]
+                fence_len = len(m_fence.group(1))
+                continue
+        else:
+            m_close = re.match(rf"^{re.escape(fence_char or '')}{{{fence_len},}}\s*$", stripped)
+            if m_close:
+                in_code_fence = False
+                fence_char = None
+                fence_len = 0
+                continue
 
         if in_code_fence:
             continue
@@ -144,18 +157,21 @@ def apply_token_budget(text: str, budget: int | str | None) -> str:
     current_chars = 0
     in_fm = text.startswith("---")
     fm_count = 0
+    fm_chars = 0
 
     for line in lines:
         if in_fm:
             packed.append(line)
             current_chars += len(line)
+            fm_chars += len(line)
             if line.strip() == "---":
                 fm_count += 1
                 if fm_count == 2:
                     in_fm = False
             continue
 
-        if current_chars + len(line) > char_budget - 120:
+        effective_limit = max(char_budget, fm_chars + 120)
+        if current_chars + len(line) > effective_limit:
             packed.append(f"\n[Notice: Output truncated to fit budget of ~{budget} tokens]\n")
             break
         packed.append(line)

@@ -75,6 +75,7 @@ from akatsuki.search import (
 from akatsuki.storage import (
     CURRENT_VAULT_OVERRIDE,
     VaultLock,
+    VaultNotFoundError,
     _yaml_format_scalar,
     auto_heal_frontmatter,
     contained_path,
@@ -118,6 +119,7 @@ __all__ = [
     "RAW_EXTS",
     "VERSION",
     "VaultLock",
+    "VaultNotFoundError",
     "_yaml_format_scalar",
     "append_section_to_note",
     "append_work_log",

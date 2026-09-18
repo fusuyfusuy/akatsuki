@@ -2,13 +2,14 @@
 
 import ast
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
 
 from akatsuki.constants import DOMAIN_MOCS, HAVE_PYYAML
 from akatsuki.index import fts_db_context, sync_fts_index
-from akatsuki.storage import validate_frontmatter_yaml
+from akatsuki.storage import VaultLock, validate_frontmatter_yaml
 
 if HAVE_PYYAML:
     import yaml
@@ -71,6 +72,7 @@ def run_verification_tests(
                 capture_output=True,
                 text=True,
                 timeout=5,
+                cwd=vault,
             )
             ok = res.returncode == 0
             if ok:
@@ -278,7 +280,7 @@ def verify_links(vault: Path) -> tuple[bool, list[tuple[str, str]]]:
                 continue
             resolved = (f.parent / tgt).resolve()
             if resolved.exists():
-                if resolved.is_file() and str(resolved).startswith(str(vault)):
+                if resolved.is_file() and resolved.is_relative_to(vault):
                     cand_rel = str(resolved.relative_to(vault))
                     if cand_rel in inbound_links:
                         inbound_links[cand_rel].add(src_rel)
@@ -333,18 +335,24 @@ def reconcile_vault(vault: Path, dry_run: bool = False, with_vectors: bool = Fal
             text = f.read_text(encoding="utf-8")
         except Exception:
             continue
-        if not text.startswith("---"):
+        lines = text.splitlines(keepends=True)
+        if not lines or not lines[0].startswith("---"):
             continue
-        parts = text.split("---", 2)
-        if len(parts) < 3:
+        closing_idx = -1
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                closing_idx = i
+                break
+        if closing_idx == -1:
             continue
-        fm_raw = parts[1]
-        body = parts[2]
+        fm_raw = "".join(lines[1:closing_idx])
+        body = "".join(lines[closing_idx + 1:])
         needs_write = False
         new_fm_lines = []
         for line in fm_raw.splitlines():
             stripped = line.strip()
             if ":" in stripped and not stripped.startswith(("-", "#")):
+                indent = line[: len(line) - len(line.lstrip())]
                 k, v = stripped.split(":", 1)
                 val = v.strip()
                 # Check for unquoted scalar with colon-space
@@ -352,14 +360,17 @@ def reconcile_vault(vault: Path, dry_run: bool = False, with_vectors: bool = Fal
                     (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'"))
                 ):
                     escaped_val = val.replace('"', '\\"')
-                    new_fm_lines.append(f'{k}: "{escaped_val}"')
+                    new_fm_lines.append(f'{indent}{k}: "{escaped_val}"')
                     needs_write = True
                     actions.append(f"Auto-quoted frontmatter field '{k}' in {rel}")
                     continue
             new_fm_lines.append(line)
         if needs_write and not dry_run:
-            new_content = "---\n" + "\n".join(new_fm_lines) + "\n---" + body
-            f.write_text(new_content, encoding="utf-8")
+            new_content = "---\n" + "\n".join(new_fm_lines) + "\n---\n" + body.lstrip()
+            with VaultLock(vault):
+                tmp_f = f.with_name(f".{f.name}.tmp.{os.getpid()}")
+                tmp_f.write_text(new_content, encoding="utf-8")
+                os.replace(tmp_f, f)
 
     # 2. Reconcile unindexed notes to domain MOCs
     _ok, issues = verify_links(vault)
@@ -388,7 +399,10 @@ def reconcile_vault(vault: Path, dry_run: bool = False, with_vectors: bool = Fal
         if not dry_run:
             if not moc_text.endswith("\n"):
                 moc_text += "\n"
-            parent_moc.write_text(moc_text + entry_line, encoding="utf-8")
+            with VaultLock(vault):
+                tmp_moc = parent_moc.with_name(f".{parent_moc.name}.tmp.{os.getpid()}")
+                tmp_moc.write_text(moc_text + entry_line, encoding="utf-8")
+                os.replace(tmp_moc, parent_moc)
 
     # 3. Synchronize FTS5 index
     if not dry_run:

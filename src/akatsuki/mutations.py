@@ -208,7 +208,12 @@ def replace_section_in_note(vault: Path, rel_path: str, heading: str, new_conten
 
 
 def write_note(
-    vault: Path, rel_path: str, content: str, overwrite: bool = False, raw: bool = False
+    vault: Path,
+    rel_path: str,
+    content: str,
+    overwrite: bool = False,
+    raw: bool = False,
+    verify: bool = False,
 ) -> tuple[str, bool]:
     """Write note or raw config/script into vault safely enforcing boundary, permissions, and kernel lock."""
     clean_rel = rel_path.strip()
@@ -267,10 +272,11 @@ def write_note(
     if is_raw:
         return f"Successfully wrote raw file '{clean_rel}'.", False
 
-    v_ok, broken = verify_links(vault)
     report = f"Successfully wrote '{clean_rel}'."
-    if not v_ok:
-        report += f" Warning: {len(broken)} broken link(s) detected in vault."
+    if verify:
+        v_ok, broken = verify_links(vault)
+        if not v_ok:
+            report += f" Warning: {len(broken)} broken link(s) detected in vault."
     return report, False
 
 
@@ -324,28 +330,67 @@ def set_note_property(vault: Path, rel_path: str, keypath: str, value_str: str) 
 
 
 def list_notes_in_vault(vault: Path, domain: str | None = None) -> list[dict]:
-    """List notes in vault with metadata."""
-    notes = []
-    for f in sorted(vault.glob("**/*.md")):
-        rel = str(f.relative_to(vault))
-        if rel.startswith("_templates") or rel.startswith("."):
-            continue
-        if domain and not rel.startswith(domain):
-            continue
+    """List notes in vault with metadata using indexed SQLite entities when available."""
+    db_path = vault / ".akatsuki" / "index.db"
+    if db_path.exists():
         try:
-            text = f.read_text(encoding="utf-8")
-            fm, _ = parse_frontmatter(text)
-            notes.append(
-                {
-                    "rel_path": rel,
-                    "stem": f.stem,
-                    "title": fm.get("title") or f.stem,
-                    "type": fm.get("type") or "note",
-                    "summary": fm.get("summary") or "",
-                    "status": fm.get("status") or "",
-                    "tags": fm.get("tags") or [],
-                }
-            )
+            with fts_db_context(vault) as con:
+                query = "SELECT rel_path, stem, title, type, summary, status, metadata_json FROM entities"
+                params = []
+                if domain:
+                    clean_dom = domain.strip().rstrip("/")
+                    query += " WHERE domain = ? OR rel_path LIKE ?"
+                    params.extend([clean_dom, f"{clean_dom}/%"])
+                query += " ORDER BY rel_path ASC"
+                cur = con.execute(query, params)
+                notes = []
+                for row in cur.fetchall():
+                    meta = {}
+                    if row["metadata_json"]:
+                        try:
+                            meta = json.loads(row["metadata_json"])
+                        except Exception:
+                            pass
+                    notes.append(
+                        {
+                            "rel_path": row["rel_path"],
+                            "stem": row["stem"],
+                            "title": row["title"],
+                            "type": row["type"],
+                            "summary": row["summary"] or "",
+                            "status": row["status"] or "",
+                            "tags": meta.get("tags") or [],
+                        }
+                    )
+                if notes:
+                    return notes
         except Exception:
-            continue
-    return notes
+            pass
+
+    notes = []
+    ignored_dirs = {".git", ".akatsuki", ".venv", "node_modules", ".obsidian", "__pycache__", "_templates"}
+    for root, dirs, files in os.walk(vault):
+        dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
+        for file in files:
+            if file.endswith(".md"):
+                f = Path(root) / file
+                rel = str(f.relative_to(vault))
+                if domain and not rel.startswith(domain):
+                    continue
+                try:
+                    text = f.read_text(encoding="utf-8")
+                    fm, _ = parse_frontmatter(text)
+                    notes.append(
+                        {
+                            "rel_path": rel,
+                            "stem": f.stem,
+                            "title": fm.get("title") or f.stem,
+                            "type": fm.get("type") or "note",
+                            "summary": fm.get("summary") or "",
+                            "status": fm.get("status") or "",
+                            "tags": fm.get("tags") or [],
+                        }
+                    )
+                except Exception:
+                    continue
+    return sorted(notes, key=lambda n: n["rel_path"])

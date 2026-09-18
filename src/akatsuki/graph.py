@@ -184,10 +184,15 @@ def traverse_graph(vault: Path, target: str, depth: int = 2, direction: str = "b
             upstream_tree = _traverse_up(t_stem, 0, {t_stem})
 
         all_stems = {t_stem}
-        for c in downstream_tree:
-            all_stems.add(c["stem"])
-        for c in upstream_tree:
-            all_stems.add(c["stem"])
+
+        def _collect_stems(tree: list[dict]):
+            for node in tree:
+                all_stems.add(node["stem"])
+                if node.get("children"):
+                    _collect_stems(node["children"])
+
+        _collect_stems(downstream_tree)
+        _collect_stems(upstream_tree)
 
         sinks = []
         for s in sorted(all_stems):

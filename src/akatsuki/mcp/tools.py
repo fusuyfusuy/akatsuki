@@ -183,6 +183,10 @@ MCP_TOOLS = [
                     "type": "string",
                     "description": "Optional note title or stem to filter tests. If omitted, runs all tests.",
                 },
+                "target": {
+                    "type": "string",
+                    "description": "Alias for 'note'. Optional note title or stem to filter tests.",
+                },
                 "dry_run": {
                     "type": "boolean",
                     "default": False,
@@ -376,6 +380,11 @@ MCP_TOOLS = [
                     "default": False,
                     "description": "If true, simulate reconciliation without writing changes to disk.",
                 },
+                "with_vectors": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If true, also synchronize the vector index.",
+                },
             },
         },
     },
@@ -487,7 +496,7 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
         return text_out, is_err
 
     elif name == "akatsuki_test":
-        note = args.get("note")
+        note = args.get("note") or args.get("target")
         dry_run = bool(args.get("dry_run", False))
         return run_verification_tests(vault, note_filter=note, dry_run=dry_run)
 
@@ -613,7 +622,10 @@ def handle_mcp_call(name: str, args: dict) -> tuple[str, bool]:
         dry_run = args.get("dry_run", False)
         if isinstance(dry_run, str):
             dry_run = dry_run.lower() in ("true", "1", "yes")
-        res, is_err = reconcile_vault(vault, dry_run=dry_run)
+        with_vectors = args.get("with_vectors", False)
+        if isinstance(with_vectors, str):
+            with_vectors = with_vectors.lower() in ("true", "1", "yes")
+        res, is_err = reconcile_vault(vault, dry_run=dry_run, with_vectors=with_vectors)
         return res, is_err
 
     return f"Unknown tool: {name}", True

@@ -21,6 +21,7 @@ def cli_init(args: argparse.Namespace) -> None:
         "30-Agents",
         "40-Systems",
         "50-Configs",
+        "60-Scripts",
         "90-Reference",
         "90-Database",
         "_templates",
@@ -346,6 +347,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_reconcile = subparsers.add_parser("reconcile", help="Auto-reconcile unindexed notes and strict YAML across vault")
     p_reconcile.add_argument(
         "--dry-run", "-n", action="store_true", help="Simulate reconciliation without writing changes"
+    )
+    p_reconcile.add_argument(
+        "--with-vectors", action="store_true", help="Synchronize vector index during reconciliation"
     )
     p_reconcile.add_argument("--json", action="store_true", help="Output reconciliation actions as JSON")
 
