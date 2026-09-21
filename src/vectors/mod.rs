@@ -367,13 +367,16 @@ pub mod candle_engine {
                 .encode(input, true)
                 .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
-            let tokens = encoding.get_ids();
-            let token_type_ids = encoding.get_type_ids();
-            let attention_mask = encoding.get_attention_mask();
+            // BERT position embeddings are strictly bounded to max_position_embeddings (512).
+            const MAX_TOKENS: usize = 512;
+            let ids = encoding.get_ids();
+            let type_ids = encoding.get_type_ids();
+            let mask = encoding.get_attention_mask();
+            let len = ids.len().min(MAX_TOKENS);
 
-            let token_tensor = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
-            let token_type_tensor = Tensor::new(token_type_ids, &self.device)?.unsqueeze(0)?;
-            let mask_tensor = Tensor::new(attention_mask, &self.device)?.unsqueeze(0)?;
+            let token_tensor = Tensor::new(&ids[..len], &self.device)?.unsqueeze(0)?;
+            let token_type_tensor = Tensor::new(&type_ids[..len], &self.device)?.unsqueeze(0)?;
+            let mask_tensor = Tensor::new(&mask[..len], &self.device)?.unsqueeze(0)?;
 
             let output =
                 self.model
@@ -518,28 +521,30 @@ pub fn search_vectors(
         };
         let mut stmt = con.prepare(sql)?;
 
-        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            Vec<u8>,
-            i64,
-        )> {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-            ))
+        struct NoteVectorRow {
+            rel_path: String,
+            stem: String,
+            domain: String,
+            title: String,
+            summary: String,
+            breadcrumb: Option<String>,
+            preview: String,
+            blob: Vec<u8>,
+            dim: i64,
+        }
+
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<NoteVectorRow> {
+            Ok(NoteVectorRow {
+                rel_path: row.get(0)?,
+                stem: row.get(1)?,
+                domain: row.get(2)?,
+                title: row.get(3)?,
+                summary: row.get(4)?,
+                breadcrumb: row.get(5)?,
+                preview: row.get(6)?,
+                blob: row.get(7)?,
+                dim: row.get(8)?,
+            })
         };
 
         let rows: Vec<_> = if let Some(domain) = domain_filter {
@@ -554,7 +559,15 @@ pub fn search_vectors(
         let mut best: std::collections::HashMap<String, SearchHit> =
             std::collections::HashMap::new();
         for row in rows {
-            let (rel_path, stem, domain, title, summary, breadcrumb, preview, blob, dim) = row;
+            let rel_path = row.rel_path;
+            let stem = row.stem;
+            let domain = row.domain;
+            let title = row.title;
+            let summary = row.summary;
+            let breadcrumb = row.breadcrumb;
+            let preview = row.preview;
+            let blob = row.blob;
+            let dim = row.dim;
             if dim as usize * 4 != blob.len() {
                 continue;
             }

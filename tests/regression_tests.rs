@@ -157,3 +157,23 @@ fn mcp_never_replies_to_notifications() {
         .stdout(predicate::str::contains("\"id\":7"))
         .stdout(predicate::str::contains("\"id\":null").not());
 }
+
+/// A note chunk whose subword token count exceeds BERT's 512 position embeddings
+/// used to panic Candle with "index-select invalid index 512 with dim size 512".
+#[test]
+fn long_note_chunks_do_not_exceed_bert_position_embeddings() {
+    let long_body = "word ".repeat(700);
+    let vault = vault_with(
+        "40-Systems",
+        "Long.md",
+        &format!(
+            "---\ntitle: Long\ndate: 2026-09-21\ntype: system\nsummary: s\nstatus: live\n---\n# Long\n\n{}\n",
+            long_body
+        ),
+    );
+
+    run(vault.path(), &["reconcile"])
+        .success()
+        .stdout(predicate::str::contains("Vault reconciliation completed"));
+}
+
