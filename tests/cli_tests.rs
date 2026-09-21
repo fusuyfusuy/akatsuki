@@ -100,4 +100,25 @@ true
         .assert()
         .success()
         .stdout(predicate::str::contains("1 PASSED"));
+
+    // O(1) Get frontmatter property
+    let mut cmd = Command::cargo_bin("akatsuki").unwrap();
+    cmd.arg("--vault")
+        .arg(vault_path)
+        .arg("get")
+        .arg("Test-Ingress-Service.summary")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("High performance ingress router for microservices."));
+
+    // SQL Query
+    let mut cmd = Command::cargo_bin("akatsuki").unwrap();
+    cmd.arg("--vault")
+        .arg(vault_path)
+        .arg("query")
+        .arg("SELECT title FROM entities WHERE stem = 'Test-Ingress-Service'")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Test Ingress Service"));
 }
+

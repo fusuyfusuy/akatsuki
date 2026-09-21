@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::constants::MCP_DEFAULT_LIMIT;
 use crate::graph::{calculate_blast_radius, extract_contract, traverse_graph};
 use crate::mutations::{append_work_log, write_note};
-use crate::search::{format_hits_compact, search_vault};
+use crate::search::{execute_sql_query, format_hits_compact, get_keypath, search_vault};
 use crate::storage::{extract_section, resolve_note_file};
 use crate::verify::{lint_vault, run_verification_tests, verify_links};
 
@@ -299,6 +299,26 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
                 Err(e) => (format!("Tests failed: {}", e), true),
             }
         }
+        "akatsuki_get" => {
+            let keypath = args.get("key").or_else(|| args.get("keypath")).and_then(|v| v.as_str()).unwrap_or("");
+            if keypath.is_empty() {
+                return ("Error: Missing required parameter 'key'.".to_string(), true);
+            }
+            match get_keypath(vault, keypath) {
+                Ok(val) => (serde_json::to_string_pretty(&val).unwrap_or_default(), false),
+                Err(e) => (format!("Get failed: {}", e), true),
+            }
+        }
+        "akatsuki_query" => {
+            let sql = args.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+            if sql.is_empty() {
+                return ("Error: Missing required parameter 'sql'.".to_string(), true);
+            }
+            match execute_sql_query(vault, sql) {
+                Ok(results) => (serde_json::to_string_pretty(&results).unwrap_or_default(), false),
+                Err(e) => (format!("Query failed: {}", e), true),
+            }
+        }
         _ => (format!("Tool '{}' not implemented", name), true),
     }
 }
@@ -436,5 +456,28 @@ fn get_tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "akatsuki_get",
+            "description": "O(1) exact property getter across services, entities, and note frontmatter keypaths.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Keypath to extract (e.g. 'services.filament.ports', 'entities.bountools.status', 'bountools.tags')" }
+                },
+                "required": ["key"]
+            }
+        }),
+        json!({
+            "name": "akatsuki_query",
+            "description": "Execute read-only SQL queries directly against the internal SQLite index (notes_fts, entities, services, relations, invariants, verifications).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sql": { "type": "string", "description": "Read-only SQL query string (SELECT ...)." }
+                },
+                "required": ["sql"]
+            }
+        }),
     ]
 }
+

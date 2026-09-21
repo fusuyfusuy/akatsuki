@@ -7,6 +7,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::index::{open_cache_db, sync_vault_index};
+use crate::storage::{parse_frontmatter, resolve_note_file};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
@@ -302,3 +303,140 @@ pub fn format_hits_compact(hits: &[SearchHit]) -> String {
 
     out.join("\n")
 }
+
+pub fn execute_sql_query(vault: &Path, sql: &str) -> Result<Vec<serde_json::Value>> {
+    let trimmed = sql.trim();
+    if !trimmed.to_uppercase().starts_with("SELECT") {
+        anyhow::bail!("Security violation: Only SELECT queries are permitted.");
+    }
+
+    let con = open_cache_db(vault)?;
+    let mut stmt = con.prepare(trimmed)?;
+    let col_names: Vec<String> = stmt.column_names().into_iter().map(|s| s.to_string()).collect();
+
+    let mut rows = stmt.query([])?;
+    let mut results = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let mut obj = serde_json::Map::new();
+        for (i, name) in col_names.iter().enumerate() {
+            let val_ref = row.get_ref(i)?;
+            let json_val = match val_ref {
+                rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                rusqlite::types::ValueRef::Integer(v) => serde_json::Value::from(v),
+                rusqlite::types::ValueRef::Real(v) => serde_json::Value::from(v),
+                rusqlite::types::ValueRef::Text(v) => {
+                    let s = String::from_utf8_lossy(v);
+                    if let Ok(nested) = serde_json::from_str::<serde_json::Value>(&s) {
+                        nested
+                    } else {
+                        serde_json::Value::String(s.to_string())
+                    }
+                }
+                rusqlite::types::ValueRef::Blob(b) => {
+                    serde_json::Value::String(format!("<blob len={}>", b.len()))
+                }
+            };
+            obj.insert(name.clone(), json_val);
+        }
+        results.push(serde_json::Value::Object(obj));
+    }
+
+    Ok(results)
+}
+
+pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
+    let parts: Vec<&str> = keypath.split('.').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        anyhow::bail!("Error: Empty keypath.");
+    }
+
+    let category = parts[0];
+    let con = open_cache_db(vault)?;
+
+    if category == "services" && parts.len() >= 2 {
+        let svc_name = parts[1];
+        let pattern = format!("{}%", svc_name);
+        let mut stmt = con.prepare("SELECT name, container_prefix, ports, host, network, replicas, role, rel_path FROM services WHERE name = ?1 OR name LIKE ?2 LIMIT 1")?;
+        let mut rows = stmt.query(params![svc_name, pattern])?;
+        if let Some(row) = rows.next()? {
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".to_string(), serde_json::Value::String(row.get(0)?));
+            obj.insert("container_prefix".to_string(), serde_json::Value::String(row.get(1)?));
+            obj.insert("ports".to_string(), serde_json::Value::String(row.get(2)?));
+            obj.insert("host".to_string(), serde_json::Value::String(row.get(3)?));
+            obj.insert("network".to_string(), serde_json::Value::String(row.get(4)?));
+            obj.insert("replicas".to_string(), serde_json::Value::String(row.get(5)?));
+            obj.insert("role".to_string(), serde_json::Value::String(row.get(6)?));
+            obj.insert("rel_path".to_string(), serde_json::Value::String(row.get(7)?));
+
+            if parts.len() == 2 {
+                return Ok(serde_json::Value::Object(obj));
+            }
+            let prop = parts[2];
+            if let Some(val) = obj.get(prop) {
+                return Ok(val.clone());
+            } else {
+                anyhow::bail!("Property '{}' not found in service '{}'", prop, svc_name);
+            }
+        } else {
+            anyhow::bail!("Service '{}' not found in services catalog", svc_name);
+        }
+    }
+
+    if category == "entities" && parts.len() >= 2 {
+        let ent_stem = parts[1];
+        let mut stmt = con.prepare("SELECT rel_path, stem, domain, title, summary, status, repo, host, network, tags FROM entities WHERE stem = ?1 OR rel_path = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(params![ent_stem])?;
+        if let Some(row) = rows.next()? {
+            let mut obj = serde_json::Map::new();
+            obj.insert("rel_path".to_string(), serde_json::Value::String(row.get(0)?));
+            obj.insert("stem".to_string(), serde_json::Value::String(row.get(1)?));
+            obj.insert("domain".to_string(), serde_json::Value::String(row.get(2)?));
+            obj.insert("title".to_string(), serde_json::Value::String(row.get(3)?));
+            obj.insert("summary".to_string(), row.get::<_, Option<String>>(4)?.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+            obj.insert("status".to_string(), row.get::<_, Option<String>>(5)?.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+            obj.insert("repo".to_string(), row.get::<_, Option<String>>(6)?.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+            obj.insert("host".to_string(), row.get::<_, Option<String>>(7)?.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+            obj.insert("network".to_string(), row.get::<_, Option<String>>(8)?.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+            obj.insert("tags".to_string(), row.get::<_, Option<String>>(9)?.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+
+            if parts.len() == 2 {
+                return Ok(serde_json::Value::Object(obj));
+            }
+
+            let mut cur = serde_json::Value::Object(obj);
+            for p in &parts[2..] {
+                if let Some(next) = cur.get(*p) {
+                    cur = next.clone();
+                } else {
+                    anyhow::bail!("Property '{}' not found in entity '{}'", p, ent_stem);
+                }
+            }
+            return Ok(cur);
+        } else {
+            anyhow::bail!("Entity '{}' not found in vault index", ent_stem);
+        }
+    }
+
+    // Frontmatter lookup on note file
+    if let Some(note_path) = resolve_note_file(vault, category) {
+        let content = std::fs::read_to_string(&note_path)?;
+        let (fm, _) = parse_frontmatter(&content);
+        if parts.len() == 1 {
+            return Ok(fm);
+        }
+        let mut cur = fm;
+        for p in &parts[1..] {
+            if let Some(next) = cur.get(*p) {
+                cur = next.clone();
+            } else {
+                anyhow::bail!("Key '{}' not found in frontmatter of '{}'", p, note_path.display());
+            }
+        }
+        return Ok(cur);
+    }
+
+    anyhow::bail!("Could not resolve keypath '{}'", keypath);
+}
+

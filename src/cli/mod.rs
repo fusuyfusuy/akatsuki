@@ -8,7 +8,7 @@ use crate::constants::{CLI_DEFAULT_LIMIT, VERSION};
 use crate::graph::{calculate_blast_radius, extract_contract, traverse_graph};
 use crate::index::{open_cache_db, sync_vault_index};
 use crate::mutations::{append_work_log, replace_section_in_note, set_note_property, write_note};
-use crate::search::{format_hits_compact, search_vault};
+use crate::search::{execute_sql_query, format_hits_compact, get_keypath, search_vault};
 use crate::storage::{extract_section, resolve_note_file, resolve_vault_path};
 use crate::verify::{lint_vault, run_verification_tests, verify_links};
 
@@ -83,6 +83,20 @@ pub enum Commands {
 
     #[command(about = "List active software project architectures and repository paths")]
     Projects {
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(about = "O(1) exact property getter across services, entities, and note frontmatter")]
+    Get {
+        keypath: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(about = "Execute read-only SQL query against SQLite projection cache")]
+    Query {
+        sql: String,
         #[arg(long)]
         json: bool,
     },
@@ -280,6 +294,30 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             })?;
             let items: Vec<serde_json::Value> = rows.filter_map(Result::ok).collect();
             println!("{}", serde_json::to_string_pretty(&items)?);
+        }
+        Commands::Get { keypath, json } => {
+            let val = get_keypath(&vault, &keypath)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "keypath": keypath,
+                    "value": val
+                }))?);
+            } else {
+                match val {
+                    serde_json::Value::String(s) => println!("{}", s),
+                    other => println!("{}", serde_json::to_string_pretty(&other)?),
+                }
+            }
+        }
+        Commands::Query { sql, json } => {
+            let results = execute_sql_query(&vault, &sql)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                for r in results {
+                    println!("{}", serde_json::to_string(&r)?);
+                }
+            }
         }
         Commands::Log { project, summary, device, json } => {
             let p_str = project.unwrap_or_default();
