@@ -19,7 +19,7 @@ KERNEL:
     2_PURITY:     Pure Markdown & Strict YAML — zero Obsidian plugin lock-in
     3_BUDGETING:  Token-Bounded Reads (contract > read --budget > full read)
     4_INTEGRITY:  Zero Orphan Notes — wikilink resolution verify == exit 0
-    5_OPTIONAL_ML: Zero-dep core; `akatsuki[embeddings]` (sentence-transformers, torch), CPU threads <= 2, local ephemeral vectors.db
+    5_VECTORS:    Pure Rust Hugging Face Candle tensor engine (`intfloat/multilingual-e5-small`), local cache in `~/.cache/akatsuki/models/`, sub-50ms hybrid RRF search, zero Python/PyTorch overhead
 ```
 
 ## SYNOPSIS
@@ -27,7 +27,7 @@ KERNEL:
 ```shell
 akatsuki search   <query> [--domain <domain>] [--limit <N>] [--mode hybrid|bm25|vector] [--with-graph] [--compact] [--json]
 akatsuki contract <note> [--json]
-akatsuki read     <note> [--section <sec>] [--budget <N>] [--json]
+akatsuki read     <note> [--section <sec>] [--json]
 akatsuki get      <key> [--json]
 akatsuki query    <sql> [--json]
 akatsuki blast    <target> [--json]
@@ -37,13 +37,15 @@ akatsuki set      <note> --key <key> --value <val> [--json]
 akatsuki append   <note> --heading <heading> --content <content> [--json]
 akatsuki replace  <note> --heading <heading> --content <content> [--json]
 akatsuki write    <path> --content <content> [--overwrite] [--raw] [--json]
+akatsuki list     [--domain <domain>] [--json]
 akatsuki services [--json]
 akatsuki projects [--json]
 akatsuki daily    [--date <YYYY-MM-DD>] [--json]
 akatsuki log      --project <proj> --summary <sum> [--device <dev>] [--json]
 akatsuki lint     [--json]
 akatsuki verify   [--json]
-akatsuki reconcile [--dry-run] [--with-vectors] [--json]
+akatsuki reconcile [--dry-run] [--json]
+akatsuki setup-models
 akatsuki mcp      [--vault <dir>]
 ```
 
@@ -89,7 +91,7 @@ akatsuki search <query> [--domain <domain>] [--limit <N>] [--mode hybrid|bm25|ve
   - `hybrid` (default): Fuses Okapi BM25 keyword rankings and dense semantic embeddings via Reciprocal Rank Fusion (RRF, $k=60$).
   - `bm25`: Fast full-text search over SQLite FTS5 with `unicode61` tokenizer, column weighting (title 10 / tags 5 / summary 5 / body 1), and morphological suffix expansion.
   - `vector`: Pure cosine similarity over local 384-dimensional dense vectors (`multilingual-e5-small`).
-- **Incremental Metadata Caching**: Maintains `.akatsuki/vectors.db` tracking `(rel_path, mtime, size)`. Unchanged notes skip inference in $<5\text{ ms}$; zero-cost re-indexing on subsequent queries.
+- **Incremental Metadata Caching**: Maintains `.akatsuki/cache.db` (SQLite WAL) with parallel Blake3 Merkle tree change detection across all notes in $<1\text{ ms}$ via Rayon; zero-cost incremental updates.
 - **Activity & Work Log Recall**: Work logs deposited via `akatsuki log` are parsed with contextual breadcrumbs (`[Document: ...]`, `[Breadcrumb: ...]`), enabling conceptual queries against past tasks without needing exact commit hashes.
 - `--domain <dir>`: Restrict search (e.g. `20-Projects`, `40-Systems`, `01-Daily`, `30-Agents`).
 - `--limit <N>`, `-n`: Truncate matches to fit token budgets (default: 10).
@@ -178,7 +180,7 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`
 | :--- | :--- | :--- |
 | `akatsuki_search` | `akatsuki search` | `query`, `mode`, `domain`, `limit`, `with_graph` |
 | `akatsuki_contract` | `akatsuki contract` | `note` |
-| `akatsuki_read` | `akatsuki read` | `note`, `section`, `budget` |
+| `akatsuki_read` | `akatsuki read` | `note` (or `path`), `section` |
 | `akatsuki_get` | `akatsuki get` | `key` |
 | `akatsuki_query` | `akatsuki query` | `sql` |
 | `akatsuki_blast` | `akatsuki blast` | `target` |
@@ -194,7 +196,7 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`
 | `akatsuki_record_log` | `akatsuki log` | `project`, `summary`, `device` |
 | `akatsuki_lint` | `akatsuki lint` | *(none)* |
 | `akatsuki_verify` | `akatsuki verify` | *(none)* |
-| `akatsuki_reconcile` | `akatsuki reconcile` | `dry_run`, `with_vectors` |
+| `akatsuki_reconcile` | `akatsuki reconcile` | `dry_run` |
 | `akatsuki_list_notes` | `akatsuki list` | `domain` |
 
 ---

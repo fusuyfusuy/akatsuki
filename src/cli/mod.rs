@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 use crate::constants::{CLI_DEFAULT_LIMIT, VERSION};
 use crate::graph::{calculate_blast_radius, extract_contract, traverse_graph};
 use crate::index::{open_cache_db, sync_vault_index};
-use crate::mutations::{append_work_log, replace_section_in_note, set_note_property, write_note};
-use crate::search::{execute_sql_query, format_hits_compact, get_keypath, search_vault};
+use crate::mutations::{append_section_in_note, append_work_log, read_daily_note, replace_section_in_note, set_note_property, write_note};
+use crate::search::{execute_sql_query, format_hits_compact, get_keypath, list_notes, search_vault};
 use crate::storage::{extract_section, resolve_note_file, resolve_vault_path};
 use crate::verify::{lint_vault, run_verification_tests, verify_links};
 
@@ -144,6 +144,33 @@ pub enum Commands {
         key: String,
         #[arg(short, long)]
         value: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(about = "Atomically append markdown bullets or text under a specific heading")]
+    Append {
+        note: String,
+        #[arg(short = 'H', long)]
+        heading: String,
+        #[arg(short, long)]
+        content: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(about = "Read today's or specified daily horizon and work ledger")]
+    Daily {
+        #[arg(short, long)]
+        date: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(about = "List notes in vault with optional domain filtering")]
+    List {
+        #[arg(short, long)]
+        domain: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -350,6 +377,35 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::json!({ "status": "ok" }));
             } else {
                 println!("Property '{}' updated in '{}'", key, note);
+            }
+        }
+        Commands::Append { note, heading, content, json } => {
+            append_section_in_note(&vault, &note, &heading, &content)?;
+            if json {
+                println!("{}", serde_json::json!({ "status": "ok" }));
+            } else {
+                println!("Content appended under '{}' in '{}'", heading, note);
+            }
+        }
+        Commands::Daily { date, json } => {
+            let (content, exists) = read_daily_note(&vault, date.as_deref())?;
+            if json {
+                println!("{}", serde_json::json!({ "content": content, "exists": exists }));
+            } else {
+                println!("{}", content);
+            }
+        }
+        Commands::List { domain, json } => {
+            let notes = list_notes(&vault, domain.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&notes)?);
+            } else {
+                for n in notes {
+                    let stem = n["stem"].as_str().unwrap_or("");
+                    let title = n["title"].as_str().unwrap_or("");
+                    let rel = n["rel_path"].as_str().unwrap_or("");
+                    println!("- **{}** (`{}`): {}", title, rel, stem);
+                }
             }
         }
         Commands::Lint { json } => {

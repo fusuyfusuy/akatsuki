@@ -201,3 +201,85 @@ pub fn set_note_property(
 
     Ok(())
 }
+
+pub fn append_section_in_note(
+    vault: &Path,
+    rel_path: &str,
+    heading: &str,
+    content_to_append: &str,
+) -> Result<()> {
+    let _lock = VaultLock::acquire(vault)?;
+
+    let note_path = resolve_note_file(vault, rel_path)
+        .with_context(|| format!("Note '{}' not found in vault", rel_path))?;
+
+    let text = fs::read_to_string(&note_path)?;
+    let (fm, body) = parse_frontmatter(&text);
+
+    let norm_h = heading.trim().trim_start_matches('#').trim();
+    let lines: Vec<&str> = body.lines().collect();
+
+    let mut start_idx = None;
+    let mut end_idx = None;
+    let mut target_level = 2;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            let level = trimmed.chars().take_while(|c| *c == '#').count();
+            let h_text = trimmed[level..].trim();
+            if h_text.eq_ignore_ascii_case(norm_h) {
+                start_idx = Some(i);
+                target_level = level;
+                continue;
+            }
+            if start_idx.is_some() && level <= target_level {
+                end_idx = Some(i);
+                break;
+            }
+        }
+    }
+
+    if start_idx.is_none() {
+        bail!("Heading '{}' not found in note '{}'", heading, note_path.display());
+    }
+
+    let end = end_idx.unwrap_or(lines.len());
+
+    let mut new_body_lines = Vec::new();
+    for line in &lines[..end] {
+        new_body_lines.push(*line);
+    }
+    new_body_lines.push("");
+    new_body_lines.push(content_to_append.trim());
+    new_body_lines.push("");
+    for line in &lines[end..] {
+        new_body_lines.push(*line);
+    }
+
+    let updated_body = new_body_lines.join("\n");
+    let full_content = dump_frontmatter(&fm, &updated_body);
+
+    write_atomic(&note_path, &full_content)?;
+
+    let mut con = open_cache_db(vault)?;
+    let _ = sync_vault_index(vault, &mut con)?;
+
+    Ok(())
+}
+
+pub fn read_daily_note(vault: &Path, date_opt: Option<&str>) -> Result<(String, bool)> {
+    let date_str = match date_opt {
+        Some(d) if !d.trim().is_empty() => d.trim().to_string(),
+        _ => Local::now().format("%Y-%m-%d").to_string(),
+    };
+
+    let daily_file = vault.join("01-Daily").join(format!("{}.md", date_str));
+    if daily_file.is_file() {
+        let content = fs::read_to_string(&daily_file)?;
+        Ok((content, true))
+    } else {
+        Ok((format!("Daily note for {} does not exist yet.", date_str), false))
+    }
+}
+

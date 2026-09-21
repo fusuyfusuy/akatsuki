@@ -7,8 +7,9 @@ use serde_json::{json, Value};
 
 use crate::constants::MCP_DEFAULT_LIMIT;
 use crate::graph::{calculate_blast_radius, extract_contract, traverse_graph};
-use crate::mutations::{append_work_log, write_note};
-use crate::search::{execute_sql_query, format_hits_compact, get_keypath, search_vault};
+use crate::index::{open_cache_db, sync_vault_index};
+use crate::mutations::{append_section_in_note, append_work_log, read_daily_note, replace_section_in_note, set_note_property, write_note};
+use crate::search::{execute_sql_query, format_hits_compact, get_keypath, list_notes, search_vault};
 use crate::storage::{extract_section, resolve_note_file};
 use crate::verify::{lint_vault, run_verification_tests, verify_links};
 
@@ -319,6 +320,71 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
                 Err(e) => (format!("Query failed: {}", e), true),
             }
         }
+        "akatsuki_set" => {
+            let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+            if note.is_empty() || key.is_empty() {
+                return ("Error: Missing required parameter 'note' or 'key'.".to_string(), true);
+            }
+
+            match set_note_property(vault, note, key, value) {
+                Ok(()) => (format!("Property '{}' set on note '{}'", key, note), false),
+                Err(e) => (format!("Set property failed: {}", e), true),
+            }
+        }
+        "akatsuki_replace_section" => {
+            let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            let heading = args.get("heading").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+            if note.is_empty() || heading.is_empty() {
+                return ("Error: Missing required parameter 'note' or 'heading'.".to_string(), true);
+            }
+
+            match replace_section_in_note(vault, note, heading, content) {
+                Ok(()) => (format!("Section '{}' replaced in note '{}'", heading, note), false),
+                Err(e) => (format!("Replace section failed: {}", e), true),
+            }
+        }
+        "akatsuki_append_section" => {
+            let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            let heading = args.get("heading").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+            if note.is_empty() || heading.is_empty() {
+                return ("Error: Missing required parameter 'note' or 'heading'.".to_string(), true);
+            }
+
+            match append_section_in_note(vault, note, heading, content) {
+                Ok(()) => (format!("Content appended under '{}' in note '{}'", heading, note), false),
+                Err(e) => (format!("Append section failed: {}", e), true),
+            }
+        }
+        "akatsuki_daily" => {
+            let date = args.get("date").and_then(|v| v.as_str());
+            match read_daily_note(vault, date) {
+                Ok((content, _)) => (content, false),
+                Err(e) => (format!("Read daily failed: {}", e), true),
+            }
+        }
+        "akatsuki_reconcile" => {
+            match open_cache_db(vault) {
+                Ok(mut con) => match sync_vault_index(vault, &mut con) {
+                    Ok(rep) => (format!("Reconciliation completed in {:.2}ms ({} total, {} added, {} updated, {} deleted)", rep.duration_ms, rep.total, rep.added, rep.updated, rep.deleted), false),
+                    Err(e) => (format!("Reconcile sync failed: {}", e), true),
+                },
+                Err(e) => (format!("Database open failed: {}", e), true),
+            }
+        }
+        "akatsuki_list_notes" => {
+            let domain = args.get("domain").and_then(|v| v.as_str());
+            match list_notes(vault, domain) {
+                Ok(notes) => (serde_json::to_string_pretty(&notes).unwrap_or_default(), false),
+                Err(e) => (format!("List notes failed: {}", e), true),
+            }
+        }
         _ => (format!("Tool '{}' not implemented", name), true),
     }
 }
@@ -476,6 +542,75 @@ fn get_tool_definitions() -> Vec<Value> {
                     "sql": { "type": "string", "description": "Read-only SQL query string (SELECT ...)." }
                 },
                 "required": ["sql"]
+            }
+        }),
+        json!({
+            "name": "akatsuki_set",
+            "description": "Surgically update a frontmatter key-value property without corrupting note body.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "note": { "type": "string", "description": "Note title, stem, or relative path" },
+                    "key": { "type": "string", "description": "Frontmatter property name" },
+                    "value": { "type": "string", "description": "New value as string, number, boolean, or JSON array" }
+                },
+                "required": ["note", "key", "value"]
+            }
+        }),
+        json!({
+            "name": "akatsuki_replace_section",
+            "description": "Surgically replace the contents of a specific markdown heading within a note under kernel lock.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "note": { "type": "string", "description": "Note title, stem, or relative path" },
+                    "heading": { "type": "string", "description": "Heading section to replace" },
+                    "content": { "type": "string", "description": "New replacement markdown content" }
+                },
+                "required": ["note", "heading", "content"]
+            }
+        }),
+        json!({
+            "name": "akatsuki_append_section",
+            "description": "Atomically append markdown bullets or text under a specific heading.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "note": { "type": "string", "description": "Note title, stem, or relative path" },
+                    "heading": { "type": "string", "description": "Heading section under which to append" },
+                    "content": { "type": "string", "description": "Markdown content to append" }
+                },
+                "required": ["note", "heading", "content"]
+            }
+        }),
+        json!({
+            "name": "akatsuki_daily",
+            "description": "Read today's or specified daily horizon and work ledger.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "date": { "type": "string", "description": "Optional YYYY-MM-DD date (defaults to today)" }
+                }
+            }
+        }),
+        json!({
+            "name": "akatsuki_reconcile",
+            "description": "Auto-reconcile unindexed notes and synchronize SQLite index.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dry_run": { "type": "boolean", "default": false }
+                }
+            }
+        }),
+        json!({
+            "name": "akatsuki_list_notes",
+            "description": "List notes in vault with metadata and domain filtering.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "domain": { "type": "string", "description": "Optional domain filter (e.g. '20-Projects', '40-Systems')" }
+                }
             }
         }),
     ]

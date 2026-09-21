@@ -440,3 +440,37 @@ pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
     anyhow::bail!("Could not resolve keypath '{}'", keypath);
 }
 
+pub fn list_notes(vault: &Path, domain: Option<&str>) -> Result<Vec<serde_json::Value>> {
+    let con = open_cache_db(vault)?;
+    let (sql, is_filtered) = if domain.is_some() {
+        ("SELECT stem, rel_path, domain, title, summary, status FROM entities WHERE domain = ?1 ORDER BY stem", true)
+    } else {
+        ("SELECT stem, rel_path, domain, title, summary, status FROM entities ORDER BY domain, stem", false)
+    };
+
+    let mut stmt = con.prepare(sql)?;
+    let map_row = |r: &rusqlite::Row| {
+        Ok(serde_json::json!({
+            "stem": r.get::<_, String>(0)?,
+            "rel_path": r.get::<_, String>(1)?,
+            "domain": r.get::<_, String>(2)?,
+            "title": r.get::<_, String>(3)?,
+            "summary": r.get::<_, Option<String>>(4)?,
+            "status": r.get::<_, Option<String>>(5)?,
+        }))
+    };
+
+    let rows: Vec<serde_json::Value> = if is_filtered {
+        stmt.query_map(rusqlite::params![domain.unwrap()], map_row)?
+            .filter_map(Result::ok)
+            .collect()
+    } else {
+        stmt.query_map([], map_row)?
+            .filter_map(Result::ok)
+            .collect()
+    };
+
+    Ok(rows)
+}
+
+
