@@ -1,14 +1,14 @@
 # Project Memory
 
 ## Active Epics & Scale
-- Scale: Modularized standard-library AI knowledge secretariat (4.8k LOC total across 13 modules, 43 unit tests).
-- Architecture: Decoupled into `storage`, `index`, `vectors`, `search`, `graph`, `verify`, `mutations`, `mcp`, and `cli`, preserved by a backward-compatible `core.py` facade.
+- Scale: Native compiled Rust knowledge secretariat (akatsuki v0.2.0, ~3k LOC Rust across storage, index, search, vectors, graph, mutations, verify, mcp, cli; sub-50ms execution).
+- Architecture: Dual-layer Markdown Git source-of-truth with SQLite WAL projection (`.akatsuki/cache.db`), parallel Blake3 Merkle tree change detection via Rayon, pure Rust HuggingFace Candle tensor embeddings (`intfloat/multilingual-e5-small`), and native JSON-RPC 2.0 MCP stdio server.
 
 ## KNOWN DEBT (open only — one line per item, delete when done)
-# Deliberate gaps get ledger lines: - accepted <what> <- <why> -> <trigger>
 
 ## Domain Vocabulary & Gotchas
-- Test Isolation: `get_external_embed_python` scans host paths unless `AKATSUKI_TESTING=1` or `AKATSUKI_DISABLE_HOST_EMBED=1` is set; always keep test environment isolated to prevent cold PyTorch subprocess latency.
-- M2M Parity: All CLI subcommands strictly support `--json` output alongside human terminal formatting.
-- Surgical Section Patching: `replace_section_in_note` atomically swaps markdown content under a specific heading without corrupting frontmatter or adjacent sections.
-- Vault Override: `resolve_vault_path` checks both `akatsuki.storage.CURRENT_VAULT_OVERRIDE` and `akatsuki.core.CURRENT_VAULT_OVERRIDE` for multi-module and test runner compatibility.
+- Spill Trap: Antigravity dumps tool outputs > 4000 bytes to disk (`output.txt`). MCP `akatsuki_search` caps matches to 5 with dense breadcrumbs (~1.6 KB) to prevent agents wasting turns reading spilled files.
+- Domain File Stems: Rust `Path::file_stem()` strips dots (e.g. `yusufakcakaya.com.md` -> `yusufakcakaya`). Notes must use `strip_suffix(".md")` to preserve full domain stems.
+- Heading Normalization: Notes frequently use emojis in headings (e.g. `## 📌 Overview`). `extract_section` filters non-alphanumerics before matching query strings.
+- Invariant Boundary: Akatsuki never runs repo unit tests; `bash:verify` assertion blocks are strictly for machine infrastructure invariants (ports, containers, daemons, host addresses).
+- Parameter Aliasing: `akatsuki_read` accepts `note`, `path`, or `target` interchangeably and normalizes spaces to hyphens for robust stem resolution.

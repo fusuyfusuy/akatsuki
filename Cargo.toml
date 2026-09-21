@@ -1,0 +1,39 @@
+[package]
+name = "akatsuki"
+version = "0.2.0"
+edition = "2021"
+authors = ["fusuyfusuy"]
+description = "Universal Living System Memory & Architectural Contracts Gateway"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = { version = "1.5", features = ["rayon"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+fs2 = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+thiserror = "2.0"
+regex = "1.10"
+walkdir = "2.5"
+dirs = "6.0"
+
+# Optional / Vector feature dependencies
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+hf-hub = { version = "0.4", optional = true }
+
+[features]
+default = []
+vectors = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+
+[dev-dependencies]
+tempfile = "3.16"
+assert_cmd = "2.0"
+predicates = "3.1"
