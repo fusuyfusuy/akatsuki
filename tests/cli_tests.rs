@@ -80,7 +80,9 @@ true
         .arg("Architectural Overview")
         .assert()
         .success()
-        .stdout(predicate::str::contains("This service manages ingress routing across all cluster nodes."));
+        .stdout(predicate::str::contains(
+            "This service manages ingress routing across all cluster nodes.",
+        ));
 
     // BM25 Search
     let mut cmd = Command::cargo_bin("akatsuki").unwrap();
@@ -109,7 +111,9 @@ true
         .arg("Test-Ingress-Service.summary")
         .assert()
         .success()
-        .stdout(predicate::str::contains("High performance ingress router for microservices."));
+        .stdout(predicate::str::contains(
+            "High performance ingress router for microservices.",
+        ));
 
     // SQL Query
     let mut cmd = Command::cargo_bin("akatsuki").unwrap();
@@ -121,4 +125,3 @@ true
         .success()
         .stdout(predicate::str::contains("Test Ingress Service"));
 }
-

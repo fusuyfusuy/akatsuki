@@ -1,20 +1,28 @@
 //! Model Context Protocol (MCP) native JSON-RPC 2.0 stdio server.
 
-use std::io::{self, BufRead, Write};
-use std::path::Path;
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::io::{self, BufRead, Write};
+use std::path::Path;
 
 use crate::constants::MCP_DEFAULT_LIMIT;
 use crate::graph::{calculate_blast_radius, extract_contract, traverse_graph};
-use crate::index::{open_cache_db, sync_vault_index};
-use crate::mutations::{append_section_in_note, append_work_log, read_daily_note, replace_section_in_note, set_note_property, write_note};
-use crate::search::{execute_sql_query, format_hits_compact, get_keypath, list_notes, search_vault};
+use crate::index::open_synced_db;
+use crate::mutations::{
+    append_section_in_note, append_work_log, read_daily_note, replace_section_in_note,
+    set_note_property, write_note,
+};
+use crate::search::{
+    execute_sql_query, format_hits_compact, get_keypath, list_notes, search_vault,
+};
 use crate::storage::{extract_section, resolve_note_file};
-use crate::verify::{lint_vault, run_verification_tests, verify_links};
+use crate::verify::{lint_vault, reconcile_vault, run_verification_tests, verify_links};
 
 pub fn run_mcp_server(vault: &Path) -> Result<()> {
-    eprintln!("🌅 Akatsuki Native MCP Server listening on stdio (PID: {})...", std::process::id());
+    eprintln!(
+        "🌅 Akatsuki Native MCP Server listening on stdio (PID: {})...",
+        std::process::id()
+    );
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -48,6 +56,11 @@ pub fn run_mcp_server(vault: &Path) -> Result<()> {
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
 
+        // JSON-RPC: a message without an id is a notification and MUST NOT be answered.
+        if id.is_none() {
+            continue;
+        }
+
         let response = match method {
             "initialize" => json!({
                 "jsonrpc": "2.0",
@@ -72,9 +85,26 @@ pub fn run_mcp_server(vault: &Path) -> Result<()> {
             }),
             "tools/call" => {
                 let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let tool_args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let tool_args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
 
-                let (text_out, is_err) = dispatch_tool(vault, tool_name, &tool_args);
+                // A panic inside one tool must not take the whole stdio server down.
+                let (text_out, is_err) =
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dispatch_tool(vault, tool_name, &tool_args)
+                    })) {
+                        Ok(pair) => pair,
+                        Err(panic) => (
+                            format!(
+                                "Internal error: tool '{}' panicked: {}",
+                                tool_name,
+                                panic_message(&panic)
+                            ),
+                            true,
+                        ),
+                    };
 
                 json!({
                     "jsonrpc": "2.0",
@@ -95,7 +125,6 @@ pub fn run_mcp_server(vault: &Path) -> Result<()> {
                 "id": id,
                 "result": {}
             }),
-            "notifications/initialized" => continue,
             _ => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -115,12 +144,14 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
         "akatsuki_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let domain = args.get("domain").and_then(|v| v.as_str());
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(MCP_DEFAULT_LIMIT as u64) as usize;
-            let with_graph = args.get("with_graph").and_then(|v| v.as_bool()).unwrap_or(false);
+            let limit = arg_usize(args, "limit").unwrap_or(MCP_DEFAULT_LIMIT);
+            let with_graph = arg_bool(args, "with_graph").unwrap_or(false);
 
-            // Default mode is hybrid if models are downloaded, else bm25
-            let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or_else(|| {
-                if crate::vectors::are_models_available() {
+            // Hybrid is the default intent; the effective engine is reported back,
+            // never assumed.
+            let requested = args.get("mode").and_then(|v| v.as_str());
+            let mode = requested.unwrap_or_else(|| {
+                if crate::vectors::degradation_note().is_none() {
                     "hybrid"
                 } else {
                     "bm25"
@@ -128,37 +159,57 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             });
 
             match search_vault(vault, query, domain, limit, with_graph, mode) {
-                Ok(hits) => (format_hits_compact(&hits), false),
+                Ok(hits) => {
+                    let mut text = format_hits_compact(&hits);
+                    if let Some(note) = crate::vectors::hybrid_note(vault) {
+                        text.push_str(&format!("\n⚠ {}", note));
+                    }
+                    (text, false)
+                }
                 Err(e) => (format!("Search failed: {}", e), true),
             }
         }
         "akatsuki_read" => {
             // Parameter aliasing: accept note, path, or target
-            let target_query = args.get("note")
+            let target_query = args
+                .get("note")
                 .or_else(|| args.get("path"))
                 .or_else(|| args.get("target"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
             if target_query.is_empty() {
-                return ("Error: Missing required parameter 'note' (or 'path').".to_string(), true);
+                return (
+                    "Error: Missing required parameter 'note' (or 'path').".to_string(),
+                    true,
+                );
             }
 
             let section = args.get("section").and_then(|v| v.as_str());
+            let budget = arg_usize(args, "budget");
 
             match resolve_note_file(vault, target_query) {
                 Some(p) => match std::fs::read_to_string(&p) {
                     Ok(content) => {
-                        if let Some(sec) = section {
+                        let selected = if let Some(sec) = section {
                             match extract_section(&content, sec) {
-                                Some(s) => (s, false),
-                                None => (format!("Section '{}' not found in '{}'", sec, p.display()), true),
+                                Some(s) => s,
+                                None => {
+                                    return (
+                                        format!("Section '{}' not found in '{}'", sec, p.display()),
+                                        true,
+                                    )
+                                }
                             }
                         } else {
-                            (content, false)
-                        }
+                            content
+                        };
+                        (crate::storage::apply_token_budget(&selected, budget), false)
                     }
-                    Err(e) => (format!("Failed to read note '{}': {}", p.display(), e), true),
+                    Err(e) => (
+                        format!("Failed to read note '{}': {}", p.display(), e),
+                        true,
+                    ),
                 },
                 None => (format!("Note '{}' not found in vault.", target_query), true),
             }
@@ -166,95 +217,115 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
         "akatsuki_contract" => {
             let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("");
             if note.is_empty() {
-                return ("Error: Missing required parameter 'note'.".to_string(), true);
+                return (
+                    "Error: Missing required parameter 'note'.".to_string(),
+                    true,
+                );
             }
             match extract_contract(vault, note) {
-                Ok(contract) => (serde_json::to_string_pretty(&contract).unwrap_or_default(), false),
+                Ok(contract) => (
+                    serde_json::to_string_pretty(&contract).unwrap_or_default(),
+                    false,
+                ),
                 Err(e) => (format!("Contract extraction failed: {}", e), true),
             }
         }
         "akatsuki_blast" => {
             let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
             if target.is_empty() {
-                return ("Error: Missing required parameter 'target'.".to_string(), true);
+                return (
+                    "Error: Missing required parameter 'target'.".to_string(),
+                    true,
+                );
             }
             match calculate_blast_radius(vault, target) {
-                Ok(blast) => (serde_json::to_string_pretty(&blast).unwrap_or_default(), false),
+                Ok(blast) => (
+                    serde_json::to_string_pretty(&blast).unwrap_or_default(),
+                    false,
+                ),
                 Err(e) => (format!("Blast radius failed: {}", e), true),
             }
         }
         "akatsuki_map" => {
             let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
-            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
-            let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("both");
+            let depth = arg_usize(args, "depth").unwrap_or(2);
+            let direction = args
+                .get("direction")
+                .and_then(|v| v.as_str())
+                .unwrap_or("both");
 
             match traverse_graph(vault, target, depth, direction) {
-                Ok(graph) => (serde_json::to_string_pretty(&graph).unwrap_or_default(), false),
+                Ok(graph) => (
+                    serde_json::to_string_pretty(&graph.payload).unwrap_or_default(),
+                    false,
+                ),
                 Err(e) => (format!("Map traversal failed: {}", e), true),
             }
         }
-        "akatsuki_services" => {
-            match crate::index::open_cache_db(vault) {
-                Ok(con) => {
-                    let sql = "SELECT name, container_prefix, ports, replicas, role, host, network FROM services";
-                    match con.prepare(sql) {
-                        Ok(mut stmt) => {
-                            let rows = stmt.query_map([], |r| {
-                                Ok(json!({
-                                    "name": r.get::<_, String>(0)?,
-                                    "container_prefix": r.get::<_, String>(1)?,
-                                    "ports": r.get::<_, String>(2)?,
-                                    "replicas": r.get::<_, String>(3)?,
-                                    "role": r.get::<_, String>(4)?,
-                                    "host": r.get::<_, String>(5)?,
-                                    "network": r.get::<_, String>(6)?,
-                                }))
-                            });
-                            match rows {
-                                Ok(iter) => {
-                                    let items: Vec<Value> = iter.filter_map(Result::ok).collect();
-                                    (serde_json::to_string_pretty(&items).unwrap_or_default(), false)
-                                }
-                                Err(e) => (format!("Query failed: {}", e), true),
+        "akatsuki_services" => match open_synced_db(vault) {
+            Ok(con) => {
+                let sql = "SELECT name, container_prefix, ports, replicas, role, host, network FROM services";
+                match con.prepare(sql) {
+                    Ok(mut stmt) => {
+                        let rows = stmt.query_map([], |r| {
+                            Ok(json!({
+                                "name": r.get::<_, String>(0)?,
+                                "container_prefix": r.get::<_, String>(1)?,
+                                "ports": r.get::<_, String>(2)?,
+                                "replicas": r.get::<_, String>(3)?,
+                                "role": r.get::<_, String>(4)?,
+                                "host": r.get::<_, String>(5)?,
+                                "network": r.get::<_, String>(6)?,
+                            }))
+                        });
+                        match rows {
+                            Ok(iter) => {
+                                let items: Vec<Value> = iter.filter_map(Result::ok).collect();
+                                (
+                                    serde_json::to_string_pretty(&items).unwrap_or_default(),
+                                    false,
+                                )
                             }
+                            Err(e) => (format!("Query failed: {}", e), true),
                         }
-                        Err(e) => (format!("Prepare failed: {}", e), true),
                     }
+                    Err(e) => (format!("Prepare failed: {}", e), true),
                 }
-                Err(e) => (format!("Database open failed: {}", e), true),
             }
-        }
-        "akatsuki_projects" => {
-            match crate::index::open_cache_db(vault) {
-                Ok(con) => {
-                    let sql = "SELECT stem, title, status, repo, host, network, summary FROM entities WHERE domain = '20-Projects'";
-                    match con.prepare(sql) {
-                        Ok(mut stmt) => {
-                            let rows = stmt.query_map([], |r| {
-                                Ok(json!({
-                                    "stem": r.get::<_, String>(0)?,
-                                    "title": r.get::<_, String>(1)?,
-                                    "status": r.get::<_, Option<String>>(2)?,
-                                    "repo": r.get::<_, Option<String>>(3)?,
-                                    "host": r.get::<_, Option<String>>(4)?,
-                                    "network": r.get::<_, Option<String>>(5)?,
-                                    "summary": r.get::<_, Option<String>>(6)?,
-                                }))
-                            });
-                            match rows {
-                                Ok(iter) => {
-                                    let items: Vec<Value> = iter.filter_map(Result::ok).collect();
-                                    (serde_json::to_string_pretty(&items).unwrap_or_default(), false)
-                                }
-                                Err(e) => (format!("Query failed: {}", e), true),
+            Err(e) => (format!("Database open failed: {}", e), true),
+        },
+        "akatsuki_projects" => match open_synced_db(vault) {
+            Ok(con) => {
+                let sql = "SELECT stem, title, status, repo, host, network, summary FROM entities WHERE domain = '20-Projects'";
+                match con.prepare(sql) {
+                    Ok(mut stmt) => {
+                        let rows = stmt.query_map([], |r| {
+                            Ok(json!({
+                                "stem": r.get::<_, String>(0)?,
+                                "title": r.get::<_, String>(1)?,
+                                "status": r.get::<_, Option<String>>(2)?,
+                                "repo": r.get::<_, Option<String>>(3)?,
+                                "host": r.get::<_, Option<String>>(4)?,
+                                "network": r.get::<_, Option<String>>(5)?,
+                                "summary": r.get::<_, Option<String>>(6)?,
+                            }))
+                        });
+                        match rows {
+                            Ok(iter) => {
+                                let items: Vec<Value> = iter.filter_map(Result::ok).collect();
+                                (
+                                    serde_json::to_string_pretty(&items).unwrap_or_default(),
+                                    false,
+                                )
                             }
+                            Err(e) => (format!("Query failed: {}", e), true),
                         }
-                        Err(e) => (format!("Prepare failed: {}", e), true),
                     }
+                    Err(e) => (format!("Prepare failed: {}", e), true),
                 }
-                Err(e) => (format!("Database open failed: {}", e), true),
             }
-        }
+            Err(e) => (format!("Database open failed: {}", e), true),
+        },
         "akatsuki_record_log" => {
             let project = args.get("project").and_then(|v| v.as_str()).unwrap_or("");
             let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
@@ -272,41 +343,66 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
         "akatsuki_write_note" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
-            let raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
+            let overwrite = arg_bool(args, "overwrite").unwrap_or(false);
+            let raw = arg_bool(args, "raw").unwrap_or(false);
 
             if path.is_empty() || content.is_empty() {
-                return ("Error: Missing required parameter 'path' or 'content'.".to_string(), true);
+                return (
+                    "Error: Missing required parameter 'path' or 'content'.".to_string(),
+                    true,
+                );
             }
 
             match write_note(vault, path, content, overwrite, raw) {
-                Ok(p) => (format!("Note successfully written to: {}", p.display()), false),
+                Ok(p) => (
+                    format!("Note successfully written to: {}", p.display()),
+                    false,
+                ),
                 Err(e) => (format!("Write note failed: {}", e), true),
             }
         }
         "akatsuki_verify" => match verify_links(vault) {
-            Ok(rep) => (serde_json::to_string_pretty(&rep).unwrap_or_default(), !rep.passed),
+            Ok(rep) => (
+                serde_json::to_string_pretty(&rep).unwrap_or_default(),
+                !rep.passed,
+            ),
             Err(e) => (format!("Verification failed: {}", e), true),
         },
         "akatsuki_lint" => match lint_vault(vault) {
-            Ok(rep) => (serde_json::to_string_pretty(&rep).unwrap_or_default(), !rep.passed),
+            Ok(rep) => (
+                serde_json::to_string_pretty(&rep).unwrap_or_default(),
+                !rep.passed,
+            ),
             Err(e) => (format!("Lint failed: {}", e), true),
         },
         "akatsuki_test" => {
-            let note = args.get("note").or_else(|| args.get("target")).and_then(|v| v.as_str());
-            let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+            let note = args
+                .get("note")
+                .or_else(|| args.get("target"))
+                .and_then(|v| v.as_str());
+            let dry_run = arg_bool(args, "dry_run").unwrap_or(false);
             match run_verification_tests(vault, note, dry_run) {
-                Ok(rep) => (serde_json::to_string_pretty(&rep).unwrap_or_default(), rep.failed > 0),
+                Ok(rep) => (
+                    serde_json::to_string_pretty(&rep).unwrap_or_default(),
+                    rep.failed > 0,
+                ),
                 Err(e) => (format!("Tests failed: {}", e), true),
             }
         }
         "akatsuki_get" => {
-            let keypath = args.get("key").or_else(|| args.get("keypath")).and_then(|v| v.as_str()).unwrap_or("");
+            let keypath = args
+                .get("key")
+                .or_else(|| args.get("keypath"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if keypath.is_empty() {
                 return ("Error: Missing required parameter 'key'.".to_string(), true);
             }
             match get_keypath(vault, keypath) {
-                Ok(val) => (serde_json::to_string_pretty(&val).unwrap_or_default(), false),
+                Ok(val) => (
+                    serde_json::to_string_pretty(&val).unwrap_or_default(),
+                    false,
+                ),
                 Err(e) => (format!("Get failed: {}", e), true),
             }
         }
@@ -316,7 +412,10 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
                 return ("Error: Missing required parameter 'sql'.".to_string(), true);
             }
             match execute_sql_query(vault, sql) {
-                Ok(results) => (serde_json::to_string_pretty(&results).unwrap_or_default(), false),
+                Ok(results) => (
+                    serde_json::to_string_pretty(&results).unwrap_or_default(),
+                    false,
+                ),
                 Err(e) => (format!("Query failed: {}", e), true),
             }
         }
@@ -326,7 +425,10 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
             if note.is_empty() || key.is_empty() {
-                return ("Error: Missing required parameter 'note' or 'key'.".to_string(), true);
+                return (
+                    "Error: Missing required parameter 'note' or 'key'.".to_string(),
+                    true,
+                );
             }
 
             match set_note_property(vault, note, key, value) {
@@ -340,11 +442,17 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
             if note.is_empty() || heading.is_empty() {
-                return ("Error: Missing required parameter 'note' or 'heading'.".to_string(), true);
+                return (
+                    "Error: Missing required parameter 'note' or 'heading'.".to_string(),
+                    true,
+                );
             }
 
             match replace_section_in_note(vault, note, heading, content) {
-                Ok(()) => (format!("Section '{}' replaced in note '{}'", heading, note), false),
+                Ok(()) => (
+                    format!("Section '{}' replaced in note '{}'", heading, note),
+                    false,
+                ),
                 Err(e) => (format!("Replace section failed: {}", e), true),
             }
         }
@@ -354,11 +462,17 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
             if note.is_empty() || heading.is_empty() {
-                return ("Error: Missing required parameter 'note' or 'heading'.".to_string(), true);
+                return (
+                    "Error: Missing required parameter 'note' or 'heading'.".to_string(),
+                    true,
+                );
             }
 
             match append_section_in_note(vault, note, heading, content) {
-                Ok(()) => (format!("Content appended under '{}' in note '{}'", heading, note), false),
+                Ok(()) => (
+                    format!("Content appended under '{}' in note '{}'", heading, note),
+                    false,
+                ),
                 Err(e) => (format!("Append section failed: {}", e), true),
             }
         }
@@ -370,18 +484,39 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             }
         }
         "akatsuki_reconcile" => {
-            match open_cache_db(vault) {
-                Ok(mut con) => match sync_vault_index(vault, &mut con) {
-                    Ok(rep) => (format!("Reconciliation completed in {:.2}ms ({} total, {} added, {} updated, {} deleted)", rep.duration_ms, rep.total, rep.added, rep.updated, rep.deleted), false),
-                    Err(e) => (format!("Reconcile sync failed: {}", e), true),
-                },
-                Err(e) => (format!("Database open failed: {}", e), true),
+            let dry_run = arg_bool(args, "dry_run").unwrap_or(false);
+            match reconcile_vault(vault, dry_run) {
+                Ok(report) => {
+                    let mut text = format!(
+                        "{}Reconciliation completed in {:.2}ms ({} total, {} added, {} updated, {} deleted)",
+                        if dry_run { "[DRY-RUN] " } else { "" },
+                        report.sync.duration_ms,
+                        report.sync.total,
+                        report.sync.added,
+                        report.sync.updated,
+                        report.sync.deleted
+                    );
+                    for action in &report.actions {
+                        text.push_str(&format!("\n- {}", action));
+                    }
+                    for err in &report.sync.parse_errors {
+                        text.push_str(&format!("\n- unindexable frontmatter: {}", err));
+                    }
+                    if let Some(note) = &report.sync.vectors {
+                        text.push_str(&format!("\n- vectors: {}", note));
+                    }
+                    (text, false)
+                }
+                Err(e) => (format!("Reconcile failed: {}", e), true),
             }
         }
         "akatsuki_list_notes" => {
             let domain = args.get("domain").and_then(|v| v.as_str());
             match list_notes(vault, domain) {
-                Ok(notes) => (serde_json::to_string_pretty(&notes).unwrap_or_default(), false),
+                Ok(notes) => (
+                    serde_json::to_string_pretty(&notes).unwrap_or_default(),
+                    false,
+                ),
                 Err(e) => (format!("List notes failed: {}", e), true),
             }
         }
@@ -616,3 +751,35 @@ fn get_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// MCP hosts routinely send booleans as strings (`"true"`); treating those as
+/// absent silently flipped `dry_run` to false and executed live assertions.
+fn arg_bool(args: &Value, key: &str) -> Option<bool> {
+    match args.get(key) {
+        Some(Value::Bool(v)) => Some(*v),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Accepts integers in either their numeric or string form.
+fn arg_usize(args: &Value, key: &str) -> Option<usize> {
+    match args.get(key) {
+        Some(Value::Number(n)) => n.as_u64().map(|v| v as usize),
+        Some(Value::String(s)) => s.trim().parse::<usize>().ok(),
+        _ => None,
+    }
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}

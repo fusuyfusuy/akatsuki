@@ -1,16 +1,21 @@
 //! Command-line interface definitions and dispatcher using clap.
 
-use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 use crate::constants::{CLI_DEFAULT_LIMIT, VERSION};
 use crate::graph::{calculate_blast_radius, extract_contract, traverse_graph};
-use crate::index::{open_cache_db, sync_vault_index};
-use crate::mutations::{append_section_in_note, append_work_log, read_daily_note, replace_section_in_note, set_note_property, write_note};
-use crate::search::{execute_sql_query, format_hits_compact, get_keypath, list_notes, search_vault};
+use crate::index::open_synced_db;
+use crate::mutations::{
+    append_section_in_note, append_work_log, read_daily_note, replace_section_in_note,
+    set_note_property, write_note,
+};
+use crate::search::{
+    execute_sql_query, format_hits_compact, get_keypath, list_notes, search_vault,
+};
 use crate::storage::{extract_section, resolve_note_file, resolve_vault_path};
-use crate::verify::{lint_vault, run_verification_tests, verify_links};
+use crate::verify::{lint_vault, reconcile_vault, run_verification_tests, verify_links};
 
 #[derive(Parser)]
 #[command(name = "akatsuki", version = VERSION, about = "Universal Living System Memory & Architectural Contracts Gateway")]
@@ -31,7 +36,7 @@ pub enum Commands {
         domain: Option<String>,
         #[arg(short = 'n', long, default_value_t = CLI_DEFAULT_LIMIT)]
         limit: usize,
-        #[arg(short, long, default_value = "hybrid")]
+        #[arg(short, long, default_value = "hybrid", value_parser = ["hybrid", "bm25", "vector"])]
         mode: String,
         #[arg(short = 'g', long)]
         with_graph: bool,
@@ -41,11 +46,20 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(alias = "cat", about = "Read an akatsuki note or specific markdown section")]
+    #[command(
+        alias = "cat",
+        about = "Read an akatsuki note or specific markdown section"
+    )]
     Read {
         note: String,
         #[arg(short, long)]
         section: Option<String>,
+        #[arg(
+            short,
+            long,
+            help = "Maximum approximate tokens (~4 chars each) to return"
+        )]
+        budget: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -87,7 +101,9 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(about = "O(1) exact property getter across services, entities, and note frontmatter")]
+    #[command(
+        about = "O(1) exact property getter across services, entities, and note frontmatter"
+    )]
     Get {
         keypath: String,
         #[arg(long)]
@@ -116,7 +132,7 @@ pub enum Commands {
     #[command(about = "Write or update a note under process advisory lock")]
     Write {
         path: String,
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         content: String,
         #[arg(long)]
         overwrite: bool,
@@ -131,7 +147,7 @@ pub enum Commands {
         note: String,
         #[arg(long)]
         heading: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         content: String,
         #[arg(long)]
         json: bool,
@@ -153,7 +169,7 @@ pub enum Commands {
         note: String,
         #[arg(short = 'H', long)]
         heading: String,
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         content: String,
         #[arg(long)]
         json: bool,
@@ -167,7 +183,10 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(about = "List notes in vault with optional domain filtering")]
+    #[command(
+        alias = "ls",
+        about = "List notes in vault with optional domain filtering"
+    )]
     List {
         #[arg(short, long)]
         domain: Option<String>,
@@ -196,7 +215,9 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(about = "Reconcile unindexed notes and sync FTS5 index")]
+    #[command(
+        about = "Rebuild the projection and repair frontmatter quoting and domain MOC links"
+    )]
     Reconcile {
         #[arg(long)]
         dry_run: bool,
@@ -204,7 +225,9 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(about = "Provision Hugging Face Candle E5-Small model weights into ~/.cache/akatsuki")]
+    #[command(
+        about = "Provision Hugging Face Candle E5-Small model weights into ~/.cache/akatsuki"
+    )]
     SetupModels {},
 
     #[command(about = "Start Model Context Protocol (MCP) JSON-RPC 2.0 stdio server")]
@@ -215,16 +238,38 @@ pub fn run_cli(cli: Cli) -> Result<()> {
     let vault = resolve_vault_path(cli.vault.as_deref());
 
     match cli.command {
-        Commands::Search { query, domain, limit, mode, with_graph, compact, json } => {
+        Commands::Search {
+            query,
+            domain,
+            limit,
+            mode,
+            with_graph,
+            compact,
+            json,
+        } => {
             let hits = search_vault(&vault, &query, domain.as_deref(), limit, with_graph, &mode)?;
+            let degradation = if mode == "bm25" {
+                None
+            } else {
+                crate::vectors::hybrid_note(&vault)
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&hits)?);
             } else if compact {
                 println!("{}", format_hits_compact(&hits));
+                if let Some(note) = degradation {
+                    println!("⚠ {}", note);
+                }
             } else {
                 println!("Found {} matching note(s) [Mode: {}]:", hits.len(), mode);
+                if let Some(note) = degradation {
+                    println!("  ⚠ {}", note);
+                }
                 for h in hits {
-                    println!("\n- **{}** (`{}`) [Score: {}]: {}", h.title, h.rel_path, h.score, h.summary);
+                    println!(
+                        "\n- **{}** (`{}`) [Score: {}]: {}",
+                        h.title, h.rel_path, h.score, h.summary
+                    );
                     if let Some(ref b) = h.breadcrumb {
                         println!("    Section: {}", b);
                     }
@@ -234,18 +279,28 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Commands::Read { note, section, json } => {
+        Commands::Read {
+            note,
+            section,
+            budget,
+            json,
+        } => {
             let note_path = resolve_note_file(&vault, &note)
                 .ok_or_else(|| anyhow::anyhow!("Note '{}' not found in vault", note))?;
             let raw_content = std::fs::read_to_string(&note_path)?;
             let content = if let Some(sec) = section {
-                extract_section(&raw_content, &sec)
-                    .ok_or_else(|| anyhow::anyhow!("Section '{}' not found in '{}'", sec, note_path.display()))?
+                extract_section(&raw_content, &sec).ok_or_else(|| {
+                    anyhow::anyhow!("Section '{}' not found in '{}'", sec, note_path.display())
+                })?
             } else {
                 raw_content
             };
+            let content = crate::storage::apply_token_budget(&content, budget);
             if json {
-                println!("{}", serde_json::json!({ "path": note_path.display().to_string(), "content": content }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "path": note_path.display().to_string(), "content": content })
+                );
             } else {
                 println!("{}", content);
             }
@@ -266,25 +321,39 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 println!("# 💥 Architectural Blast Radius: `{}`\n", blast.target);
                 println!("## ⬆️ Upstream Dependents:");
                 for u in &blast.upstream {
-                    println!("- **`{}`** ({})", u.source_or_target, u.relation_type);
+                    println!("- **`{}`** ({})", u.source_rel, u.relation_type);
                 }
                 println!("\n## ⬇️ Downstream Dependencies:");
                 for d in &blast.downstream {
-                    println!("- **`{}`** ({})", d.source_or_target, d.relation_type);
+                    println!("- **`{}`** ({})", d.target_stem, d.relation_type);
                 }
                 println!("\n## 🎯 Boundary Sinks & Ports:");
                 for s in &blast.boundary_sinks {
-                    println!("- **{}** (`{}`): {} [host: {}, net: {}]", s.name, s.container, s.ports, s.host, s.network);
+                    println!(
+                        "- **{}** (`{}`): {} [host: {}, net: {}]",
+                        s.name, s.container_prefix, s.ports, s.host, s.network
+                    );
                 }
             }
         }
-        Commands::Map { target, depth, direction, json: _ } => {
-            let graph = traverse_graph(&vault, &target, depth, &direction)?;
-            println!("{}", serde_json::to_string_pretty(&graph)?);
+        Commands::Map {
+            target,
+            depth,
+            direction,
+            json,
+        } => {
+            let map = traverse_graph(&vault, &target, depth, &direction)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&map.payload)?);
+            } else {
+                println!("{}", map.text);
+            }
         }
         Commands::Services { json } => {
-            let con = open_cache_db(&vault)?;
-            let mut stmt = con.prepare("SELECT name, container_prefix, ports, replicas, role, host, network FROM services")?;
+            let con = open_synced_db(&vault)?;
+            let mut stmt = con.prepare(
+                "SELECT name, container_prefix, ports, replicas, role, host, network FROM services",
+            )?;
             let rows = stmt.query_map([], |r| {
                 Ok(serde_json::json!({
                     "name": r.get::<_, String>(0)?,
@@ -301,12 +370,17 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&items)?);
             } else {
                 for s in items {
-                    println!("- **{}** (ports: {}): {}", s["name"].as_str().unwrap_or(""), s["ports"].as_str().unwrap_or(""), s["role"].as_str().unwrap_or(""));
+                    println!(
+                        "- **{}** (ports: {}): {}",
+                        s["name"].as_str().unwrap_or(""),
+                        s["ports"].as_str().unwrap_or(""),
+                        s["role"].as_str().unwrap_or("")
+                    );
                 }
             }
         }
-        Commands::Projects { json: _ } => {
-            let con = open_cache_db(&vault)?;
+        Commands::Projects { json } => {
+            let con = open_synced_db(&vault)?;
             let mut stmt = con.prepare("SELECT stem, title, status, repo, host, network, summary FROM entities WHERE domain = '20-Projects'")?;
             let rows = stmt.query_map([], |r| {
                 Ok(serde_json::json!({
@@ -319,16 +393,31 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                     "summary": r.get::<_, Option<String>>(6)?,
                 }))
             })?;
-            let items: Vec<serde_json::Value> = rows.filter_map(Result::ok).collect();
-            println!("{}", serde_json::to_string_pretty(&items)?);
+            let items: Vec<serde_json::Value> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else {
+                for p in items {
+                    println!(
+                        "- **{}** (`{}`): [{}] {}",
+                        p["title"].as_str().unwrap_or(""),
+                        p["stem"].as_str().unwrap_or(""),
+                        p["status"].as_str().unwrap_or("unknown"),
+                        p["summary"].as_str().unwrap_or("")
+                    );
+                }
+            }
         }
         Commands::Get { keypath, json } => {
             let val = get_keypath(&vault, &keypath)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "keypath": keypath,
-                    "value": val
-                }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "keypath": keypath,
+                        "value": val
+                    }))?
+                );
             } else {
                 match val {
                     serde_json::Value::String(s) => println!("{}", s),
@@ -346,7 +435,12 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Commands::Log { project, summary, device, json } => {
+        Commands::Log {
+            project,
+            summary,
+            device,
+            json,
+        } => {
             let p_str = project.unwrap_or_default();
             let entry = append_work_log(&vault, &p_str, &summary, device.as_deref())?;
             if json {
@@ -355,7 +449,13 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 println!("Recorded: {}", entry);
             }
         }
-        Commands::Write { path, content, overwrite, raw, json } => {
+        Commands::Write {
+            path,
+            content,
+            overwrite,
+            raw,
+            json,
+        } => {
             let p = write_note(&vault, &path, &content, overwrite, raw)?;
             if json {
                 println!("{}", serde_json::json!({ "path": p.display().to_string() }));
@@ -363,7 +463,12 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 println!("Note successfully written: {}", p.display());
             }
         }
-        Commands::Replace { note, heading, content, json } => {
+        Commands::Replace {
+            note,
+            heading,
+            content,
+            json,
+        } => {
             replace_section_in_note(&vault, &note, &heading, &content)?;
             if json {
                 println!("{}", serde_json::json!({ "status": "ok" }));
@@ -371,7 +476,12 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 println!("Section '{}' replaced successfully in '{}'", heading, note);
             }
         }
-        Commands::Set { note, key, value, json } => {
+        Commands::Set {
+            note,
+            key,
+            value,
+            json,
+        } => {
             set_note_property(&vault, &note, &key, &value)?;
             if json {
                 println!("{}", serde_json::json!({ "status": "ok" }));
@@ -379,7 +489,12 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 println!("Property '{}' updated in '{}'", key, note);
             }
         }
-        Commands::Append { note, heading, content, json } => {
+        Commands::Append {
+            note,
+            heading,
+            content,
+            json,
+        } => {
             append_section_in_note(&vault, &note, &heading, &content)?;
             if json {
                 println!("{}", serde_json::json!({ "status": "ok" }));
@@ -390,7 +505,10 @@ pub fn run_cli(cli: Cli) -> Result<()> {
         Commands::Daily { date, json } => {
             let (content, exists) = read_daily_note(&vault, date.as_deref())?;
             if json {
-                println!("{}", serde_json::json!({ "content": content, "exists": exists }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "content": content, "exists": exists })
+                );
             } else {
                 println!("{}", content);
             }
@@ -431,7 +549,10 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             } else {
                 println!("FAILED: Verification issues found:");
                 for (src, tgt) in rep.broken_wikilinks {
-                    println!("  - Broken link in '{}' -> [[{}]]", src, tgt);
+                    println!("  - Broken wikilink in '{}' -> [[{}]]", src, tgt);
+                }
+                for (src, tgt) in rep.broken_markdown_links {
+                    println!("  - Broken markdown link in '{}' -> ({})", src, tgt);
                 }
                 for orph in rep.orphan_notes {
                     println!("  - Orphan note: {}", orph);
@@ -439,17 +560,36 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Test { note, dry_run, json } => {
+        Commands::Test {
+            note,
+            dry_run,
+            json,
+        } => {
             let rep = run_verification_tests(&vault, note.as_deref(), dry_run)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&rep)?);
             } else {
-                println!("Ran {} verification assertion(s): {} PASSED, {} FAILED", rep.total, rep.passed, rep.failed);
+                if dry_run {
+                    println!(
+                        "Dry-run: {} assertion(s) discovered, none executed",
+                        rep.total
+                    );
+                } else {
+                    println!(
+                        "Ran {} verification assertion(s): {} PASSED, {} FAILED",
+                        rep.total, rep.passed, rep.failed
+                    );
+                }
                 for item in rep.results {
-                    if item.passed {
+                    if !item.executed {
+                        println!("○ [{}] not executed: `{}`", item.source, item.command);
+                    } else if item.passed {
                         println!("✅ [{}] exit 0: `{}`", item.source, item.command);
                     } else {
-                        println!("❌ [{}] exit {}: `{}`", item.source, item.exit_code, item.command);
+                        println!(
+                            "❌ [{}] exit {}: `{}`",
+                            item.source, item.exit_code, item.command
+                        );
                         if !item.stderr.is_empty() {
                             println!("    stderr: {}", item.stderr);
                         }
@@ -460,13 +600,29 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Reconcile { dry_run: _, json } => {
-            let mut con = open_cache_db(&vault)?;
-            let rep = sync_vault_index(&vault, &mut con)?;
+        Commands::Reconcile { dry_run, json } => {
+            let report = reconcile_vault(&vault, dry_run)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&rep)?);
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("Vault reconciliation completed in {:.2}ms ({} notes total, {} updated, {} deleted).", rep.duration_ms, rep.total, rep.updated, rep.deleted);
+                let prefix = if dry_run { "[DRY-RUN] " } else { "" };
+                println!(
+                    "{prefix}Vault reconciliation completed in {:.2}ms ({} notes total, {} added, {} updated, {} deleted).",
+                    report.sync.duration_ms,
+                    report.sync.total,
+                    report.sync.added,
+                    report.sync.updated,
+                    report.sync.deleted
+                );
+                for action in &report.actions {
+                    println!("  - {}", action);
+                }
+                for err in &report.sync.parse_errors {
+                    println!("  - unindexable frontmatter: {}", err);
+                }
+                if let Some(note) = &report.sync.vectors {
+                    println!("  - vectors: {}", note);
+                }
             }
         }
         Commands::SetupModels {} => {

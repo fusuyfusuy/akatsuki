@@ -1,15 +1,33 @@
 //! Indexing engine: Parallel Blake3 Merkle scanner, SQLite WAL setup, and FTS5 synchronization.
 
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::storage::parse_frontmatter;
+
+/// Renders a YAML scalar or collection as the text stored in a relation/invariant row.
+fn scalar_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.trim().to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn scalar_join(items: &[Value]) -> String {
+    items
+        .iter()
+        .map(scalar_text)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct SyncReport {
@@ -18,9 +36,10 @@ pub struct SyncReport {
     pub deleted: usize,
     pub unchanged: usize,
     pub total: usize,
+    pub parse_errors: Vec<String>,
+    pub vectors: Option<String>,
     pub duration_ms: f64,
 }
-
 pub fn open_cache_db(vault: &Path) -> Result<Connection> {
     let ak_dir = vault.join(".akatsuki");
     fs::create_dir_all(&ak_dir)?;
@@ -41,7 +60,51 @@ pub fn open_cache_db(vault: &Path) -> Result<Connection> {
     Ok(con)
 }
 
+/// Opens the projection and brings it up to date with the vault in one call.
+///
+/// Read paths MUST use this: every queryable table is derived from markdown, so a
+/// projection that was never reconciled answers "nothing found" for notes that exist.
+pub fn open_synced_db(vault: &Path) -> Result<Connection> {
+    let mut con = open_cache_db(vault)?;
+    sync_vault_index(vault, &mut con)?;
+    Ok(con)
+}
+
+/// Bumped whenever the projection's shape changes; a mismatch rebuilds the cache.
+const SCHEMA_VERSION: &str = "0.2.2";
+
 fn init_tables(con: &Connection) -> Result<()> {
+    con.execute_batch("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, val TEXT);")?;
+
+    let stored: Option<String> = con
+        .query_row(
+            "SELECT val FROM schema_meta WHERE key = 'version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    if stored.as_deref() != Some(SCHEMA_VERSION) {
+        // The cache is a pure projection of the markdown vault, so a version bump
+        // rebuilds it wholesale instead of migrating columns in place.
+        con.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS notes_fts;
+            DROP TABLE IF EXISTS file_meta;
+            DROP TABLE IF EXISTS entities;
+            DROP TABLE IF EXISTS services;
+            DROP TABLE IF EXISTS relations;
+            DROP TABLE IF EXISTS invariants;
+            DROP TABLE IF EXISTS verifications;
+            DROP TABLE IF EXISTS note_vectors;
+            "#,
+        )?;
+        con.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, val) VALUES ('version', ?1)",
+            params![SCHEMA_VERSION],
+        )?;
+    }
+
     con.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS file_meta (
@@ -67,12 +130,16 @@ fn init_tables(con: &Connection) -> Result<()> {
             stem TEXT NOT NULL,
             domain TEXT NOT NULL,
             title TEXT NOT NULL,
+            type TEXT NOT NULL,
             summary TEXT,
             status TEXT,
             repo TEXT,
             host TEXT,
             network TEXT,
-            tags TEXT
+            tags TEXT,
+            updated TEXT,
+            updated_by TEXT,
+            metadata_json TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS services (
@@ -109,7 +176,10 @@ fn init_tables(con: &Connection) -> Result<()> {
             domain TEXT NOT NULL,
             display_title TEXT NOT NULL,
             display_summary TEXT NOT NULL,
-            breadcrumb TEXT NOT NULL,
+            tags TEXT,
+            breadcrumb TEXT,
+            chunk_index INTEGER NOT NULL,
+            total_chunks INTEGER NOT NULL,
             preview TEXT NOT NULL,
             vector_blob BLOB NOT NULL,
             dim INTEGER NOT NULL
@@ -117,8 +187,14 @@ fn init_tables(con: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_entities_stem ON entities(stem);
         CREATE INDEX IF NOT EXISTS idx_entities_title ON entities(title);
+        CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
+        CREATE INDEX IF NOT EXISTS idx_invariants_source ON invariants(source_rel);
+        CREATE INDEX IF NOT EXISTS idx_verifications_source ON verifications(source_rel);
         CREATE INDEX IF NOT EXISTS idx_services_name ON services(name);
         CREATE INDEX IF NOT EXISTS idx_services_rel ON services(rel_path);
+        CREATE INDEX IF NOT EXISTS idx_note_vectors_rel ON note_vectors(rel_path);
+        CREATE INDEX IF NOT EXISTS idx_note_vectors_domain ON note_vectors(domain);
+        CREATE INDEX IF NOT EXISTS idx_note_vectors_stem ON note_vectors(stem);
         CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_rel);
         CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_stem);
         "#,
@@ -129,38 +205,53 @@ fn init_tables(con: &Connection) -> Result<()> {
 
 struct ScannedFile {
     rel_path: String,
-    #[allow(dead_code)]
-    abs_path: PathBuf,
     hash: String,
     size: usize,
-    content: Option<String>,
+    content: String,
 }
 
 pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport> {
+    sync_vault_index_with(vault, con, true)
+}
+
+/// Reports what a reconcile would change without touching the projection.
+pub fn sync_vault_index_dry_run(vault: &Path, con: &mut Connection) -> Result<SyncReport> {
+    sync_vault_index_with(vault, con, false)
+}
+
+fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Result<SyncReport> {
     let t0 = std::time::Instant::now();
 
     // 1. Gather all existing indexed hashes
     let mut indexed_hashes: HashMap<String, String> = HashMap::new();
     {
         let mut stmt = con.prepare("SELECT rel_path, blake3_hash FROM file_meta")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         for r in rows.flatten() {
             indexed_hashes.insert(r.0, r.1);
         }
     }
 
     // 2. Discover markdown files
-    let ignored_dirs = [".git", ".akatsuki", ".venv", "node_modules", ".obsidian", "__pycache__", "_templates"];
-    let walker = walkdir::WalkDir::new(vault)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !ignored_dirs.iter().any(|ig| *ig == name)
-        });
+    let ignored_dirs = [
+        ".git",
+        ".akatsuki",
+        ".venv",
+        "node_modules",
+        ".obsidian",
+        "__pycache__",
+        "_templates",
+    ];
+    let walker = walkdir::WalkDir::new(vault).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        !ignored_dirs.iter().any(|ig| *ig == name)
+    });
 
     let paths: Vec<PathBuf> = walker
         .flatten()
-        .filter(|e| e.file_type().is_file() && e.path().extension().map_or(false, |ext| ext == "md"))
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "md"))
         .map(|e| e.into_path())
         .collect();
 
@@ -175,10 +266,9 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
 
             Some(ScannedFile {
                 rel_path: rel,
-                abs_path: abs.clone(),
                 hash,
                 size,
-                content: Some(content),
+                content,
             })
         })
         .collect();
@@ -212,8 +302,31 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
 
     let deleted_count = to_delete.len();
     let updated_count = to_update.len();
+    let added_count = to_update
+        .iter()
+        .filter(|f| !indexed_hashes.contains_key(&f.rel_path))
+        .count();
     let total_count = unchanged_count + updated_count;
+    let mut parse_errors: Vec<String> = Vec::new();
 
+    if !apply {
+        let mut parse_errors = Vec::new();
+        for file in &to_update {
+            if let Err(e) = parse_frontmatter(&file.content) {
+                parse_errors.push(format!("'{}': {}", file.rel_path, e));
+            }
+        }
+        return Ok(SyncReport {
+            added: added_count,
+            updated: updated_count,
+            deleted: deleted_count,
+            unchanged: unchanged_count,
+            total: total_count,
+            parse_errors,
+            vectors: None,
+            duration_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
     if to_delete.is_empty() && to_update.is_empty() {
         return Ok(SyncReport {
             added: 0,
@@ -221,6 +334,8 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
             deleted: 0,
             unchanged: unchanged_count,
             total: total_count,
+            parse_errors: Vec::new(),
+            vectors: None,
             duration_ms: t0.elapsed().as_secs_f64() * 1000.0,
         });
     }
@@ -229,14 +344,32 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
     let tx = con.transaction()?;
 
     for del_rel in to_delete {
-        tx.execute("DELETE FROM file_meta WHERE rel_path = ?1", params![del_rel])?;
-        tx.execute("DELETE FROM notes_fts WHERE rel_path = ?1", params![del_rel])?;
+        tx.execute(
+            "DELETE FROM file_meta WHERE rel_path = ?1",
+            params![del_rel],
+        )?;
+        tx.execute(
+            "DELETE FROM notes_fts WHERE rel_path = ?1",
+            params![del_rel],
+        )?;
         tx.execute("DELETE FROM entities WHERE rel_path = ?1", params![del_rel])?;
         tx.execute("DELETE FROM services WHERE rel_path = ?1", params![del_rel])?;
-        tx.execute("DELETE FROM relations WHERE source_rel = ?1", params![del_rel])?;
-        tx.execute("DELETE FROM invariants WHERE source_rel = ?1", params![del_rel])?;
-        tx.execute("DELETE FROM verifications WHERE source_rel = ?1", params![del_rel])?;
-        tx.execute("DELETE FROM note_vectors WHERE rel_path = ?1", params![del_rel])?;
+        tx.execute(
+            "DELETE FROM relations WHERE source_rel = ?1",
+            params![del_rel],
+        )?;
+        tx.execute(
+            "DELETE FROM invariants WHERE source_rel = ?1",
+            params![del_rel],
+        )?;
+        tx.execute(
+            "DELETE FROM verifications WHERE source_rel = ?1",
+            params![del_rel],
+        )?;
+        tx.execute(
+            "DELETE FROM note_vectors WHERE rel_path = ?1",
+            params![del_rel],
+        )?;
     }
 
     let wikilink_re = Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]")?;
@@ -244,26 +377,80 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
 
     let now_iso = chrono::Utc::now().to_rfc3339();
 
+    // Notes whose text changed are the only ones that need re-embedding.
+    let mut vector_sources: Vec<(String, String)> = Vec::new();
+
     for file in to_update {
         let rel = &file.rel_path;
-        let content = file.content.unwrap_or_default();
-        let stem = Path::new(rel).file_stem().and_then(|s| s.to_str()).unwrap_or(rel);
+        let content = file.content;
+        let stem = Path::new(rel)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(rel);
         let domain = rel.split('/').next().unwrap_or("").to_string();
+        if crate::vectors::feature_enabled() {
+            vector_sources.push((rel.clone(), content.clone()));
+        }
 
-        let (fm, body) = parse_frontmatter(&content);
+        let parsed = parse_frontmatter(&content);
+        let (fm, body) = match parsed {
+            Ok(parts) => parts,
+            Err(e) => {
+                parse_errors.push(format!("'{}': {}", rel, e));
+                (serde_json::json!({}), content)
+            }
+        };
 
-        let title = fm.get("title").and_then(|v| v.as_str()).unwrap_or(stem).to_string();
-        let summary = fm.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let status = fm.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let repo = fm.get("repo").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let host = fm.get("host").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let network = fm.get("network").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let title = fm
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or(stem)
+            .to_string();
+        let summary = fm
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let status = fm
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let repo = fm
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let host = fm
+            .get("host")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let network = fm
+            .get("network")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let tags_str = match fm.get("tags") {
-            Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "),
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
             Some(Value::String(s)) => s.clone(),
             _ => String::new(),
         };
+        let note_type = fm
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("note")
+            .to_string();
+        let updated = fm
+            .get("updated")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let updated_by = fm
+            .get("updated_by")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let metadata_json = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
         // Clean prior records
         tx.execute("DELETE FROM notes_fts WHERE rel_path = ?1", params![rel])?;
@@ -271,7 +458,10 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
         tx.execute("DELETE FROM services WHERE rel_path = ?1", params![rel])?;
         tx.execute("DELETE FROM relations WHERE source_rel = ?1", params![rel])?;
         tx.execute("DELETE FROM invariants WHERE source_rel = ?1", params![rel])?;
-        tx.execute("DELETE FROM verifications WHERE source_rel = ?1", params![rel])?;
+        tx.execute(
+            "DELETE FROM verifications WHERE source_rel = ?1",
+            params![rel],
+        )?;
 
         // Insert notes_fts
         tx.execute(
@@ -281,20 +471,87 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
 
         // Insert entities
         tx.execute(
-            "INSERT OR REPLACE INTO entities (rel_path, stem, domain, title, summary, status, repo, host, network, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![rel, stem, domain, title, summary, status, repo, host, network, tags_str],
+            "INSERT OR REPLACE INTO entities (rel_path, stem, domain, title, type, summary, status, repo, host, network, tags, updated, updated_by, metadata_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                rel, stem, domain, title, note_type, summary, status, repo, host, network, tags_str,
+                updated, updated_by, metadata_json
+            ],
         )?;
 
-        // Extract wikilinks for relations
-        for cap in wikilink_re.captures_iter(&body) {
-            let target = cap[1].trim();
+        // Frontmatter-declared relations keep the YAML key verbatim as the type,
+        // so declared dependencies are visible to blast/map/contract.
+        if let Some(Value::Object(declared)) = fm.get("relations") {
+            for (relation_type, targets) in declared {
+                match targets {
+                    Value::Array(items) => {
+                        for item in items {
+                            let target = scalar_text(item);
+                            if !target.is_empty() {
+                                tx.execute(
+                                    "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, ?3)",
+                                    params![rel, target, relation_type],
+                                )?;
+                            }
+                        }
+                    }
+                    other => {
+                        let target = scalar_text(other);
+                        if !target.is_empty() {
+                            tx.execute(
+                                "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, ?3)",
+                                params![rel, target, relation_type],
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Body wikilinks resolve through note stems; escaped links (`\[[x]]`) are
+        // documentation, not references.
+        for caps in wikilink_re.captures_iter(&body) {
+            let whole = caps.get(0).expect("capture 0 always present");
+            if body.as_bytes()[..whole.start()].last() == Some(&b'\\') {
+                continue;
+            }
+
+            let target = caps[1].trim();
             let target_stem = target.split('#').next().unwrap_or(target).trim();
             let clean_stem = target_stem.strip_suffix(".md").unwrap_or(target_stem);
             if !clean_stem.is_empty() {
                 tx.execute(
-                    "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, 'wikilink')",
+                    "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, 'references')",
                     params![rel, clean_stem],
                 )?;
+            }
+        }
+        // Invariants: declared in frontmatter, or bulleted under an `Invariants`
+        // heading.
+        if let Some(Value::Array(rules)) = fm.get("invariants") {
+            for rule in rules {
+                let rule = scalar_text(rule);
+                if !rule.is_empty() {
+                    tx.execute(
+                        "INSERT INTO invariants (source_rel, invariant_text) VALUES (?1, ?2)",
+                        params![rel, rule],
+                    )?;
+                }
+            }
+        }
+        let invariants_section = crate::storage::extract_section(&body, "Invariants")
+            .or_else(|| crate::storage::extract_section(&body, "Non-Negotiable Invariants"));
+        if let Some(section) = invariants_section {
+            for line in section.lines() {
+                if let Some(rule) = line.trim().strip_prefix("- ") {
+                    let rule = rule.trim();
+                    if !rule.is_empty() {
+                        tx.execute(
+                            "INSERT INTO invariants (source_rel, invariant_text) VALUES (?1, ?2)",
+                            params![rel, rule],
+                        )?;
+                    }
+                }
             }
         }
 
@@ -309,11 +566,15 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
             }
         }
 
-        // Parse services from Services-Catalog.md Markdown table
+        // Services catalog table: host comes from this machine, not a literal.
+        let default_host = crate::storage::machine_id();
         if rel.ends_with("Services-Catalog.md") {
             for line in body.lines() {
                 let trimmed = line.trim();
-                if !trimmed.starts_with('|') || trimmed.contains(":---") || trimmed.contains("Service / Stack") {
+                if !trimmed.starts_with('|')
+                    || trimmed.contains(":---")
+                    || trimmed.contains("Service / Stack")
+                {
                     continue;
                 }
                 let raw_cols: Vec<&str> = trimmed.split('|').collect();
@@ -326,23 +587,59 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
 
                     if !svc_name.is_empty() {
                         tx.execute(
-                            "INSERT INTO services (name, container_prefix, ports, host, network, replicas, role, rel_path) VALUES (?1, ?2, ?3, 'TanriZarAtmaz', 'dokploy-network', ?4, ?5, ?6)",
-                            params![svc_name, container, ports, replicas, role, rel],
+                            "INSERT INTO services (name, container_prefix, ports, host, network, replicas, role, rel_path) VALUES (?1, ?2, ?3, ?4, 'default', ?5, ?6, ?7)",
+                            params![svc_name, container, ports, default_host, replicas, role, rel],
                         )?;
                     }
                 }
             }
         }
 
-        // Parse services if present in frontmatter
+        // Notes that declare `ports:` or are typed as a service are services too.
+        if fm.get("ports").is_some() || note_type == "service" {
+            let ports_val = match fm.get("ports") {
+                Some(Value::Array(items)) => scalar_join(items),
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => scalar_text(other),
+                None => String::new(),
+            };
+            let container = fm
+                .get("container")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}_*", stem));
+            let svc_host = host.clone().unwrap_or_else(|| default_host.clone());
+            let svc_net = network.clone().unwrap_or_else(|| "default".to_string());
+
+            tx.execute(
+                "INSERT INTO services (name, container_prefix, ports, host, network, replicas, role, rel_path) VALUES (?1, ?2, ?3, ?4, ?5, '1', ?6, ?7)",
+                params![stem, container, ports_val, svc_host, svc_net, summary, rel],
+            )?;
+        }
+
+        // Explicit `services:` frontmatter block.
         if let Some(svcs) = fm.get("services").and_then(|v| v.as_array()) {
             for s in svcs {
                 let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let container = s.get("container").or_else(|| s.get("container_prefix")).and_then(|v| v.as_str()).unwrap_or("");
-                let ports = s.get("ports").and_then(|v| v.as_str()).or_else(|| s.get("port").and_then(|v| v.as_str())).unwrap_or("");
-                let s_host = s.get("host").and_then(|v| v.as_str()).unwrap_or(host.as_deref().unwrap_or(""));
-                let s_net = s.get("network").and_then(|v| v.as_str()).unwrap_or(network.as_deref().unwrap_or(""));
-                let replicas = s.get("replicas").and_then(|v| v.as_str()).unwrap_or("");
+                let container = s
+                    .get("container")
+                    .or_else(|| s.get("container_prefix"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let ports = s
+                    .get("ports")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| s.get("port").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let s_host = s
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(host.as_deref().unwrap_or(&default_host));
+                let s_net = s
+                    .get("network")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(network.as_deref().unwrap_or("default"));
+                let replicas = s.get("replicas").and_then(|v| v.as_str()).unwrap_or("1");
                 let role = s.get("role").and_then(|v| v.as_str()).unwrap_or("");
 
                 if !name.is_empty() {
@@ -363,12 +660,16 @@ pub fn sync_vault_index(vault: &Path, con: &mut Connection) -> Result<SyncReport
 
     tx.commit()?;
 
+    let vectors = crate::vectors::sync_note_vectors(con, &vector_sources)?;
+
     Ok(SyncReport {
-        added: updated_count,
+        added: added_count,
         updated: updated_count,
         deleted: deleted_count,
         unchanged: unchanged_count,
         total: total_count,
+        parse_errors,
+        vectors: Some(vectors),
         duration_ms: t0.elapsed().as_secs_f64() * 1000.0,
     })
 }
