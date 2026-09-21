@@ -176,4 +176,3 @@ fn long_note_chunks_do_not_exceed_bert_position_embeddings() {
         .success()
         .stdout(predicate::str::contains("Vault reconciliation completed"));
 }
-
