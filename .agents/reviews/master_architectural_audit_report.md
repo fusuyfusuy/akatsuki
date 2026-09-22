@@ -1,120 +1,124 @@
-# Master Architectural Audit Report: Akatsuki Knowledge Secretariat
+# Master Architectural Audit Report: Akatsuki v0.2.0 (Native Rust Rewrite)
 
-**Audit Date**: 2026-09-18  
-**Repository**: `fusuyfusuy/akatsuki`  
-**Overall System Health**: **8.12 / 10.0** (`MODERATE`)  
-**Audit Protocol**: M2M Boundary Review Protocol v5.0  
+**Generated**: 2026-09-21  
+**Target Repository**: `fusuyfusuy/akatsuki` (v0.2.0 Native Rust Port)  
+**Total Rust Substrate**: ~4,500 LOC across 11 modules  
+**Review Engine**: Antigravity Boundary Review Protocol (4 Horizontal Scopes + 1 Cross-Boundary Seam Auditor)
 
 ---
 
 ## 1. Executive Scorecard
 
-| Scope ID | Subsystem / Seam Boundary | Score | Status | Critical / High | Invariant Breaches / Divergences |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **Scope 1** | **[Storage, Markdown & Parsing Engine](file:///home/devhax/projects/fusuyfusuy/akatsuki/.agents/reviews/scope_1_storage_markdown.md)** | 8.2 | Moderate | 2 | 2 breaches |
-| **Scope 2** | **[Index, Vectors & Graph Pipeline](file:///home/devhax/projects/fusuyfusuy/akatsuki/.agents/reviews/scope_2_index_vectors_graph.md)** | 7.8 | Moderate | 3 | 2 breaches |
-| **Scope 3** | **[Queries, Verification & Mutations](file:///home/devhax/projects/fusuyfusuy/akatsuki/.agents/reviews/scope_3_domain_queries_mutations.md)** | 7.6 | Moderate | 4 | 2 breaches |
-| **Scope 4** | **[Adapters: CLI, Core Facade & MCP](file:///home/devhax/projects/fusuyfusuy/akatsuki/.agents/reviews/scope_4_cli_core_mcp.md)** | 8.8 | Minor | 1 | 0 breaches |
-| **Scope 5** | **[Cross-Boundary Seams & Interfaces](file:///home/devhax/projects/fusuyfusuy/akatsuki/.agents/reviews/scope_seams.md)** | 8.2 | Moderate | 2 | 6 contract drifts |
-| **COMPOSITE** | **Akatsuki Full System Assessment** | **8.12** | **MODERATE** | **12** | **12 total** |
+| Scope ID | Subsystem Name | Health Score | Status | Invariant Breaches | Critical Findings | Primary Driver |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| **`scope_1`** | **Storage & Markdown Engine** | **7.8 / 10** | `MODERATE` | 2 | 2 | CommonMark ATX & code fence blind spot in `locate_section`; relative path underflow in `contained_path`. |
+| **`scope_2`** | **Index, Vectors & Graph** | **8.5 / 10** | `MINOR` | 2 | 0 | Dual-tx desync between `file_meta` & `note_vectors`; YAML error propagation aborting vector reconcile. |
+| **`scope_3`** | **Domain Queries & Mutations** | **8.5 / 10** | `MINOR` | 0 | 1 | Mutating CTE bypass in read-only SQL validator; pipe buffer exhaustion risk on verbose invariants. |
+| **`scope_4`** | **CLI & JSON-RPC MCP Daemon** | **8.6 / 10** | `MINOR` | 1 | 1 | `lint --json` & `verify --json` exit 0 on failure; non-string scalar dropout in `akatsuki_set`. |
+| **`scope_seams`** | **Cross-Boundary Seams** | **9.4 / 10** | `MINOR` | 0 | 0 | Strong inter-module boundaries; airtight process group isolation and panic boundary containment. |
+| **OVERALL** | **Full System Architecture** | **8.6 / 10** | **`MINOR`** | **5** | **4** | **Production-grade kernel with isolated edge and storage seams requiring targeted hardening.** |
 
 ---
 
-## 2. Invariant & Contract Breaches
+## 2. Critical Findings & Invariant Breaches
 
-1. **Arbitrary Unsandboxed Shell Execution**:
-   - [`src/akatsuki/verify.py:68-74`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L68-L74) invokes `subprocess.run(cmd, shell=True)` on markdown code blocks (`bash:verify`) without sandbox isolation, permission guards, or working directory confinement.
-2. **YAML AST & Indentation Flattening**:
-   - [`src/akatsuki/verify.py:345-362`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L345-L362) strips all line indentation during unquoted-colon reconciliation (`k, v = stripped.split(":", 1)`), flattening nested mapping structures into corrupt top-level keys.
-3. **Orphan Vector Chunks on Note Truncation**:
-   - [`src/akatsuki/vectors.py:356-375`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/vectors.py#L356-L375) keys chunks as `f"{rel}:{i}"` via `INSERT OR REPLACE` but never deletes obsolete higher-indexed chunks when a note shrinks in size, permanently poisoning similarity search.
-4. **Subprocess Infinite Hang Vulnerability**:
-   - [`src/akatsuki/vectors.py:104-110, 134-139`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/vectors.py#L104-L110) lacks a `timeout` argument during external Python worker execution (`subprocess.run`), risking indefinite process deadlocks during model downloads or GPU initialization.
-5. **Daemon Crash via Library `sys.exit`**:
-   - [`src/akatsuki/storage.py:173`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L173) executes `sys.exit(1)` inside `get_vault()`. When invoked from MCP tool/resource handlers, missing vault discovery immediately terminates the persistent JSON-RPC daemon process.
-6. **Path Traversal Vulnerability in Daily Provisioning**:
-   - [`src/akatsuki/storage.py:386`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L386) joins `daily_dir / f"{date_str}.md"` without `contained_path` or format validation, allowing paths like `../../outside` to escape the daily directory and vault root.
-7. **Frontmatter Substring Splitting Fragility**:
-   - [`src/akatsuki/storage.py:197`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L197) splits markdown frontmatter using raw substring `content.split("---", 2)`. Em-dashes (`---`) inside title or summary fields prematurely split frontmatter, injecting raw YAML into the document body.
-8. **Truncated Boundary Sinks at Graph Depth >= 2**:
-   - [`src/akatsuki/graph.py:186-200`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/graph.py#L186-L200) populates `all_stems` by iterating only immediate root children (`for c in downstream_tree: all_stems.add(c["stem"])`), silently omitting grandchildren and deeper dependencies from blast radius calculation.
-9. **M2M Error Serialization Drift**:
-   - While `.agents/memory.md:12` establishes strict M2M JSON formatting, commands (`cli_contract`, `cli_get`, `cli_query`, `cli_blast`, `cli_set`, `cli_append`, `cli_replace`, `cli_write`, `cli_reconcile` in [`src/akatsuki/cli/commands.py`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/cli/commands.py)) dump plain text to stderr on error even when `--json` is specified.
-10. **MCP Resource MIME Type Mismatch**:
-    - [`src/akatsuki/mcp/server.py:84`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mcp/server.py#L84) specifies `mimeType: "application/json"` for `akatsuki://services` and `akatsuki://projects`. When index records are empty, [`src/akatsuki/mcp/resources.py:58, 72`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mcp/resources.py#L58) falls back to returning raw Markdown files wrapped in an `application/json` header.
-11. **VaultLock Bypass in Reconcile**:
-    - [`src/akatsuki/verify.py:362, 391`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L362) executes in-place `write_text()` without acquiring `VaultLock` or writing through atomic temporary staging, creating concurrency race conditions against `mutations.py`.
-12. **Write Amplification Bottleneck**:
-    - [`src/akatsuki/mutations.py:270-274`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L270-L274) invokes `verify_links(vault)` on every single call to `write_note`, forcing a synchronous $O(N)$ full-vault disk scan and re-parsing of every note on each write.
+### 🚨 IB-1: CLI `lint --json` and `verify --json` Return Exit Code 0 on Failure
+- **Contract Violation**: [`SKILL.md#L84`](file:///home/devhax/projects/fusuyfusuy/akatsuki/SKILL.md#L84) defines `akatsuki lint ∧ akatsuki verify == exit 0` as the integrity gate, and [`SKILL.md#L205-L206`](file:///home/devhax/projects/fusuyfusuy/akatsuki/SKILL.md#L205-L206) specifies exit code `1` for schema lint errors and broken links.
+- **Root Cause**: In [`src/cli/mod.rs#L531-L541`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L531-L541) (`Commands::Lint`) and [`src/cli/mod.rs#L545-L561`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L545-L561) (`Commands::Verify`), `std::process::exit(1)` is placed exclusively inside the `else` (non-JSON) branch. When `--json` is specified, both commands serialize the report and return `Ok(())`, exiting with code `0` even when `rep.passed == false`.
+- **Impact**: Automated CI/CD pipelines running `akatsuki lint --json` falsely report success on corrupt or unlintable vaults.
+- **Remediation**: Hoist `if !rep.passed { std::process::exit(1); }` outside the `if json { ... } else { ... }` block in both commands.
+
+### 🚨 IB-2: Section Boundary Corruption via Comments Inside Code Blocks
+- **Contract Violation**: [`.agents/memory.md#L17`](file:///home/devhax/projects/fusuyfusuy/akatsuki/.agents/memory.md#L17) establishes `storage::locate_section` as the single source of truth for heading lookups and section boundaries across readers and writers.
+- **Root Cause**: [`heading_at` in src/storage/mod.rs#L447-L454`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L447-L454) parses any line starting with `#` as a heading without verifying trailing whitespace (CommonMark ATX violation) and without tracking markdown code fences (```` ``` ````). Any bash or python comment (e.g. `# setup trap`) inside a code block of level $\le$ target heading level matches as a heading, prematurely ending the section.
+- **Impact**: Section extraction ([`src/storage/mod.rs#L490`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L490)), section replacement ([`src/mutations/mod.rs#L161`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mutations/mod.rs#L161)), and invariant block extraction ([`src/index/mod.rs#L542`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/index/mod.rs#L542)) discard valid markdown and split content on internal code comments.
+- **Remediation**: Require space or tab after `#` in `heading_at` (`c == ' ' || c == '\t'`) and track code block toggle state (`line.starts_with("```")`) in `locate_section`.
+
+### 🚨 IB-3: Containment Escape on Relative Vault Paths
+- **Contract Violation**: [`contained_path` in src/storage/mod.rs#L192-L236](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L192-L236) must prevent directory traversal outside the vault root.
+- **Root Cause**: [`normalize_path` in src/storage/mod.rs#L238-L250](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L238-L250) pops from an empty `components` vector on `Component::ParentDir` (`..`). When `vault` is relative (e.g. `Path::new(".")), `norm_vault` becomes `""`. Path traversals like `../../etc/passwd` normalize to `etc/passwd`, where `"etc/passwd".starts_with("")` evaluates to `true`, returning an uncontained path.
+- **Impact**: Relative `--vault` invocations can be induced to read or write files outside the target vault.
+- **Remediation**: Canonicalize `vault` immediately upon entry or preserve leading `..` underflow markers so relative paths cannot escape containment.
+
+### 🚨 IB-4: Dual-Transaction Desync Between `file_meta` and `note_vectors`
+- **Contract Violation**: Vector index maintenance must remain strictly synchronized with Blake3 file hashes.
+- **Root Cause**: In [`src/index/mod.rs#L661-L663`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/index/mod.rs#L661-L663), `tx.commit()?` commits `file_meta` and FTS records *before* `sync_note_vectors(con, &vector_sources)?` runs.
+- **Impact**: If vector embedding fails mid-run (out of memory, process kill, Candle error), `file_meta` retains the updated Blake3 hash. Subsequent sync passes consider the file unchanged and skip embedding, permanently stranding the note without vector representation.
+- **Remediation**: Defer committing `file_meta` until `sync_note_vectors` completes or wrap both in a single atomic transaction.
+
+### 🚨 IB-5: Unparseable Frontmatter Aborts Vector Reconciliation
+- **Contract Violation**: Malformed frontmatter notes must be isolated into `SyncReport.parse_errors` and never abort full vault reconciliation.
+- **Root Cause**: In [`src/vectors/mod.rs#L64-L67`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/vectors/mod.rs#L64-L67), `chunk_note` invokes `parse_frontmatter(content)?` with the `?` operator. While [`src/index/mod.rs#L398`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/index/mod.rs#L398) isolates parse errors during SQLite indexing, `sync_note_vectors` invokes `chunk_note` and bubbles the error up, aborting the entire reconcile pass.
+- **Impact**: A single invalid YAML note prevents all other notes from generating vector embeddings.
+- **Remediation**: In `chunk_note`, fall back to empty metadata (`Value::Mapping(Default::default())`) on YAML parse errors and chunk the raw body.
+
+### 🚨 IB-6: Mutating CTE Bypass in Read-Only SQL Validator
+- **Contract Violation**: [`akatsuki query`](file:///home/devhax/projects/fusuyfusuy/akatsuki/SKILL.md#L110) must be strictly read-only (`SELECT`/`WITH`/`EXPLAIN`).
+- **Root Cause**: [`execute_sql_query` in src/search/mod.rs#L357-L364](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/search/mod.rs#L357-L364) validates queries solely by checking if the first whitespace-delimited token is `SELECT`, `WITH`, or `EXPLAIN`. Data-modifying Common Table Expressions (`WITH del AS (DELETE FROM entities RETURNING *) SELECT * FROM del;`) pass this check and mutate the database. Furthermore, queries beginning with SQL comments (`-- inspect\nSELECT ...`) are falsely rejected.
+- **Impact**: Operators or agents can mutate or corrupt SQLite tables (`entities`, `services`, `relations`) via `akatsuki query`.
+- **Remediation**: Prepare the statement and assert `stmt.readonly()` via SQLite's native statement introspection; strip comments before token checking.
 
 ---
 
-## 3. Comprehensive Findings Matrix
+## 3. High & Moderate Architectural Findings
 
-| Ref | Severity | Location | Subsystem | Description |
-| :--- | :---: | :--- | :--- | :--- |
-| **F-01** | **CRITICAL** | [`verify.py:68-74`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L68-L74) | Verification | Arbitrary command injection: executes untrusted vault commands under `shell=True` without sandbox or `cwd` confinement. |
-| **F-02** | **CRITICAL** | [`verify.py:345-362`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L345-L362) | Verification | Indentation stripping in `reconcile_vault` flattens nested YAML dictionaries into corrupt top-level keys. |
-| **F-03** | **HIGH** | [`vectors.py:356-375`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/vectors.py#L356-L375) | Vectors | Orphan vector chunks persist indefinitely on note edits when text shrinks in length. |
-| **F-04** | **HIGH** | [`vectors.py:104-110`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/vectors.py#L104-L110) | Vectors | Subprocess execution lacks `timeout`, risking indefinite hang on model download or PyTorch deadlock. |
-| **F-05** | **HIGH** | [`storage.py:173`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L173) | Storage / MCP | `sys.exit(1)` in library function `get_vault()` terminates parent processes (e.g. MCP stdio server). |
-| **F-06** | **HIGH** | [`storage.py:386`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L386) | Storage | Path traversal vulnerability in `ensure_daily_note` via unvalidated `date_str`. |
-| **F-07** | **HIGH** | [`storage.py:197`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L197) | Storage | `content.split("---", 2)` breaks on em-dashes `---` inside frontmatter fields. |
-| **F-08** | **HIGH** | [`mutations.py:270-274`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L270-L274) | Mutations | $O(N)$ write amplification: full-vault `verify_links` runs synchronously on every `write_note`. |
-| **F-09** | **MEDIUM** | [`graph.py:186-200`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/graph.py#L186-L200) | Graph | Truncated boundary sink calculation drops dependencies at depth >= 2. |
-| **F-10** | **MEDIUM** | [`verify.py:322-416`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L322-L416) | Verification | Non-atomic, unlocked file writes in `reconcile_vault` risk concurrency corruption. |
-| **F-11** | **MEDIUM** | [`index.py:229-234`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/index.py#L229-L234) | Index | Wikilink section anchors (`[[Note#Sec]]`) are not stripped, corrupting relation stems. |
-| **F-12** | **MEDIUM** | [`vectors.py:419-451`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/vectors.py#L419-L451) | Vectors | Complete absence of `sqlite-vec` extension; queries perform unindexed full-table pure-Python scans. |
-| **F-13** | **MEDIUM** | [`cli/commands.py:151+`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/cli/commands.py#L151) | CLI Seam | Plaintext error strings printed to stderr on failure even when `--json` flag is provided. |
-| **F-14** | **MEDIUM** | [`mcp/server.py:84`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mcp/server.py#L84) | MCP Seam | Resource MIME type declares `application/json` but returns raw Markdown on fallback. |
-| **F-15** | **MEDIUM** | [`storage.py:426`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L426) vs [`verify.py:161`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L161) | Storage/Verify | Validation divergence: `storage.py` requires `tags` on all notes; `verify.py` omits `tags` on generic notes. |
-| **F-16** | **MEDIUM** | [`storage.py:61-75`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L61-L75) | Storage | Fallback YAML serializer formats lists of dicts as `str(dict)` and fails to escape `\n`. |
-| **F-17** | **MEDIUM** | [`markdown.py:23-28`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/markdown.py#L23-L28) | Markdown | Code fence state machine desynchronizes on nested code fences, misclassifying `#` comments as headings. |
-| **F-18** | **MEDIUM** | [`search.py:257-288`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/search.py#L257-L288) | Search | Score scale disparity: fallback single-sided hits yield raw BM25 (5-10) vs fused RRF scores (0.01-0.03). |
-| **F-19** | **MEDIUM** | [`mutations.py:119-120`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L119-L120) | Mutations | `append_section_to_note` forcefully prepends `- ` to any content not starting with `#`. |
-| **F-20** | **LOW** | [`mcp/tools.py:182, 490`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mcp/tools.py#L182) | MCP / Tests | Tool schema specifies `note` parameter, but integration test passes `target`, causing silent full test runs. |
-| **F-21** | **LOW** | [`cli.py:1-7`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/cli.py#L1) | Packaging | Redundant `cli.py` module shadows package directory `src/akatsuki/cli/`. |
-| **F-22** | **LOW** | [`cli/parser.py:23`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/cli/parser.py#L23) | Scaffolding | `akatsuki init` omits `"60-Scripts"` directory specified in `constants.py:DOMAIN_DIRS`. |
-| **F-23** | **LOW** | [`tests/test_map_and_search.py`](file:///home/devhax/projects/fusuyfusuy/akatsuki/tests/test_map_and_search.py) | Testing | Zero unit test coverage for `src/akatsuki/vectors.py` chunking, similarity, and sync routines. |
+| Ref | Scope | Severity | File:Line | Description |
+| :--- | :--- | :---: | :--- | :--- |
+| **F-01** | `scope_4` | **HIGH** | [`src/mcp/mod.rs#L425`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L425) | `akatsuki_set` MCP tool strictly calls `v.as_str()`. Passing native JSON booleans, numbers, or arrays (e.g. `{"value": 42}`) causes silent property wipe to `""`. Coerce non-strings to formatted JSON strings. |
+| **F-02** | `scope_4` | **HIGH** | [`src/mcp/mod.rs#L544,L621`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L544) | MCP tool definitions omit `budget` for `akatsuki_read` and `raw` for `akatsuki_write_note` despite runtime handler support and `SKILL.md` advertisement. |
+| **F-03** | `scope_3` | **MEDIUM** | [`src/verify/mod.rs#L685-L720`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L685-L720) | `run_invariant` polls child execution without draining stdout/stderr pipes. Commands emitting >64 KB deadlock on OS pipe buffers and get killed by SIGKILL at timeout. |
+| **F-04** | `scope_2` | **MEDIUM** | [`src/index/mod.rs#L520-L527`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/index/mod.rs#L520-L527) | `parse_wikilinks` only strips `.md` suffix (`[[40-Systems/Database]]` -> `"40-Systems/Database"`), leaving directory prefix that fails stem matching against `entities.stem` (`"Database"`). |
+| **F-05** | `scope_3` | **MEDIUM** | [`src/search/mod.rs#L472-L478`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/search/mod.rs#L472-L478) | `get_keypath` fails on array indexing (`tags.0`) because `serde_json::Value::get` only accepts string slice keys. Parse digits to `usize` for array segments. |
+| **F-06** | `scope_3` | **MEDIUM** | [`src/verify/mod.rs#L278-L285`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L278-L285) | `audit_links` stores stems in a flat `HashMap<String, String>`, causing notes with matching stems across folders (`20-Projects/api.md` vs `40-Systems/api.md`) to shadow each other and report false orphans. |
+| **F-07** | `scope_1` | **MEDIUM** | [`src/storage/mod.rs#L456-L488`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L456-L488) | `locate_section` performs `name == target || name.contains(&target)` in a single pass. An earlier substring heading shadows a later exact match. Implement two-pass matching. |
+| **F-08** | `scope_1` | **MEDIUM** | [`src/storage/mod.rs#L11-L35`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L11-L35) | `VaultLock` executes blocking `flock` without timeout or in-process thread-local re-entrancy tracking. |
+| **F-09** | `scope_4` | **LOW** | [`src/cli/mod.rs#L86-L88`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L86-L88) | `Map.direction` lacks Clap `value_parser = ["both", "down", "up"]`, silently falling back to `"both"` on typo instead of exiting `2`. |
+| **F-10** | `scope_seams` | **LOW** | [`src/cli/mod.rs#L107`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L107) vs [`src/mcp/mod.rs#L661`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L661) | Parameter naming divergence: CLI uses positional `<KEYPATH>` while MCP schema declares `key` (aliasing `keypath`). |
 
 ---
 
 ## 4. Prioritized Remediation Roadmap
 
-### Phase 1: Security & Crash Immunity (P0 / P1 — High Priority)
-1. **Sanitize or Sandbox `bash:verify` Execution**:
-   - Require explicit `--allow-exec` flag and execute in a sandboxed subshell with `cwd=vault` ([`verify.py:68-74`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L68-L74)).
-2. **Eliminate Library `sys.exit`**:
-   - Refactor `get_vault()` in [`storage.py:173`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L173) to raise `VaultNotFoundError(RuntimeError)`. Catch in CLI `main()` (`sys.exit(1)`) and return JSON-RPC error `-32603` in MCP server.
-3. **Secure Path Boundaries in Daily Provisioning**:
-   - Enforce `contained_path` and regex format check `r"^\d{4}-\d{2}-\d{2}$"` on `date_str` in [`storage.py:386`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L386).
-4. **Subprocess Timeout Guard**:
-   - Add `timeout=120.0` with `try...except subprocess.TimeoutExpired` in [`vectors.py:104-110, 134-139`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/vectors.py#L104-L110).
+```mermaid
+graph TD
+    subgraph Batch 1: Critical Invariants & Security [P0 / P1 - Immediate]
+        B1_1[Fix CLI lint & verify --json exit code 1]
+        B1_2[Fenced code block awareness in heading_at & locate_section]
+        B1_3[Fix contained_path relative traversal underflow]
+        B1_4[Enforce stmt.readonly on execute_sql_query]
+        B1_5[Isolate frontmatter errors in vectors::chunk_note]
+        B1_6[Defer file_meta commit until sync_note_vectors completes]
+    end
 
-### Phase 2: Invariant Correctness & Robustness (P1 / P2 — Medium Priority)
-5. **Preserve YAML Hierarchy in Reconcile**:
-   - Retain leading whitespace/indentation during auto-quoting in [`verify.py:345-362`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L345-L362).
-6. **Prune Stale Vector Chunks**:
-   - In [`vectors.py:316-328`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/vectors.py#L316-L328), execute `DELETE FROM note_vectors WHERE rel_path = ?` before inserting updated chunks during `sync_vectors_index`.
-7. **Line-Anchored Frontmatter Parsing**:
-   - Split frontmatter strictly on line-anchored regex `r"^---\s*$"` in [`storage.py:197`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/storage.py#L197).
-8. **Decouple Full Vault Verification from Write Path**:
-   - Remove unconditional `verify_links(vault)` from [`mutations.py:270-274`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L270-L274) or guard behind `verify=False` by default.
-9. **Recursively Flatten Graph Boundary Sinks**:
-   - Collect all descendant nodes in [`graph.py:186-200`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/graph.py#L186-L200) to resolve boundary sinks at depth >= 2.
-10. **Strip Wikilink Section Anchors**:
-    - Remove `#anchor` from wikilink targets in [`index.py:229-234`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/index.py#L229-L234) before stem calculation.
-11. **Concurrency Protection in Reconcile**:
-    - Wrap [`verify.py:360-392`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L360-L392) in `with VaultLock(vault):` and atomic `.tmp.{pid}` staging.
+    subgraph Batch 2: Edge Robustness & Type Coercion [P1 / P2]
+        B2_1[Coerce non-string scalars in akatsuki_set]
+        B2_2[Add budget & raw to MCP tool schemas]
+        B2_3[Drain child pipes in run_invariant wait loop]
+        B2_4[Normalize wikilink stems via Path file_stem]
+        B2_5[Support numeric array indexing in get_keypath]
+        B2_6[Multi-map stems in audit_links to prevent shadowing]
+    end
 
-### Phase 3: Seam Parity & Interface Polish (P2 / P3 — Quality of Life)
-12. **M2M Error Output Normalization**:
-    - Wrap CLI error outputs in `json.dumps({"error": str(e)})` when `args.json` is active across [`cli/commands.py`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/cli/commands.py).
-13. **MCP Resource MIME Header Fix**:
-    - Set `mimeType: "text/markdown"` when returning fallback notes in [`mcp/resources.py:58-75`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mcp/resources.py#L58-L75).
-14. **Unify Subprocess Input Channels**:
-    - Pass query payloads via stdin JSON in [`vectors.py:125-139`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/vectors.py#L125-L139) instead of inline script formatting.
-15. **CLI Shadowing & Packaging Clean-up**:
-    - Remove redundant [`src/akatsuki/cli.py`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/cli.py) and add `src/akatsuki/cli/__main__.py`.
-16. **Add Comprehensive Vector Unit Tests**:
-    - Create dedicated test suite for vector chunking, packing, similarity computation, and index synchronization.
+    subgraph Batch 3: Ergonomics & Performance Polish [P2 / P3]
+        B3_1[Add Clap value_parser to Map.direction]
+        B3_2[Implement two-pass section matching in locate_section]
+        B3_3[Add try_lock timeout & re-entrancy guard to VaultLock]
+        B3_4[Case-insensitive index.md MOC resolution]
+    end
+
+    B1_1 --> B2_1
+    B2_1 --> B3_1
+```
+
+---
+
+## 5. Executive Approval Gate (MANDATORY STOP)
+
+> [!IMPORTANT]
+> **Audit Gate Policy**: This architectural audit is **strictly diagnostic**. In accordance with the Boundary-Review Protocol, **zero code modifications have been made**. Remediations require your explicit direction.
+
+### Recommended Actions for Operator:
+1. **Approve Batch 1 (P0/P1 Critical Invariants)**: Fix CLI `--json` exit codes, code block heading comment isolation, SQL `stmt.readonly()` enforcement, vector sync transaction safety, and relative path containment.
+2. **Approve Batch 2 (P1/P2 Robustness)**: Fix MCP parameter coercion, schema parity (`budget`/`raw`), pipe draining in invariants, and wikilink stem resolution.
+3. **Approve Full Remediation (Batches 1 + 2 + 3)**: Complete all remediations sequentially with automated regression verification.
+4. **Defer / Custom Selection**: Select specific findings to fix or defer.

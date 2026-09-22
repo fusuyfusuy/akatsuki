@@ -1,68 +1,62 @@
 ---
-scope: "queries-verification-mutations"
-score: 7.6
-status: "MODERATE"
-critical_findings: 2
-invariant_breaches:
-  - "Unsandboxed shell execution in run_verification_tests (subprocess.run shell=True without path confinement)"
-  - "Indentation destruction during reconcile_vault auto-quoting flattens nested YAML mappings"
+scope: "domain_queries_mutations"
+score: 8.5
+status: "MINOR"
+critical_findings: 0
+invariant_breaches: []
 ---
 
-# Deep Audit: Queries, Verification & Mutations
+# Scope 3 Audit: Domain Queries, Mutations & Invariants Engine
 
 ## 1. Executive Summary & Health Score
-- **Overall Score**: 7.6 / 10 (`MODERATE`)
-- **Primary Strengths**: Process-safe advisory locking (`VaultLock`) across mutations, atomic file writes via PID-tagged temp files and `os.replace`, robust frontmatter auto-healing, and Okapi BM25 FTS5 column weighting.
-- **Key Vulnerabilities**: Arbitrary shell command execution via ```bash:verify``` blocks, YAML AST corruption in reconciliation, quadratic disk I/O in write loops (`verify_links` on note write), and non-atomic writes in `reconcile_vault`.
+- **Overall Score**: 8.5 / 10 (`MINOR`)
+- **Primary Strengths**: Process-safe advisory locking (`VaultLock`) with strict non-reentrancy separation (`append_work_log` vs `append_work_log_inner`); atomic file replacement (`write_atomic`); indentation-preserving YAML scalar auto-quoting (`quote_colon_scalars`); strict path containment and traversal blocking (`contained_path`); process group isolation with hard ceiling timeout and `SIGKILL` on invariant assertions.
+- **Key Vulnerabilities**: Mutating CTE bypass in SQL query validator; section locator (`locate_section`) splitting on comments inside code blocks; stem shadowing across domains in link audits; keypath traversal failing on JSON arrays; pipe buffer exhaustion risking false timeouts on verbose invariant commands.
 
 ## 2. Findings Matrix
 
 | Ref | Severity | File:Line | Category | Summary |
 |---|---|---|---|---|
-| F-01 | CRITICAL | [verify.py:68-74](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L68-L74) | Security | Unsandboxed `subprocess.run(cmd, shell=True)` executes untrusted vault commands with no `cwd` or path bounds. |
-| F-02 | CRITICAL | [verify.py:345-362](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L345-L362) | Correctness | `reconcile_vault` strips YAML line indentation on auto-quote, flattening nested mapping structures into top-level keys. |
-| F-03 | HIGH | [verify.py:322-416](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L322-L416) | Robustness | `reconcile_vault` performs in-place `write_text` without `VaultLock` or atomic temp files, risking corruption. |
-| F-04 | HIGH | [mutations.py:270-274](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L270-L274) | Performance | `write_note` triggers full vault parse `verify_links(vault)` ($O(N)$ file reads) on every single write operation. |
-| F-05 | MEDIUM | [mutations.py:222-251](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L222-L251) | Security | `contained_path` permits writes to `.git/` (e.g. `.git/hooks/pre-commit` + `chmod 0o755`), enabling hook execution. |
-| F-06 | MEDIUM | [verify.py:281](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L281) | Security | Path prefix flaw: `str(resolved).startswith(str(vault))` allows adjacent folders like `akatsuki_evil` to pass check. |
-| F-07 | MEDIUM | [search.py:257-288](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/search.py#L257-L288) | Correctness | Score scale disparity: hybrid fallback returns raw BM25 (5-10) vs RRF reciprocal scores (0.01-0.03). |
-| F-08 | MEDIUM | [mutations.py:119-120](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L119-L120) | Correctness | `append_section_to_note` forces `- ` prefix onto paragraphs, tables, code blocks, and blockquotes. |
-| F-09 | MEDIUM | [mutations.py:292-299](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L292-L299) | Correctness | `set_note_property` replaces existing list values with empty dicts when indexing attempts occur (`tags.0`). |
-| F-10 | LOW | [search.py:108-116](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/search.py#L108-L116) | Correctness | `get_keypath` for `services` discards `parts[3:]`, failing to traverse nested service attributes. |
-| F-11 | LOW | [verify.py:239-242](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/verify.py#L239-L242) | Robustness | `stems = {f.stem.lower(): f}` causes non-deterministic stem shadowing when files share names across folders. |
-| F-12 | LOW | [mutations.py:58-62](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L58-L62) | Robustness | `append_work_log` treats bash `# comment` inside fences as H1 headings, splitting code blocks. |
-| F-13 | LOW | [mutations.py:326-352](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/mutations.py#L326-L352) | Performance | `list_notes_in_vault` reads every `.md` file from disk instead of querying indexed SQLite `entities` table. |
-| F-14 | LOW | [search.py:293-317](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/akatsuki/search.py#L293-L317) | Performance | `with_graph` runs 3 separate SQL queries per result row in a loop (N+1 query bottleneck). |
+| F-01 | HIGH | [src/search/mod.rs#L357-L364](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/search/mod.rs#L357-L364) | Robustness | `execute_sql_query` only checks initial keyword against `SELECT\|WITH\|EXPLAIN`, allowing mutating CTEs (`WITH ... INSERT/DELETE`) and rejecting leading comments. |
+| F-02 | MEDIUM | [src/storage/mod.rs#L447-L485](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L447-L485) | Robustness | `locate_section` does not track code fences; `# comment` lines inside code blocks match as H1 headings, splitting sections prematurely. |
+| F-03 | MEDIUM | [src/verify/mod.rs#L278-L285](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L278-L285) | Correctness | `audit_links` stores stems in a flat map (`stems.insert(stem, rel)`), causing duplicate note stems across domains to shadow each other and trigger false orphans. |
+| F-04 | MEDIUM | [src/search/mod.rs#L472-L478](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/search/mod.rs#L472-L478) | Correctness | `get_keypath` uses `Value::get(&str)`, which fails on sequence indexing (`tags.0`) because `serde_json::Value` only accepts `usize` for arrays. |
+| F-05 | MEDIUM | [src/verify/mod.rs#L685-L720](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L685-L720) | Robustness | `run_invariant` does not drain piped stdout/stderr during wait loop; child processes emitting > 64 KB block on pipe buffers and get killed by SIGKILL at timeout. |
+| F-06 | LOW | [src/verify/mod.rs#L404](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L404) | Correctness | MOC closure check hardcodes case-sensitive `"INDEX.md"`, causing lowercase `index.md` anchors (as defined in `ROOT_ANCHORS`) to fail indexing closure. |
+| F-07 | LOW | [src/verify/mod.rs#L635-L665](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L635-L665) | Security | `run_verification_tests` does not enforce the `repo_test_re` boundary at runtime; unit test assertions (`cargo test`, `pytest`) run if lint is skipped. |
+| F-08 | LOW | [src/search/mod.rs#L64-L68](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/search/mod.rs#L64-L68) | Correctness | Hybrid search score scale disparity: empty vector fallback returns raw BM25 (5.0–25.0) whereas fused hits return RRF scores (0.015–0.035). |
 
 ## 3. Dimensional Deep Dive
 
-### 3.1 Correctness
-- **RRF Hybrid Search**: `cand_limit = max(limit * 2, 20)` with `k=60.0` works mathematically, but single-sided hits retain raw BM25 scores (`score > 1.0`), whereas fused hits are `0.015 - 0.033`. Callers relying on thresholding receive mismatched scales.
-- **Section Replacement**: `replace_markdown_section` accurately computes 1-indexed boundaries and protects subsequent headings, but if replacement text starts with `#` (e.g. Markdown header or Bash comment), it discards the target heading line.
-- **Keypath Resolution**: Discrepancy between `services` (max 1 property deep) and `entities` (arbitrary dictionary traversal).
+### 3.1 Correctness & Query Engine
+- **FTS5 & BM25**: `build_fts_clause` expands queries with suffix trimming and prefix wildcards (`expand_query_term`). `run_bm25_search` correctly applies column weights (`title: 10.0, tags: 5.0, summary: 5.0, body: 1.0`). `ORDER BY score` sorts ascending (correct for negative FTS5 BM25 values), and `SearchHit.score` records `bm25.abs()`.
+- **Keypath Resolution**: `get_keypath` correctly resolves `services.<name>` (extracting host, ports, replicas) and `entities.<stem>`. However, `services` discards `parts[3..]`, and neither entity metadata nor note frontmatter resolves numeric array indices (`tags.0`) because `Value::get(&str)` does not index `Value::Array`.
+- **Note Mutations**: `write_note` strictly validates YAML frontmatter via `parse_frontmatter` before mutating; missing fields are automatically populated via `auto_heal_frontmatter`. Writes are atomic via PID-tagged temp files and `fs::rename`.
 
-### 3.2 Robustness
-- **Reconciliation Concurrency**: `reconcile_vault` bypasses `VaultLock` and writes directly via `Path.write_text`. Under multi-agent concurrency, reconciliation can race with `append_work_log` or `write_note`.
-- **Wikilink Resolution**: Stems are stored in a single-value dictionary `stems = {f.stem.lower(): f}`. Colliding stems (e.g. `20-Projects/api.md` vs `40-Systems/api.md`) shadow each other arbitrarily.
+### 3.2 Robustness & Lock Safety
+- **SQL Validator Vulnerability**: [src/search/mod.rs#L357-L364](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/search/mod.rs#L357-L364) inspects solely the first token of the SQL query. Mutating queries wrapped in CTEs (`WITH del AS (...) DELETE FROM ...`) pass the check. The validator must verify `stmt.readonly()` on the prepared statement to guarantee read-only execution.
+- **Lock Non-Reentrancy**: Public `append_work_log` acquires `VaultLock`; mutation workflows (`write_note`, `replace_section_in_note`, `set_note_property`, `append_section_in_note`) invoke `append_work_log_inner` while already holding `VaultLock`. This cleanly eliminates self-deadlock.
+- **Heading Replacement vs Append**: `replace_section_in_note` correctly bails if a heading or note is missing. `append_section_in_note` creates missing headings at the end of the note or synthesizes a seeded note. However, `locate_section` does not track code fences (````...````); bash comments (`# comment`) inside code snippets are parsed as H1 headings, truncating sections prematurely.
 
-### 3.3 Performance
-- **Write Amplification**: Every call to `write_note` invokes `verify_links(vault)`, forcing synchronous reads of every note in the vault. In a vault with 3,000 notes, writing 10 notes reads 30,000 files from disk.
-- **Redundant Disk Scanning**: `list_notes_in_vault` re-reads all markdown files instead of reading from `entities`. `search_vault` runs incremental FTS sync (`glob` + `stat` on all files) on every single query call.
+### 3.3 Invariant Runner & Security
+- **Isolation & Timeouts**: Invariants execute inside a dedicated process group (`process_group(0)`) spawned under `current_dir(vault)`. If the execution duration exceeds `AKATSUKI_INVARIANT_TIMEOUT` (default 10s), `SIGKILL` is sent to `-child.id()`, terminating all subshells cleanly and returning exit code 124.
+- **Dry-Run & Pipe Safety**: `dry_run` is safely parsed from both booleans and strings (`arg_bool`). However, in [src/verify/mod.rs#L685-L720](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L685-L720), the wait loop sleeps without draining `child.stdout`/`stderr`. Commands writing > 64 KB will stall on full pipe buffers until timeout.
+- **Unit Test Boundary**: `lint_vault` detects `cargo test`, `pytest`, `npm test` inside `bash:verify` blocks, but `run_verification_tests` does not enforce this regex at execution time.
 
-### 3.4 Security
-- **Command Injection via bash:verify**: Markdown notes with ````bash:verify```` blocks execute arbitrary commands under `shell=True` without sandboxing or timeout overrides.
-- **Hidden Vault Overwrites**: `contained_path` checks that target is within vault, but allows subpaths starting with `.` (e.g., `.git/hooks/pre-commit`), allowing arbitrary hook injection if scripts are marked executable.
-- **Path Prefix Checking**: `str(resolved).startswith(str(vault))` should be replaced with `resolved.is_relative_to(vault)`.
+### 3.4 Linting & Link Audit Integrity
+- **Graph Closure & Anchors**: `audit_links` strips code fences and inline ticks before link extraction, preventing false positives from code examples. Root anchors (`ROOT_ANCHORS`) and daily notes are exempt from orphan checks.
+- **Case Sensitivity & Shadowing**: [src/verify/mod.rs#L404](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L404) checks `sources.contains("INDEX.md")`, which misses lowercase `index.md`. Stems stored in `stems: HashMap<String, String>` overwrite across directories (`20-Projects/api.md` vs `40-Systems/api.md`), causing false orphan alerts.
+- **Reconciliation Safety**: `reconcile_vault` auto-quotes unquoted colon scalars while preserving line indentation (`quote_colon_scalars`) and performs writes under `VaultLock` with `write_atomic`.
 
 ## 4. Test Suite Evaluation
-- **`tests/test_reconcile.py` (145 lines)**: Covers unquoted colon detection, graph closure unindexed detection, wikilink anchor parsing, and relations parsing. Defect: does not test nested YAML auto-quoting, multiple unindexed notes in same MOC, or concurrency.
-- **`tests/test_device_tracking.py` (106 lines)**: Covers host resolution, work log formatting, frontmatter updating, and entity synchronization. Defect: does not test concurrent mutations, lock timeouts, or non-bullet work log content.
+- **`tests/regression_tests.rs` (178 lines)**: Excellent targeted regression coverage for multibyte snippet char-boundary truncation, unparseable frontmatter rejection, date path-traversal prevention, invariant timeout SIGKILL, MCP dry-run string coercion, JSON-RPC notification silence, and BERT token limit handling.
+- **Gaps**: Lacks automated regression tests for mutating CTE SQL rejection, keypath array indexing, code fence comment tolerance in `locate_section`, and stem collision in `audit_links`.
 
 ## 5. Prioritized Actionable Remediations
-1. **Sanitize `bash:verify` Execution**: Require explicit `--allow-exec` flag or execute via restricted runner with explicit `cwd=vault` and sandboxed environment (`verify.py:68-74`).
-2. **Preserve YAML Indentation**: Refactor auto-quoting in `reconcile_vault` to compute leading indentation (`len(line) - len(line.lstrip())`) before rewriting lines (`verify.py:345-362`).
-3. **Lock & Atomize Reconcile**: Wrap `reconcile_vault` in `with VaultLock(vault):` and use atomic `.tmp.{pid}` + `os.replace` (`verify.py:362, 392`).
-4. **Decouple `verify_links` from `write_note`**: Remove synchronous `verify_links` from `write_note` or guard behind an opt-in `verify=True` parameter (`mutations.py:270-274`).
-5. **Enforce Dotfile Immunity in `contained_path`**: Reject write targets starting with `.` or containing `/.` (`storage.py:177-190`).
-6. **Use `Path.is_relative_to`**: Replace string prefix checking with `resolved.is_relative_to(vault)` (`verify.py:281`).
-7. **Leverage SQLite in `list_notes_in_vault`**: Query `entities` table directly instead of re-reading markdown files from disk (`mutations.py:326-352`).
+1. **Enforce `stmt.readonly()` in SQL Execution**: Validate `stmt.readonly()` on prepared statements in `execute_sql_query` to block mutating CTEs, and strip leading comments before token inspection ([src/search/mod.rs#L362-L367](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/search/mod.rs#L362-L367)).
+2. **Fence-Aware Section Locator**: Update `locate_section` in `src/storage/mod.rs` to track markdown code fences (````...````) so bash comments do not trigger false heading boundaries ([src/storage/mod.rs#L462-L485](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L462-L485)).
+3. **Drain Pipes Asynchronously in `run_invariant`**: Read stdout and stderr in background threads or drain pipes iteratively during the wait loop to prevent 64 KB pipe buffer stalls ([src/verify/mod.rs#L685-L729](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L685-L729)).
+4. **Support Array Indexing in Keypaths**: Check if keypath segment parses as `usize` in `get_keypath` and index `Value::Array` accordingly ([src/search/mod.rs#L472-L478](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/search/mod.rs#L472-L478)).
+5. **Stem Multi-Map in `audit_links`**: Use `HashMap<String, Vec<String>>` for stems to avoid stem shadowing and false orphan reports when note filenames collide across directories ([src/verify/mod.rs#L278-L285](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L278-L285)).
+6. **Case-Insensitive Root MOC Resolution**: Use `sources.iter().any(|s| s.eq_ignore_ascii_case("index.md"))` in MOC graph closure check ([src/verify/mod.rs#L404](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L404)).
+7. **Runtime Unit Test Gate in `run_verification_tests`**: Reject invariant execution if command matches `repo_test_re` at test execution time ([src/verify/mod.rs#L635-L665](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L635-L665)).

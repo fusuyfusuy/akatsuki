@@ -61,8 +61,33 @@ pub struct NoteChunk {
 /// Splits a note into embedding chunks: one per heading section (levels 1-4),
 /// windowed at [`MAX_CHUNK_CHARS`] on paragraph boundaries, each carrying a
 /// document header and breadcrumb so a chunk is interpretable on its own.
+fn extract_body_fallback(content: &str) -> String {
+    let text = content.strip_prefix('\u{feff}').unwrap_or(content);
+    if let Some(line_end) = text.find('\n') {
+        if text[..line_end].trim_end_matches('\r').trim() == "---" {
+            let after_open = &text[line_end + 1..];
+            let mut offset = 0usize;
+            for line in after_open.split_inclusive('\n') {
+                if line.trim_end_matches(['\r', '\n']).trim() == "---" {
+                    return after_open[offset + line.len()..]
+                        .trim_start_matches('\n')
+                        .to_string();
+                }
+                offset += line.len();
+            }
+        }
+    }
+    content.to_string()
+}
+
 pub fn chunk_note(rel_path: &str, content: &str) -> Result<Vec<NoteChunk>> {
-    let (fm, body) = parse_frontmatter(content)?;
+    let (fm, body) = match parse_frontmatter(content) {
+        Ok(parts) => parts,
+        Err(_) => (
+            Value::Object(Default::default()),
+            extract_body_fallback(content),
+        ),
+    };
     Ok(chunk_parsed(rel_path, &fm, &body))
 }
 

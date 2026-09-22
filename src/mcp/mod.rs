@@ -139,7 +139,7 @@ pub fn run_mcp_server(vault: &Path) -> Result<()> {
     Ok(())
 }
 
-fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
+pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
     match name {
         "akatsuki_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -215,7 +215,12 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             }
         }
         "akatsuki_contract" => {
-            let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            let note = args
+                .get("note")
+                .or_else(|| args.get("target"))
+                .or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if note.is_empty() {
                 return (
                     "Error: Missing required parameter 'note'.".to_string(),
@@ -231,7 +236,12 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             }
         }
         "akatsuki_blast" => {
-            let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args
+                .get("target")
+                .or_else(|| args.get("note"))
+                .or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if target.is_empty() {
                 return (
                     "Error: Missing required parameter 'target'.".to_string(),
@@ -247,12 +257,24 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             }
         }
         "akatsuki_map" => {
-            let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args
+                .get("target")
+                .or_else(|| args.get("note"))
+                .or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let depth = arg_usize(args, "depth").unwrap_or(2);
             let direction = args
                 .get("direction")
                 .and_then(|v| v.as_str())
                 .unwrap_or("both");
+
+            if target.is_empty() {
+                return (
+                    "Error: Missing required parameter 'target'.".to_string(),
+                    true,
+                );
+            }
 
             match traverse_graph(vault, target, depth, direction) {
                 Ok(graph) => (
@@ -422,7 +444,16 @@ fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
         "akatsuki_set" => {
             let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("");
             let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            let value_str = match args.get("value") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                Some(Value::Bool(b)) => b.to_string(),
+                Some(v @ (Value::Array(_) | Value::Object(_))) => {
+                    serde_json::to_string(v).unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            let value = &value_str;
 
             if note.is_empty() || key.is_empty() {
                 return (
@@ -549,7 +580,8 @@ fn get_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "note": { "type": "string", "description": "Note title, stem, or relative path (e.g. 'Dokploy API Guide', '40-Systems/Cluster-Topology.md')" },
                     "path": { "type": "string", "description": "Alias for note" },
-                    "section": { "type": "string", "description": "Optional section heading to extract" }
+                    "section": { "type": "string", "description": "Optional section heading to extract" },
+                    "budget": { "type": "integer", "description": "Optional character budget to truncate output" }
                 }
             }
         }),
@@ -559,9 +591,10 @@ fn get_tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "note": { "type": "string", "description": "Target note title, stem, or relative path" }
-                },
-                "required": ["note"]
+                    "note": { "type": "string", "description": "Target note title, stem, or relative path" },
+                    "target": { "type": "string", "description": "Alias for note" },
+                    "path": { "type": "string", "description": "Alias for note" }
+                }
             }
         }),
         json!({
@@ -570,9 +603,10 @@ fn get_tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Target service, stem, or note name" }
-                },
-                "required": ["target"]
+                    "target": { "type": "string", "description": "Target service, stem, or note name" },
+                    "note": { "type": "string", "description": "Alias for target" },
+                    "path": { "type": "string", "description": "Alias for target" }
+                }
             }
         }),
         json!({
@@ -582,10 +616,10 @@ fn get_tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": "Origin note stem or service name" },
+                    "note": { "type": "string", "description": "Alias for target" },
                     "depth": { "type": "integer", "default": 2, "description": "Traversal depth" },
                     "direction": { "type": "string", "enum": ["both", "down", "up"], "default": "both" }
-                },
-                "required": ["target"]
+                }
             }
         }),
         json!({
@@ -625,7 +659,8 @@ fn get_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "path": { "type": "string", "description": "Vault-relative path (e.g. '20-Projects/my-app.md')" },
                     "content": { "type": "string", "description": "Full Markdown content with YAML frontmatter" },
-                    "overwrite": { "type": "boolean", "default": false }
+                    "overwrite": { "type": "boolean", "default": false },
+                    "raw": { "type": "boolean", "default": false, "description": "Store raw artifact verbatim without auto-healing frontmatter" }
                 },
                 "required": ["path", "content"]
             }
@@ -663,9 +698,9 @@ fn get_tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "Keypath to extract (e.g. 'services.filament.ports', 'entities.bountools.status', 'bountools.tags')" }
-                },
-                "required": ["key"]
+                    "key": { "type": "string", "description": "Keypath to extract (e.g. 'services.filament.ports', 'entities.bountools.status', 'bountools.tags')" },
+                    "keypath": { "type": "string", "description": "Alias for key" }
+                }
             }
         }),
         json!({

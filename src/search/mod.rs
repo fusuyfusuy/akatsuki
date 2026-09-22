@@ -352,8 +352,31 @@ fn ellipsize(text: &str, max_chars: usize) -> String {
     out
 }
 
+fn strip_leading_sql_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if s.starts_with("--") {
+            if let Some(pos) = s.find('\n') {
+                s = &s[pos + 1..];
+            } else {
+                return "";
+            }
+        } else if s.starts_with("/*") {
+            if let Some(pos) = s.find("*/") {
+                s = &s[pos + 2..];
+            } else {
+                return "";
+            }
+        } else {
+            break;
+        }
+    }
+    s
+}
+
 pub fn execute_sql_query(vault: &Path, sql: &str) -> Result<Vec<serde_json::Value>> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let stripped = strip_leading_sql_comments(sql);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
     let keyword = trimmed
         .split_whitespace()
         .next()
@@ -365,6 +388,9 @@ pub fn execute_sql_query(vault: &Path, sql: &str) -> Result<Vec<serde_json::Valu
 
     let con = open_synced_db(vault)?;
     let mut stmt = con.prepare(trimmed)?;
+    if !stmt.readonly() {
+        anyhow::bail!("Security violation: query is not read-only.");
+    }
     let col_names: Vec<String> = stmt
         .column_names()
         .into_iter()
@@ -400,6 +426,20 @@ pub fn execute_sql_query(vault: &Path, sql: &str) -> Result<Vec<serde_json::Valu
     }
 
     Ok(results)
+}
+
+fn traverse_value_keypath(cur: &serde_json::Value, p: &str) -> Option<serde_json::Value> {
+    match cur {
+        serde_json::Value::Object(map) => map.get(p).cloned(),
+        serde_json::Value::Array(arr) => {
+            if let Ok(idx) = p.parse::<usize>() {
+                arr.get(idx).cloned()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
@@ -470,8 +510,8 @@ pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
             })?;
 
             for p in &parts[2..] {
-                if let Some(next) = cur.get(*p) {
-                    cur = next.clone();
+                if let Some(next) = traverse_value_keypath(&cur, p) {
+                    cur = next;
                 } else {
                     anyhow::bail!("Property '{}' not found in entity '{}'", p, ent_stem);
                 }
@@ -491,8 +531,8 @@ pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
         }
         let mut cur = fm;
         for p in &parts[1..] {
-            if let Some(next) = cur.get(*p) {
-                cur = next.clone();
+            if let Some(next) = traverse_value_keypath(&cur, p) {
+                cur = next;
             } else {
                 anyhow::bail!(
                     "Key '{}' not found in frontmatter of '{}'",

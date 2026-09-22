@@ -272,11 +272,14 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
     let notes = linkable_notes(vault)?;
     let vault_canon = fs::canonicalize(vault).unwrap_or_else(|_| vault.to_path_buf());
 
-    let mut stems: HashMap<String, String> = HashMap::new();
+    let mut stems: HashMap<String, Vec<String>> = HashMap::new();
     let mut rels: HashMap<String, String> = HashMap::new();
     let mut inbound: HashMap<String, HashSet<String>> = HashMap::new();
     for (rel, _) in &notes {
-        stems.insert(file_stem_lower(rel), rel.clone());
+        stems
+            .entry(file_stem_lower(rel))
+            .or_default()
+            .push(rel.clone());
         rels.insert(
             rel.strip_suffix(".md").unwrap_or(rel).to_lowercase(),
             rel.clone(),
@@ -317,16 +320,18 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
                 continue;
             }
             let target_clean = without_anchor.strip_suffix(".md").unwrap_or(without_anchor);
-            let candidate = rels
-                .get(&target_clean.to_lowercase())
-                .or_else(|| stems.get(&file_stem_lower(target_clean)));
-            match candidate {
-                Some(target_rel) => {
+            if let Some(target_rel) = rels.get(&target_clean.to_lowercase()) {
+                if let Some(sources) = inbound.get_mut(target_rel) {
+                    sources.insert(src_rel.clone());
+                }
+            } else if let Some(target_rels) = stems.get(&file_stem_lower(target_clean)) {
+                for target_rel in target_rels {
                     if let Some(sources) = inbound.get_mut(target_rel) {
                         sources.insert(src_rel.clone());
                     }
                 }
-                None => broken.push((src_rel.clone(), target.to_string())),
+            } else {
+                broken.push((src_rel.clone(), target.to_string()));
             }
         }
 
@@ -401,7 +406,8 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
             None => continue,
         };
         let sources = &inbound[rel];
-        let mut indexed = sources.contains("INDEX.md") || sources.contains(parent_moc);
+        let mut indexed = sources.iter().any(|s| s.eq_ignore_ascii_case("index.md"))
+            || sources.contains(parent_moc);
         if rel.starts_with("40-Systems/ADRs/") {
             indexed = indexed || sources.contains("40-Systems/ADRs/ADRs-MOC.md");
         }
@@ -692,6 +698,21 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
         Err(e) => return (1, String::new(), format!("Failed to spawn bash: {}", e)),
     };
 
+    let stdout_handle = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let timeout = invariant_timeout();
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -719,14 +740,12 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_end(&mut stdout);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_end(&mut stderr);
-    }
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     if timed_out {
         return (

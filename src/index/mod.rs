@@ -29,6 +29,49 @@ fn scalar_join(items: &[Value]) -> String {
         .join(", ")
 }
 
+/// Extracts the bare note stem from a wikilink target or declared relation target.
+/// Strips surrounding `[[` and `]]`, anchors (`#...`), `.md` suffix, and directory paths (`dir/stem`).
+pub fn extract_target_stem(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(inner) = s.strip_prefix("[[").and_then(|v| v.strip_suffix("]]")) {
+        s = inner.trim();
+    }
+    let target = s.split('|').next().unwrap_or(s).trim();
+    let without_anchor = target.split('#').next().unwrap_or(target).trim();
+    let without_md = without_anchor.strip_suffix(".md").unwrap_or(without_anchor);
+    let stem = without_md
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(without_md)
+        .trim();
+    stem.to_string()
+}
+
+/// Parses wikilinks from note body, extracting target note stems.
+/// Escaped wikilinks (`\[[x]]`) are ignored as documentation.
+pub fn parse_wikilinks(body: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let wikilink_re = RE.get_or_init(|| {
+        Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]").expect("valid wikilink regex")
+    });
+    let mut targets = Vec::new();
+    for caps in wikilink_re.captures_iter(body) {
+        let whole = match caps.get(0) {
+            Some(w) => w,
+            None => continue,
+        };
+        if whole.start() > 0 && body.as_bytes().get(whole.start() - 1) == Some(&b'\\') {
+            continue;
+        }
+        let clean_stem = extract_target_stem(&caps[1]);
+        if !clean_stem.is_empty() {
+            targets.push(clean_stem);
+        }
+    }
+    targets
+}
+
 #[derive(Debug, Default, serde::Serialize)]
 pub struct SyncReport {
     pub added: usize,
@@ -372,7 +415,6 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         )?;
     }
 
-    let wikilink_re = Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]")?;
     let verify_re = Regex::new(r"(?s)```bash:verify\s*\n(.*?)\n```")?;
 
     let now_iso = chrono::Utc::now().to_rfc3339();
@@ -380,9 +422,9 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
     // Notes whose text changed are the only ones that need re-embedding.
     let mut vector_sources: Vec<(String, String)> = Vec::new();
 
-    for file in to_update {
+    for file in &to_update {
         let rel = &file.rel_path;
-        let content = file.content;
+        let content = &file.content;
         let stem = Path::new(rel)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -392,12 +434,12 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
             vector_sources.push((rel.clone(), content.clone()));
         }
 
-        let parsed = parse_frontmatter(&content);
+        let parsed = parse_frontmatter(content);
         let (fm, body) = match parsed {
             Ok(parts) => parts,
             Err(e) => {
                 parse_errors.push(format!("'{}': {}", rel, e));
-                (serde_json::json!({}), content)
+                (serde_json::json!({}), content.clone())
             }
         };
 
@@ -486,7 +528,7 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
                 match targets {
                     Value::Array(items) => {
                         for item in items {
-                            let target = scalar_text(item);
+                            let target = extract_target_stem(&scalar_text(item));
                             if !target.is_empty() {
                                 tx.execute(
                                     "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, ?3)",
@@ -496,7 +538,7 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
                         }
                     }
                     other => {
-                        let target = scalar_text(other);
+                        let target = extract_target_stem(&scalar_text(other));
                         if !target.is_empty() {
                             tx.execute(
                                 "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, ?3)",
@@ -510,21 +552,11 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
 
         // Body wikilinks resolve through note stems; escaped links (`\[[x]]`) are
         // documentation, not references.
-        for caps in wikilink_re.captures_iter(&body) {
-            let whole = caps.get(0).expect("capture 0 always present");
-            if body.as_bytes()[..whole.start()].last() == Some(&b'\\') {
-                continue;
-            }
-
-            let target = caps[1].trim();
-            let target_stem = target.split('#').next().unwrap_or(target).trim();
-            let clean_stem = target_stem.strip_suffix(".md").unwrap_or(target_stem);
-            if !clean_stem.is_empty() {
-                tx.execute(
-                    "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, 'references')",
-                    params![rel, clean_stem],
-                )?;
-            }
+        for clean_stem in parse_wikilinks(&body) {
+            tx.execute(
+                "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, 'references')",
+                params![rel, clean_stem],
+            )?;
         }
         // Invariants: declared in frontmatter, or bulleted under an `Invariants`
         // heading.
@@ -650,17 +682,20 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
                 }
             }
         }
-
-        // Update file_meta
-        tx.execute(
-            "INSERT OR REPLACE INTO file_meta (rel_path, blake3_hash, size, indexed_at) VALUES (?1, ?2, ?3, ?4)",
-            params![rel, file.hash, file.size as i64, now_iso],
-        )?;
     }
 
     tx.commit()?;
 
     let vectors = crate::vectors::sync_note_vectors(con, &vector_sources)?;
+
+    let meta_tx = con.transaction()?;
+    for file in &to_update {
+        meta_tx.execute(
+            "INSERT OR REPLACE INTO file_meta (rel_path, blake3_hash, size, indexed_at) VALUES (?1, ?2, ?3, ?4)",
+            params![&file.rel_path, file.hash, file.size as i64, &now_iso],
+        )?;
+    }
+    meta_tx.commit()?;
 
     Ok(SyncReport {
         added: added_count,

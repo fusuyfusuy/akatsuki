@@ -21,4 +21,5 @@
 - Retrieval Honesty: `--mode vector` errors without weights/feature; `hybrid` falls back to BM25 but always prints or returns an explicit `⚠ semantic ranking unavailable…` notice.
 - Domain File Stems: Rust `Path::file_stem()` keeps interior dots (`yusufakcakaya.com.md` -> `yusufakcakaya.com`). The legacy Python `Path.stem` stripped the last dot-suffix, which was the bug — Rust is correct; wikilink targets only need their `.md` suffix removed.
 - Invariant Boundary: Akatsuki never runs repo unit tests; `bash:verify` assertion blocks are strictly for machine infrastructure invariants (ports, containers, daemons, host addresses). Each assertion runs under a hard timeout (default 10s, `AKATSUKI_INVARIANT_TIMEOUT`).
-- Parameter Aliasing: `akatsuki_read` accepts `note`, `path`, or `target` interchangeably and normalizes spaces to hyphens for robust stem resolution.
+- Parameter Aliasing: akatsuki_read, akatsuki_contract, akatsuki_blast, and akatsuki_map accept note, target, or path interchangeably; akatsuki_get accepts key or keypath.
+- Code Fence Isolation: storage::locate_section tracks markdown code fences (```/~~~) so that # comments inside bash/python snippets are never mistaken for section headings.

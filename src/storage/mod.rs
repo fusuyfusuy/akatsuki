@@ -194,9 +194,16 @@ pub fn contained_path(vault: &Path, rel_path: &str) -> Option<PathBuf> {
     if clean.is_empty() || clean == "." || clean == "./" || clean.contains('\0') {
         return None;
     }
-    let candidate = vault.join(clean);
+    let abs_vault = if vault.is_relative() {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(vault)
+    } else {
+        vault.to_path_buf()
+    };
+    let candidate = abs_vault.join(clean);
     let norm_candidate = normalize_path(&candidate);
-    let norm_vault = normalize_path(vault);
+    let norm_vault = normalize_path(&abs_vault);
 
     if !norm_candidate.starts_with(&norm_vault) || norm_candidate == norm_vault {
         return None;
@@ -241,7 +248,15 @@ fn normalize_path(path: &Path) -> PathBuf {
         match comp {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                components.pop();
+                if components.is_empty()
+                    || components
+                        .iter()
+                        .all(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    components.push(comp);
+                } else if components.last() != Some(&std::path::Component::RootDir) {
+                    components.pop();
+                }
             }
             c => components.push(c),
         }
@@ -450,7 +465,11 @@ pub fn heading_at(line: &str) -> Option<(usize, String)> {
         return None;
     }
     let level = trimmed.chars().take_while(|c| *c == '#').count();
-    Some((level, normalize_heading(&trimmed[level..])))
+    let rest = &trimmed[level..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    Some((level, normalize_heading(rest)))
 }
 
 /// Locates a section by heading: exact normalized match first, substring second.
@@ -465,26 +484,48 @@ pub fn locate_section(lines: &[&str], heading: &str) -> Option<(usize, usize, us
         return None;
     }
 
-    let mut found: Option<(usize, usize)> = None;
-    for (index, line) in lines.iter().enumerate() {
-        let Some((level, name)) = heading_at(line) else {
-            continue;
-        };
-        match found {
-            None => {
-                if name == target || name.contains(&target) {
-                    found = Some((index, level));
+    let scan = |predicate: &dyn Fn(&str) -> bool| -> Option<(usize, usize, usize)> {
+        let mut in_fence: Option<char> = None;
+        let mut found: Option<(usize, usize)> = None;
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if let Some(fence_char) = in_fence {
+                let fence_prefix = if fence_char == '`' { "```" } else { "~~~" };
+                if trimmed.starts_with(fence_prefix) {
+                    in_fence = None;
                 }
+                continue;
             }
-            Some((_, matched_level)) if level <= matched_level => {
-                let (start, start_level) = found.expect("checked");
-                return Some((start, start_level, index));
-            }
-            Some(_) => {}
-        }
-    }
 
-    found.map(|(start, level)| (start, level, lines.len()))
+            if trimmed.starts_with("```") {
+                in_fence = Some('`');
+                continue;
+            } else if trimmed.starts_with("~~~") {
+                in_fence = Some('~');
+                continue;
+            }
+
+            let Some((level, name)) = heading_at(line) else {
+                continue;
+            };
+            match found {
+                None => {
+                    if predicate(&name) {
+                        found = Some((index, level));
+                    }
+                }
+                Some((_, matched_level)) if level <= matched_level => {
+                    let (start, start_level) = found.expect("checked");
+                    return Some((start, start_level, index));
+                }
+                Some(_) => {}
+            }
+        }
+
+        found.map(|(start, level)| (start, level, lines.len()))
+    };
+
+    scan(&|name| name == target).or_else(|| scan(&|name| name.contains(&target)))
 }
 
 pub fn extract_section(content: &str, section_name: &str) -> Option<String> {

@@ -83,7 +83,7 @@ pub enum Commands {
         target: String,
         #[arg(short, long, default_value_t = 2)]
         depth: usize,
-        #[arg(long, default_value = "both")]
+        #[arg(long, default_value = "both", value_parser = ["both", "down", "up"])]
         direction: String,
         #[arg(long)]
         json: bool,
@@ -537,6 +537,8 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 for e in rep.errors {
                     println!("  - {}", e);
                 }
+            }
+            if !rep.passed {
                 std::process::exit(1);
             }
         }
@@ -557,6 +559,8 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 for orph in rep.orphan_notes {
                     println!("  - Orphan note: {}", orph);
                 }
+            }
+            if !rep.passed {
                 std::process::exit(1);
             }
         }

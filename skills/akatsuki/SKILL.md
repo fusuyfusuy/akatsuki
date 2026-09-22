@@ -155,14 +155,14 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`. Every tool call is panic-isola
 | :--- | :--- | :--- |
 | `akatsuki_search` | `akatsuki search` | `query`, `mode`, `domain`, `limit`, `with_graph` |
 | `akatsuki_read` | `akatsuki read` | `note` (or `path`), `section`, `budget` |
-| `akatsuki_contract` | `akatsuki contract` | `note` |
-| `akatsuki_blast` | `akatsuki blast` | `target` |
-| `akatsuki_map` | `akatsuki map` | `target`, `depth`, `direction` |
+| `akatsuki_contract` | `akatsuki contract` | `note` (or `target`, `path`) |
+| `akatsuki_blast` | `akatsuki blast` | `target` (or `note`, `path`) |
+| `akatsuki_map` | `akatsuki map` | `target` (or `note`, `path`), `depth`, `direction` |
 | `akatsuki_services` | `akatsuki services` | *(none)* |
 | `akatsuki_projects` | `akatsuki projects` | *(none)* |
 | `akatsuki_record_log` | `akatsuki log` | `project`, `summary`, `device` |
 | `akatsuki_write_note` | `akatsuki write` | `path`, `content`, `overwrite`, `raw` |
-| `akatsuki_get` | `akatsuki get` | `key` |
+| `akatsuki_get` | `akatsuki get` | `key` (or `keypath`) |
 | `akatsuki_query` | `akatsuki query` | `sql` |
 | `akatsuki_set` | `akatsuki set` | `note`, `key`, `value` |
 | `akatsuki_append_section` | `akatsuki append` | `note`, `heading`, `content` |
