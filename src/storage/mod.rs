@@ -233,12 +233,13 @@ pub fn contained_path(vault: &Path, rel_path: &str) -> Option<PathBuf> {
 
     // A symlink inside the vault must never resolve outside of it: containment is
     // enforced against the real target, not the lexical path.
+    let canon_vault = fs::canonicalize(&abs_vault).unwrap_or_else(|_| norm_vault.clone());
     let mut resolved = norm_vault.clone();
     for comp in components {
         resolved.push(comp);
         if fs::symlink_metadata(&resolved).is_ok_and(|m| m.file_type().is_symlink()) {
             resolved = fs::canonicalize(&resolved).ok()?;
-            if !resolved.starts_with(&norm_vault) {
+            if !resolved.starts_with(&norm_vault) && !resolved.starts_with(&canon_vault) {
                 return None;
             }
         }

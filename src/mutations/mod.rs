@@ -33,7 +33,10 @@ fn ensure_writable_note_path(
         if let std::path::Component::Normal(c) = comp {
             let s = c.to_string_lossy();
             if s == ".akatsuki" || s == ".akatsuki.lock" || s.starts_with(".akatsuki") {
-                bail!("Cannot mutate internal akatsuki metadata files: {}", rel_path);
+                bail!(
+                    "Cannot mutate internal akatsuki metadata files: {}",
+                    rel_path
+                );
             }
             break;
         }
@@ -53,7 +56,10 @@ fn ensure_writable_note_path(
             if let Some(std::path::Component::Normal(first)) = rel.components().next() {
                 let s = first.to_string_lossy();
                 if s == ".akatsuki" || s == ".akatsuki.lock" || s.starts_with(".akatsuki") {
-                    bail!("Cannot mutate internal akatsuki metadata files: {}", rel_path);
+                    bail!(
+                        "Cannot mutate internal akatsuki metadata files: {}",
+                        rel_path
+                    );
                 }
             }
         }

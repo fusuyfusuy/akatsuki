@@ -9,7 +9,10 @@ fn test_cli_version() {
     cmd.arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!("akatsuki {}", env!("CARGO_PKG_VERSION"))));
+        .stdout(predicate::str::contains(format!(
+            "akatsuki {}",
+            env!("CARGO_PKG_VERSION")
+        )));
 }
 
 #[test]

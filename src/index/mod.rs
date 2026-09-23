@@ -48,20 +48,30 @@ pub fn extract_target_stem(raw: &str) -> String {
 }
 
 /// Parses wikilinks from note body, extracting target note stems.
-/// Escaped wikilinks (`\[[x]]`) are ignored as documentation.
+/// Escaped wikilinks (`\[[x]]`) and wikilinks inside code fences are ignored as documentation.
 pub fn parse_wikilinks(body: &str) -> Vec<String> {
     use std::sync::OnceLock;
+    static FENCE_RE: OnceLock<Regex> = OnceLock::new();
+    static INLINE_RE: OnceLock<Regex> = OnceLock::new();
     static RE: OnceLock<Regex> = OnceLock::new();
+
+    let fence_re =
+        FENCE_RE.get_or_init(|| Regex::new(r"(?s)```.*?```").expect("valid fence regex"));
+    let inline_re = INLINE_RE.get_or_init(|| Regex::new(r"`[^`\n]+`").expect("valid inline regex"));
     let wikilink_re = RE.get_or_init(|| {
         Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]").expect("valid wikilink regex")
     });
+
+    let without_fences = fence_re.replace_all(body, "");
+    let clean = inline_re.replace_all(&without_fences, "");
+
     let mut targets = Vec::new();
-    for caps in wikilink_re.captures_iter(body) {
+    for caps in wikilink_re.captures_iter(&clean) {
         let whole = match caps.get(0) {
             Some(w) => w,
             None => continue,
         };
-        if whole.start() > 0 && body.as_bytes().get(whole.start() - 1) == Some(&b'\\') {
+        if whole.start() > 0 && clean.as_bytes().get(whole.start() - 1) == Some(&b'\\') {
             continue;
         }
         let clean_stem = extract_target_stem(&caps[1]);
@@ -91,7 +101,8 @@ pub fn open_cache_db(vault: &Path) -> Result<Connection> {
     let con = Connection::open(&db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
 
-    // Performance pragmas
+    // Performance pragmas & concurrency lock timeout
+    con.busy_timeout(std::time::Duration::from_secs(5))?;
     con.pragma_update(None, "journal_mode", "WAL")?;
     con.pragma_update(None, "synchronous", "NORMAL")?;
     con.pragma_update(None, "foreign_keys", "ON")?;
@@ -733,7 +744,8 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
             }
         }
         for (rel, file) in &current_map {
-            if !existing_vector_rels.contains(rel) && !vector_sources.iter().any(|(r, _)| r == rel) {
+            if !existing_vector_rels.contains(rel) && !vector_sources.iter().any(|(r, _)| r == rel)
+            {
                 vector_sources.push((rel.clone(), file.content.clone()));
             }
         }

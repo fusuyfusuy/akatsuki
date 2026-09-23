@@ -626,8 +626,12 @@ fn mutations_reject_internal_akatsuki_paths() {
         msg2
     );
 
-    let err3 = akatsuki::mutations::write_note(vault, "./.akatsuki/cache.db", "content", true, false);
-    assert!(err3.is_err(), "write_note to ./.akatsuki/cache.db should fail");
+    let err3 =
+        akatsuki::mutations::write_note(vault, "./.akatsuki/cache.db", "content", true, false);
+    assert!(
+        err3.is_err(),
+        "write_note to ./.akatsuki/cache.db should fail"
+    );
     let msg3 = format!("{}", err3.unwrap_err());
     assert!(
         msg3.contains("Cannot mutate internal akatsuki metadata files"),
@@ -637,7 +641,10 @@ fn mutations_reject_internal_akatsuki_paths() {
 
     // 2. set_note_property targeting .akatsuki/foo or .akatsuki.lock must fail
     let err4 = akatsuki::mutations::set_note_property(vault, ".akatsuki/foo", "title", "Bad");
-    assert!(err4.is_err(), "set_note_property to .akatsuki/foo should fail");
+    assert!(
+        err4.is_err(),
+        "set_note_property to .akatsuki/foo should fail"
+    );
     let msg4 = format!("{}", err4.unwrap_err());
     assert!(
         msg4.contains("Cannot mutate internal akatsuki metadata files"),
@@ -646,7 +653,10 @@ fn mutations_reject_internal_akatsuki_paths() {
     );
 
     let err5 = akatsuki::mutations::set_note_property(vault, ".akatsuki.lock", "title", "Bad");
-    assert!(err5.is_err(), "set_note_property to .akatsuki.lock should fail");
+    assert!(
+        err5.is_err(),
+        "set_note_property to .akatsuki.lock should fail"
+    );
     let msg5 = format!("{}", err5.unwrap_err());
     assert!(
         msg5.contains("Cannot mutate internal akatsuki metadata files"),
@@ -687,7 +697,10 @@ fn write_atomic_preserves_file_permissions() {
     #[cfg(not(unix))]
     {
         akatsuki::storage::write_atomic(&file_path, "#!/bin/sh\necho updated\n").unwrap();
-        assert_eq!(fs::read_to_string(&file_path).unwrap(), "#!/bin/sh\necho updated\n");
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "#!/bin/sh\necho updated\n"
+        );
     }
 }
 
@@ -761,7 +774,9 @@ After code blocks.
         .find(|c| c.breadcrumb == "Primary Section")
         .expect("Primary Section chunk exists");
     assert!(
-        primary_chunk.embed_text.contains("# comment that looks like a heading"),
+        primary_chunk
+            .embed_text
+            .contains("# comment that looks like a heading"),
         "code block comment should be retained inside section embed_text"
     );
     assert!(
@@ -795,7 +810,10 @@ fn reconcile_read_errors_do_not_delete_cache_records() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1, "Preserve entity must exist after initial reconcile");
+    assert_eq!(
+        count, 1,
+        "Preserve entity must exist after initial reconcile"
+    );
 
     // 2. Overwrite file with invalid UTF-8 bytes to simulate read failure
     let file_path = vault.path().join("40-Systems/Preserve.md");
@@ -805,7 +823,9 @@ fn reconcile_read_errors_do_not_delete_cache_records() {
     let res = run(vault.path(), &["reconcile"]).success();
     let stdout = String::from_utf8_lossy(&res.get_output().stdout);
     assert!(
-        stdout.contains("Preserve.md") || stdout.contains("read error") || stdout.contains("stream did not contain valid UTF-8"),
+        stdout.contains("Preserve.md")
+            || stdout.contains("read error")
+            || stdout.contains("stream did not contain valid UTF-8"),
         "reconcile output should mention the errored note: {}",
         stdout
     );
@@ -868,7 +888,8 @@ fn reconcile_detects_notes_missing_vectors() {
 
     if akatsuki::vectors::feature_enabled() {
         assert!(
-            stdout.contains("vectors: embedded") || stdout.contains("vectors: skipped 1 changed note"),
+            stdout.contains("vectors: embedded")
+                || stdout.contains("vectors: skipped 1 changed note"),
             "reconcile must attempt vector sync for notes missing from note_vectors: {}",
             stdout
         );
@@ -899,9 +920,19 @@ fn is_raw_path_recognizes_subdirectories_and_prevents_forced_md() {
         false,
         false,
     );
-    assert!(res.is_ok(), "write_note must succeed for raw path: {:?}", res);
-    assert!(vault.join("apps/Dockerfile").exists(), "apps/Dockerfile must exist");
-    assert!(!vault.join("apps/Dockerfile.md").exists(), "apps/Dockerfile.md must NOT exist");
+    assert!(
+        res.is_ok(),
+        "write_note must succeed for raw path: {:?}",
+        res
+    );
+    assert!(
+        vault.join("apps/Dockerfile").exists(),
+        "apps/Dockerfile must exist"
+    );
+    assert!(
+        !vault.join("apps/Dockerfile.md").exists(),
+        "apps/Dockerfile.md must NOT exist"
+    );
 
     // Also verify via MCP akatsuki_write_note
     let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"akatsuki_write_note","arguments":{"path":"20-Projects/app/Caddyfile","content":"localhost { respond OK }"}}}"#;
@@ -914,8 +945,14 @@ fn is_raw_path_recognizes_subdirectories_and_prevents_forced_md() {
         .success()
         .stdout(predicate::str::contains("\"isError\":false"));
 
-    assert!(vault.join("20-Projects/app/Caddyfile").exists(), "20-Projects/app/Caddyfile must exist");
-    assert!(!vault.join("20-Projects/app/Caddyfile.md").exists(), "20-Projects/app/Caddyfile.md must NOT exist");
+    assert!(
+        vault.join("20-Projects/app/Caddyfile").exists(),
+        "20-Projects/app/Caddyfile must exist"
+    );
+    assert!(
+        !vault.join("20-Projects/app/Caddyfile.md").exists(),
+        "20-Projects/app/Caddyfile.md must NOT exist"
+    );
 }
 
 /// MCP tool definitions in `get_tool_definitions()` expose parameter aliases.
@@ -933,36 +970,80 @@ fn mcp_tool_definitions_expose_parameter_aliases() {
     // akatsuki_read must expose 'note', 'path', and 'target'
     let read_tool = find_tool("akatsuki_read");
     let read_props = read_tool["inputSchema"]["properties"].as_object().unwrap();
-    assert!(read_props.contains_key("note"), "akatsuki_read must have 'note'");
-    assert!(read_props.contains_key("path"), "akatsuki_read must have 'path'");
-    assert!(read_props.contains_key("target"), "akatsuki_read must have 'target'");
+    assert!(
+        read_props.contains_key("note"),
+        "akatsuki_read must have 'note'"
+    );
+    assert!(
+        read_props.contains_key("path"),
+        "akatsuki_read must have 'path'"
+    );
+    assert!(
+        read_props.contains_key("target"),
+        "akatsuki_read must have 'target'"
+    );
 
     // akatsuki_test must expose 'note' and 'target'
     let test_tool = find_tool("akatsuki_test");
     let test_props = test_tool["inputSchema"]["properties"].as_object().unwrap();
-    assert!(test_props.contains_key("note"), "akatsuki_test must have 'note'");
-    assert!(test_props.contains_key("target"), "akatsuki_test must have 'target'");
+    assert!(
+        test_props.contains_key("note"),
+        "akatsuki_test must have 'note'"
+    );
+    assert!(
+        test_props.contains_key("target"),
+        "akatsuki_test must have 'target'"
+    );
 
     // akatsuki_map must expose 'target', 'note', and 'path'
     let map_tool = find_tool("akatsuki_map");
     let map_props = map_tool["inputSchema"]["properties"].as_object().unwrap();
-    assert!(map_props.contains_key("target"), "akatsuki_map must have 'target'");
-    assert!(map_props.contains_key("note"), "akatsuki_map must have 'note'");
-    assert!(map_props.contains_key("path"), "akatsuki_map must have 'path'");
+    assert!(
+        map_props.contains_key("target"),
+        "akatsuki_map must have 'target'"
+    );
+    assert!(
+        map_props.contains_key("note"),
+        "akatsuki_map must have 'note'"
+    );
+    assert!(
+        map_props.contains_key("path"),
+        "akatsuki_map must have 'path'"
+    );
 
     // akatsuki_contract must expose 'note', 'target', and 'path'
     let contract_tool = find_tool("akatsuki_contract");
-    let contract_props = contract_tool["inputSchema"]["properties"].as_object().unwrap();
-    assert!(contract_props.contains_key("note"), "akatsuki_contract must have 'note'");
-    assert!(contract_props.contains_key("target"), "akatsuki_contract must have 'target'");
-    assert!(contract_props.contains_key("path"), "akatsuki_contract must have 'path'");
+    let contract_props = contract_tool["inputSchema"]["properties"]
+        .as_object()
+        .unwrap();
+    assert!(
+        contract_props.contains_key("note"),
+        "akatsuki_contract must have 'note'"
+    );
+    assert!(
+        contract_props.contains_key("target"),
+        "akatsuki_contract must have 'target'"
+    );
+    assert!(
+        contract_props.contains_key("path"),
+        "akatsuki_contract must have 'path'"
+    );
 
     // akatsuki_blast must expose 'target', 'note', and 'path'
     let blast_tool = find_tool("akatsuki_blast");
     let blast_props = blast_tool["inputSchema"]["properties"].as_object().unwrap();
-    assert!(blast_props.contains_key("target"), "akatsuki_blast must have 'target'");
-    assert!(blast_props.contains_key("note"), "akatsuki_blast must have 'note'");
-    assert!(blast_props.contains_key("path"), "akatsuki_blast must have 'path'");
+    assert!(
+        blast_props.contains_key("target"),
+        "akatsuki_blast must have 'target'"
+    );
+    assert!(
+        blast_props.contains_key("note"),
+        "akatsuki_blast must have 'note'"
+    );
+    assert!(
+        blast_props.contains_key("path"),
+        "akatsuki_blast must have 'path'"
+    );
 
     // Also verify via MCP JSON-RPC tools/list
     let vault = tempdir().unwrap();
@@ -1006,3 +1087,36 @@ fn run_invariant_caps_output_buffer_at_2mb() {
     );
 }
 
+/// Frontmatter auto-quoting must not quote flow mappings or flow sequences containing colons.
+#[test]
+fn quote_colon_scalars_preserves_flow_mappings_and_arrays() {
+    let dir_handle = tempdir().unwrap();
+    let projects = dir_handle.path().join("20-Projects");
+    fs::create_dir_all(&projects).unwrap();
+
+    let note_content = "---\ntitle: Flow Test\ndate: 2026-09-23\ntype: project\nsummary: Test note\nstatus: live\nflow_map: { key: value, port: 8080 }\nports: [\"80: 8080\", \"443: 8443\"]\n---\n# Flow Test\n";
+    let note_path = projects.join("flow-test.md");
+    fs::write(&note_path, note_content).unwrap();
+
+    run(dir_handle.path(), &["reconcile"]).success();
+
+    let after = fs::read_to_string(&note_path).unwrap();
+    assert!(
+        after.contains("flow_map: { key: value, port: 8080 }"),
+        "flow mapping must remain unquoted, but got:\n{}",
+        after
+    );
+    assert!(
+        after.contains("ports: [\"80: 8080\", \"443: 8443\"]"),
+        "flow array must remain unquoted, but got:\n{}",
+        after
+    );
+}
+
+/// `parse_wikilinks` must ignore wikilinks inside markdown code fences.
+#[test]
+fn parse_wikilinks_ignores_code_fences() {
+    let body = "# Example\n\n```markdown\nHere is an example link: [[PhantomDep]]\n```\n\nHere is a real link: [[RealDep]].";
+    let links = akatsuki::index::parse_wikilinks(body);
+    assert_eq!(links, vec!["RealDep".to_string()]);
+}

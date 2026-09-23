@@ -480,7 +480,10 @@ fn quote_colon_scalars(text: &str, rel: &str, actions: &mut Vec<String>) -> Opti
                 let value = raw_value.trim();
                 let already_quoted = (value.starts_with('"') && value.ends_with('"'))
                     || (value.starts_with('\'') && value.ends_with('\''));
-                if value.contains(": ") && !already_quoted {
+                let is_flow_mapping = value.starts_with('{') && value.ends_with('}');
+                let is_flow_sequence = value.starts_with('[') && value.ends_with(']');
+                if value.contains(": ") && !already_quoted && !is_flow_mapping && !is_flow_sequence
+                {
                     let indent = &body[..body.len() - body.trim_start().len()];
                     rewritten.push_str(&format!(
                         "{indent}{key}: \"{}\"{terminator}",
@@ -684,9 +687,10 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
 
+    let script = format!("set -eo pipefail;\n{}", command);
     let spawn = Command::new("bash")
         .arg("-c")
-        .arg(command)
+        .arg(&script)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
