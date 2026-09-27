@@ -1,65 +1,62 @@
 ---
-scope: "cli_core_mcp"
-score: 8.6
-status: "MINOR"
+scope: "Scope 4: CLI Interface & MCP Server Gateway"
+score: 9.5
+status: "EXEMPLARY"
 critical_findings: 0
-invariant_breaches:
-  - "CLI Commands::Lint and Commands::Verify return exit code 0 when --json is specified on failure (violates SKILL.md exit code contract)"
+invariant_breaches: []
 ---
 
-# Scope Audit: CLI Interface & JSON-RPC MCP Daemon (Akatsuki v0.2.0)
+# Scope 4 Audit: CLI Interface & MCP Server Gateway
 
 ## 1. Executive Summary
-- **Health Score**: 8.6 / 10.0 (MINOR).
-- **Core Substrate**: Native Clap v4 CLI dispatcher and JSON-RPC 2.0 stdio MCP daemon exposing 20 architectural knowledge tools.
-- **Verdict**: The CLI and MCP adapters demonstrate solid engineering: clean panic isolation (`catch_unwind`), strict notification ignoring (no responses to id-less frames), resilient multi-tier vault discovery, and effective 1.6 KB compact search formatting preventing agent spill traps. However, an exit code contract breach in `lint --json` and `verify --json` masks failures in automation, MCP parameter type coercion fails on non-string scalars in `akatsuki_set`, and several tool schemas omit documented arguments (`budget`, `raw`).
+- **Health Score**: 9.5 / 10.0 (EXEMPLARY).
+- **Substrate**: Native Clap v4 CLI dispatcher ([`src/cli/mod.rs:20-642`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L20-L642)) and JSON-RPC 2.0 stdio MCP server ([`src/mcp/mod.rs:21-556`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L21-L556)) exposing 20 architectural knowledge tools.
+- **Verdict**: The CLI interface and MCP daemon exhibit exceptional structural rigor. Prior invariant breaches—including exit code 0 masking under `--json` in `lint` and `verify`, uncoerced scalar values in `akatsuki_set`, unvalidated enums in `Map.direction`, and schema parameter omissions—have been comprehensively remediated and verified by regression tests (`tests/regression_tests.rs:1-603`). Panic containment (`catch_unwind`), stdio JSON-RPC notification compliance, and token spill protection (< 2.5 KB responses) are robust. Zero critical findings or invariant breaches remain.
 
 ---
 
-## 2. Invariant Breaches
-
-1. **CLI `lint --json` and `verify --json` Return Exit Code 0 on Failure**:
-   - **Contract**: [`SKILL.md#L84`](file:///home/devhax/projects/fusuyfusuy/akatsuki/SKILL.md#L84) defines `akatsuki lint ∧ akatsuki verify == exit 0` as the integrity gate, and [`SKILL.md#L205-L206`](file:///home/devhax/projects/fusuyfusuy/akatsuki/SKILL.md#L205-L206) specifies exit code `1` for schema lint errors and broken links.
-   - **Breach**: In [`src/cli/mod.rs#L531-L541`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L531-L541) (`Commands::Lint`) and [`src/cli/mod.rs#L545-L561`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L545-L561) (`Commands::Verify`), `std::process::exit(1)` is sequestered inside the `else` (non-JSON) branch. When `--json` is supplied, both commands serialize the report and return `Ok(())`, exiting `0` even if `rep.passed == false`. In contrast, [`Commands::Test` in src/cli/mod.rs#L599-L601](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L599-L601) correctly positions `if rep.failed > 0 { std::process::exit(1); }` outside the formatting branch. Automated CI/CD gates running `akatsuki lint --json` falsely pass green on invalid vaults.
+## 2. Verification of Prior Remediations
+1. **Exit Code 1 Integrity on `--json` Failure**:
+   - `std::process::exit(1)` is now positioned after both text and JSON serialization in `Commands::Lint` ([`src/cli/mod.rs:541-543`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L541-L543)) and `Commands::Verify` ([`src/cli/mod.rs:563-565`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L563-L565)). CI automation running `--json` correctly fails with exit code 1 on schema/link violations (asserted in [`tests/regression_tests.rs:182-193`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L182-L193)).
+2. **Native Scalar Coercion in `akatsuki_set`**:
+   - [`src/mcp/mod.rs:447-455`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L447-L455) parses `Value::String`, `Value::Number`, `Value::Bool`, `Value::Array`, and `Value::Object`, serializing non-string inputs rather than discarding them to empty strings (asserted in [`tests/regression_tests.rs:299-325`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L299-L325)).
+3. **Clap Enum Validation for `Map.direction`**:
+   - [`src/cli/mod.rs:86-87`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L86-L87) enforces `value_parser = ["both", "down", "up"]`, causing invalid directions to cleanly exit 2 via Clap before execution (asserted in [`tests/regression_tests.rs:492-508`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L492-L508)).
+4. **Tool Schema Alignment**:
+   - `budget` is formally declared in `akatsuki_read` ([`src/mcp/mod.rs:584`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L584)); `raw` is declared in `akatsuki_write_note` ([`src/mcp/mod.rs:663`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L663)).
+5. **Bidirectional Parameter Aliasing**:
+   - `akatsuki_contract`, `akatsuki_blast`, and `akatsuki_map` accept `note`, `target`, and `path` interchangeably ([`src/mcp/mod.rs:218-223, 239-244, 260-265`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L218-L223); asserted in [`tests/regression_tests.rs:512-566`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L512-L566)).
 
 ---
 
-## 3. Dimensional Findings
+## 3. Dimensional Audit Findings
 
 ### A. Correctness
-- **MCP Tool Schema Omissions** ([`src/mcp/mod.rs#L544-L555`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L544-L555), [`L621-L632`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L621-L632)):
-  In `get_tool_definitions()`, `akatsuki_read` declares `note`, `path`, and `section`, but omits `budget`, despite `dispatch_tool` extracting it ([`src/mcp/mod.rs#L189`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L189)) and [`SKILL.md#L157`](file:///home/devhax/projects/fusuyfusuy/akatsuki/SKILL.md#L157) advertising it. Similarly, `akatsuki_write_note` declares `path`, `content`, and `overwrite`, but omits `raw`, despite `dispatch_tool` extracting `raw` ([`src/mcp/mod.rs#L347`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L347)) and [`SKILL.md#L164`](file:///home/devhax/projects/fusuyfusuy/akatsuki/SKILL.md#L164) documenting it.
-- **Unvalidated CLI Enum on `Map.direction`** ([`src/cli/mod.rs#L86-L88`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L86-L88)):
-  `Search.mode` validates allowed modes via Clap's `value_parser = ["hybrid", "bm25", "vector"]` (exiting `2` on invalid input). `Map.direction` has no `value_parser`; invalid arguments (e.g. `--direction sideways`) silently fall back to `"both"` in [`src/graph/mod.rs#L449-L453`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/graph/mod.rs#L449-L453) instead of raising exit code `2`.
-- **JSON-RPC 2.0 Protocol Compliance** ([`src/mcp/mod.rs#L41-L137`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L41-L137)):
-  Exemplary method routing for `initialize`, `tools/list`, `tools/call`, and `ping`. Parse errors properly emit error `-32700` with `id: null`. Tool registration contains exactly 20 tools with 1:1 match parity in `dispatch_tool`.
+- **Clap Parsing & Flag Handling**: Global `--vault` option ([`src/cli/mod.rs:23-24`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L23-L24)) operates consistently across all 22 subcommands. `allow_hyphen_values = true` on `Write`, `Replace`, and `Append` ([`src/cli/mod.rs:135, 150, 172`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L135)) allows raw markdown bullet lists (`- item`) without triggering argument syntax errors.
+- **Exit Code Conventions**: Syntax errors and invalid enum arguments trigger exit code 2. Verification/lint failures trigger exit code 1. Runtime failures bubble through `anyhow::Result` to exit 1 ([`src/main.rs:6-9`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/main.rs#L6-L9)). All human/json diagnostic outputs route to stdout while error traces route to stderr.
+- **JSON-RPC 2.0 Compliance**: Handlers for `initialize`, `tools/list`, `tools/call`, and `ping` conform to MCP protocol version `2024-11-05` ([`src/mcp/mod.rs:65-127`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L65-L127)). Id-less notifications are strictly dropped without generating replies ([`src/mcp/mod.rs:60-62`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L60-L62); [`tests/regression_tests.rs:144-159`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L144-L159)). Parse errors emit code `-32700` and unknown methods emit `-32601`.
+- **Schema Parity**: Exactly 20 tools declared in `get_tool_definitions()` ([`src/mcp/mod.rs:558-786`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L558-L786)) map 1:1 to `dispatch_tool` arms ([`src/mcp/mod.rs:142-555`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L142-L555)).
 
 ### B. Robustness
-- **Type Coercion Dropout in `akatsuki_set`** ([`src/mcp/mod.rs#L425`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L425)):
-  `let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");` assumes string input. If a host sends native JSON booleans, numbers, or arrays (e.g. `{"value": 42}` or `{"value": true}`), `v.as_str()` returns `None`, silently wiping the target property to `""`. MCP schema ([`src/mcp/mod.rs#L690`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L690)) explicitly documents accepting numbers, booleans, and arrays; coercion must stringify non-string values before passing to `set_note_property`.
-- **Panic Isolation & Notification Safety** ([`src/mcp/mod.rs#L59-L62`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L59-L62), [`L94-L107`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L94-L107)):
-  `catch_unwind` wraps `dispatch_tool`, safely returning `{ content: [...], isError: true }` on panics and preserving daemon life. Notifications without `id` are silently skipped (asserted by regression suite [`tests/regression_tests.rs#L144-L159`](file:///home/devhax/projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L144-L159)). Loose booleans (`"true"`, `"1"`, `"yes"`) in `arg_bool` prevent assertion leakage in dry-run mode ([`src/mcp/mod.rs#L756-L766`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L756-L766)).
+- **Panic Isolation**: Tool execution in `tools/call` is enclosed in `std::panic::catch_unwind(AssertUnwindSafe(...))` ([`src/mcp/mod.rs:95-107`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L95-L107)). Panicking handlers return `{ "content": [...], "isError": true }` with `panic_message` ([`src/mcp/mod.rs:812-820`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L812-L820)) without terminating the daemon.
+- **Stdin EOF & Stream Resilience**: Stdin line loop terminates cleanly on EOF ([`src/mcp/mod.rs:30-34`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L30-L34)). Malformed JSON frames emit standard `-32700` responses and continue loop execution without crashing ([`src/mcp/mod.rs:43-52`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L43-L52)).
+- **Token Spill Trap Prevention**: Compact search hit formatting (`format_hits_compact`), UTF-8 multibyte truncation ([`tests/regression_tests.rs:31-51`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L31-51)), and `MCP_DEFAULT_LIMIT = 5` ([`src/constants.rs:36`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/constants.rs#L36)) restrict search responses to ~1.6 KB (under Antigravity 4000-byte spill trap). `akatsuki_read` enforces token budgets via `apply_token_budget` ([`src/storage/mod.rs:629-655`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L629-L655)), preserving frontmatter while truncating body text.
 
-### C. Usability & Spill Prevention
-- **Spill Trap Prevention (< 4000 Bytes)** ([`src/constants.rs#L36-L37`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/constants.rs#L36-L37), [`src/mcp/mod.rs#L147`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L147)):
-  MCP default limit of 5 combined with `format_hits_compact` and 160-char ellipsized snippets bounds typical search responses to ~1.6 KB, comfortably below the Antigravity 4000-byte tool spill trap. CLI defaults to 10 hits (`CLI_DEFAULT_LIMIT`).
-- **Terminal vs JSON Duality** ([`src/cli/mod.rs#L249-L635`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L249-L635)):
-  All 20 functional CLI commands provide structured `--json` outputs. Human terminal modes output rich domain representations (compact hits, token-dense YAML contracts, emoji blast trees, ASCII graph maps, NDJSON queries).
+### C. Performance
+- **Stdio I/O Buffering**: `stdin.lock().lines()` provides efficient buffered input consumption. Responses are formatted into single strings and flushed immediately via `stdout.flush()?` ([`src/mcp/mod.rs:50, 136`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L50)), preventing pipe deadlocks.
+- **Database & Re-Indexing Invariant**: Tool calls requiring database state invoke `open_synced_db(vault)` ([`src/index/mod.rs:110-114`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/index/mod.rs#L110-L114)), which opens SQLite and executes `sync_vault_index` on every invocation ([`src/mcp/mod.rs:287, 319`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L287)). While this guarantees zero stale reads across process boundaries, in a persistent MCP daemon with hundreds of notes, scanning directories and computing BLAKE3 hashes per tool call adds redundant I/O.
 
-### D. Boundary Cleanliness
-- **Asymmetric Parameter Aliasing in Graph/Contract Tools** ([`src/mcp/mod.rs#L218`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L218), [`L234`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L234), [`L250`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L250)):
-  While `akatsuki_read` aliases `note`, `path`, and `target` ([`src/mcp/mod.rs#L174-L177`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L174-L177)) and `akatsuki_test` aliases `note` and `target`, `akatsuki_contract` strictly requires `note` (rejects `target`), and `akatsuki_blast` / `akatsuki_map` strictly require `target` (rejects `note`). Unifying `target` and `note` across contract and graph tools prevents common LLM invocation failures.
-- **Vault Discovery & Path Resolution** ([`src/storage/mod.rs#L71-L148`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L71-L148), [`src/cli/mod.rs#L23-L24`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L23-L24)):
-  Global `--vault` attribute operates cleanly before and after subcommands. Fallback ladder resolves CLI arg -> `$AKATSUKI_VAULT` (with `shellexpand`) -> `~/.config/knowledge-base/env` -> ancestor search -> known defaults -> `.`. `contained_path` ([`src/storage/mod.rs#L192-L236`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L192-L236)) enforces containment against traversal attacks.
+### D. Security
+- **Path Traversal Protection**: Note resolution and mutations enforce `contained_path` ([`src/storage/mod.rs:192-236`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L192-L236)), strictly blocking directory traversal attacks ([`tests/regression_tests.rs:76-84, 266-272`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L76-L84)).
+- **Read-Only SQL Invariants**: `execute_sql_query` strictly rejects mutating statements and enforces `stmt.readonly()` ([`src/search/mod.rs:377-393`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/search/mod.rs#L377-L393)), blocking mutating CTEs and schema tampering ([`tests/regression_tests.rs:232-261`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L232-L261)).
+- **Invariant Execution Containment**: `akatsuki_test` / `Commands::Test` executes `bash:verify` commands under process groups with strict timeouts (`invariant_timeout()`, default 10s) and asynchronous pipe-draining threads ([`src/verify/mod.rs:687-725`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L687-L725)), preventing hanging processes ([`tests/regression_tests.rs:89-111, 330-353`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L89-L111)).
+- **Information Exposure**: Diagnostic errors return cleanly sanitized messages; sensitive system paths and credentials are not exposed in stdout/stderr error streams.
 
 ---
 
-## 4. Prioritized Actionable Remediations
+## 4. Minor Residual Polish Items
 
-| Priority | Component | Remediation |
-| :--- | :--- | :--- |
-| **P0 (Critical)** | `Commands::Lint` & `Commands::Verify` | Move `if !rep.passed { std::process::exit(1); }` outside the `if json { ... } else { ... }` block in [`src/cli/mod.rs#L540`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L540) and [`L560`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L560) to guarantee exit code `1` on failure in `--json` mode. |
-| **P1 (High)** | `akatsuki_set` MCP Dispatch | Support non-string JSON values in [`src/mcp/mod.rs#L425`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L425): coerce `Value::Number`, `Value::Bool`, and structured JSON into string representations before passing to `set_note_property`. |
-| **P1 (High)** | MCP Tool Definitions | Add missing `budget` property to `akatsuki_read` ([`src/mcp/mod.rs#L548`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L548)) and missing `raw` boolean property to `akatsuki_write_note` ([`src/mcp/mod.rs#L625`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L625)). |
-| **P2 (Medium)** | `Commands::Map` Clap Parser | Add `#[arg(long, default_value = "both", value_parser = ["both", "down", "up"])]` to `direction` in [`src/cli/mod.rs#L86-L88`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L86-L88) to enforce valid arguments with exit code `2`. |
-| **P2 (Medium)** | Parameter Aliasing | In [`src/mcp/mod.rs#L218,L234,L250`](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L218), accept `note` or `target` interchangeably across `akatsuki_contract`, `akatsuki_blast`, and `akatsuki_map`. |
+| Priority | Component | Item & Location | Rationale |
+| :--- | :--- | :--- | :--- |
+| **Low** | Schema Aliasing | Declare `target` in `akatsuki_read` ([`src/mcp/mod.rs:580`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L580)) & `akatsuki_test` ([`src/mcp/mod.rs:689`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L689)); declare `path` in `akatsuki_map` ([`src/mcp/mod.rs:617`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L617)). | Handler code supports these aliases; documenting them in JSON schema ensures client LLM discovery. |
+| **Low** | Daemon DB Cache | Cache SQLite `Connection` and debounce vault hash scans in `run_mcp_server` ([`src/mcp/mod.rs:21`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L21)). | Reduces repetitive disk scans during rapid multi-turn MCP tool invocation bursts. |

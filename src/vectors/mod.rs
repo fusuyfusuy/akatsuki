@@ -129,26 +129,67 @@ fn chunk_parsed(rel_path: &str, fm: &Value, body: &str) -> Vec<NoteChunk> {
         header.push_str(&format!("\n[Tags: {}]", tags));
     }
 
-    let heading_re = Regex::new(r"(?m)^(#{1,4})[ \t]+(.+)$").expect("static heading regex");
-    let headings: Vec<regex::Captures> = heading_re.captures_iter(body).collect();
+    let heading_re = Regex::new(r"^(#{1,4})[ \t]+(.+)$").expect("static heading regex");
+
+    struct HeadingMatch {
+        start: usize,
+        body_start: usize,
+        title: String,
+    }
+
+    let mut in_fence: Option<char> = None;
+    let mut headings: Vec<HeadingMatch> = Vec::new();
+    let mut offset = 0usize;
+
+    for line_str in body.split_inclusive('\n') {
+        let line = line_str.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim_start();
+
+        if let Some(fence_char) = in_fence {
+            let fence_prefix = if fence_char == '`' { "```" } else { "~~~" };
+            if trimmed.starts_with(fence_prefix) {
+                in_fence = None;
+            }
+            offset += line_str.len();
+            continue;
+        }
+
+        if trimmed.starts_with("```") {
+            in_fence = Some('`');
+            offset += line_str.len();
+            continue;
+        } else if trimmed.starts_with("~~~") {
+            in_fence = Some('~');
+            offset += line_str.len();
+            continue;
+        }
+
+        if let Some(caps) = heading_re.captures(line) {
+            let title = caps.get(2).expect("capture 2").as_str().trim().to_string();
+            headings.push(HeadingMatch {
+                start: offset,
+                body_start: offset + line_str.len(),
+                title,
+            });
+        }
+        offset += line_str.len();
+    }
 
     let mut sections: Vec<(String, String)> = Vec::new();
     if headings.is_empty() {
         sections.push((String::new(), body.trim().to_string()));
     } else {
-        let first_start = headings[0].get(0).expect("capture 0").start();
+        let first_start = headings[0].start;
         let preamble = body[..first_start].trim();
         if !preamble.is_empty() {
             sections.push(("Overview".to_string(), preamble.to_string()));
         }
-        for (index, caps) in headings.iter().enumerate() {
-            let whole = caps.get(0).expect("capture 0");
-            let title = caps.get(2).expect("capture 2").as_str().trim().to_string();
+        for (index, h) in headings.iter().enumerate() {
             let end = headings
                 .get(index + 1)
-                .map(|next| next.get(0).expect("capture 0").start())
+                .map(|next| next.start)
                 .unwrap_or(body.len());
-            sections.push((title, body[whole.end()..end].trim().to_string()));
+            sections.push((h.title.clone(), body[h.body_start..end].trim().to_string()));
         }
     }
 
@@ -432,9 +473,19 @@ pub fn sync_note_vectors(
     con: &mut rusqlite::Connection,
     notes: &[(String, String)],
 ) -> Result<String> {
+    let tx = con.transaction()?;
+    let report = sync_note_vectors_tx(&tx, notes)?;
+    tx.commit()?;
+    Ok(report)
+}
+
+pub fn sync_note_vectors_tx(
+    tx: &rusqlite::Transaction,
+    notes: &[(String, String)],
+) -> Result<String> {
     #[cfg(not(feature = "vectors"))]
     {
-        let _ = con;
+        let _ = tx;
         Ok(format!(
             "disabled: this binary lacks the `vectors` feature ({} changed note(s) left unembedded)",
             notes.len()
@@ -455,7 +506,6 @@ pub fn sync_note_vectors(
 
         let embedder = candle_engine::CandleEmbedder::load()?;
         let mut embedded = 0usize;
-        let tx = con.transaction()?;
 
         for (rel_path, content) in notes {
             let chunks = chunk_note(rel_path, content)?;
@@ -497,7 +547,6 @@ pub fn sync_note_vectors(
             }
         }
 
-        tx.commit()?;
         Ok(format!(
             "embedded {} chunk(s) across {} changed note(s)",
             embedded,

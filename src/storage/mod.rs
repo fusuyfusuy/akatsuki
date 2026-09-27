@@ -36,9 +36,14 @@ impl VaultLock {
 
 pub fn is_raw_path(rel_path: &str) -> bool {
     let lower = rel_path.to_lowercase();
-    if lower == "dockerfile"
-        || lower == "caddyfile"
-        || lower == "makefile"
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if file_name == "dockerfile"
+        || file_name == "caddyfile"
+        || file_name == "makefile"
         || lower.ends_with(".example")
     {
         return true;
@@ -242,7 +247,7 @@ pub fn contained_path(vault: &Path, rel_path: &str) -> Option<PathBuf> {
     Some(resolved)
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for comp in path.components() {
         match comp {
@@ -341,6 +346,21 @@ pub fn write_atomic(target: &Path, content: &str) -> Result<()> {
     let tmp_path = target.with_extension(format!("tmp.{}.{}", pid, rand_id));
 
     fs::write(&tmp_path, content)?;
+
+    if target.exists() {
+        let perms = match fs::metadata(target) {
+            Ok(m) => m.permissions(),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = fs::set_permissions(&tmp_path, perms) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+    }
+
     fs::rename(&tmp_path, target).with_context(|| {
         let _ = fs::remove_file(&tmp_path);
         format!(

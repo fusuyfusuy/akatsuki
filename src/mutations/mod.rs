@@ -21,6 +21,46 @@ use crate::storage::{
 /// The project that owns vault-maintenance entries in the daily audit trail.
 const AUDIT_PROJECT: &str = "akatsuki";
 
+/// Asserts that a note path does not target internal engine metadata files (.akatsuki, .akatsuki.lock).
+fn ensure_writable_note_path(
+    vault: &Path,
+    rel_path: &str,
+    resolved_path: Option<&Path>,
+) -> Result<()> {
+    let trimmed = rel_path.trim();
+    let p = Path::new(trimmed);
+    for comp in p.components() {
+        if let std::path::Component::Normal(c) = comp {
+            let s = c.to_string_lossy();
+            if s == ".akatsuki" || s == ".akatsuki.lock" || s.starts_with(".akatsuki") {
+                bail!("Cannot mutate internal akatsuki metadata files: {}", rel_path);
+            }
+            break;
+        }
+    }
+
+    if let Some(target) = resolved_path {
+        let abs_vault = if vault.is_relative() {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(vault)
+        } else {
+            vault.to_path_buf()
+        };
+        let norm_vault = crate::storage::normalize_path(&abs_vault);
+        let norm_target = crate::storage::normalize_path(target);
+        if let Ok(rel) = norm_target.strip_prefix(&norm_vault) {
+            if let Some(std::path::Component::Normal(first)) = rel.components().next() {
+                let s = first.to_string_lossy();
+                if s == ".akatsuki" || s == ".akatsuki.lock" || s.starts_with(".akatsuki") {
+                    bail!("Cannot mutate internal akatsuki metadata files: {}", rel_path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn write_note(
     vault: &Path,
     rel_path: &str,
@@ -28,6 +68,7 @@ pub fn write_note(
     overwrite: bool,
     raw: bool,
 ) -> Result<PathBuf> {
+    ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
     let trimmed = rel_path.trim();
@@ -45,6 +86,7 @@ pub fn write_note(
 
     let target_path = contained_path(vault, &target_rel)
         .context("Path traversal outside vault boundary is forbidden")?;
+    ensure_writable_note_path(vault, rel_path, Some(&target_path))?;
 
     if target_path.exists() && !overwrite {
         bail!(
@@ -149,10 +191,12 @@ pub fn replace_section_in_note(
     heading: &str,
     new_section_content: &str,
 ) -> Result<()> {
+    ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
     let note_path = resolve_note_file(vault, rel_path)
         .with_context(|| format!("Note '{}' not found in vault", rel_path))?;
+    ensure_writable_note_path(vault, rel_path, Some(&note_path))?;
 
     let text = fs::read_to_string(&note_path)?;
     let (mut fm, body) = parse_frontmatter(&text)
@@ -187,10 +231,12 @@ pub fn replace_section_in_note(
 }
 
 pub fn set_note_property(vault: &Path, rel_path: &str, keypath: &str, value: &str) -> Result<()> {
+    ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
     let note_path = resolve_note_file(vault, rel_path)
         .with_context(|| format!("Note '{}' not found in vault", rel_path))?;
+    ensure_writable_note_path(vault, rel_path, Some(&note_path))?;
 
     let text = fs::read_to_string(&note_path)?;
     let (mut fm, body) = parse_frontmatter(&text)
@@ -212,10 +258,14 @@ pub fn append_section_in_note(
     heading: &str,
     content_to_append: &str,
 ) -> Result<()> {
+    ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
     let note_path = match resolve_note_file(vault, rel_path) {
-        Some(path) => path,
+        Some(path) => {
+            ensure_writable_note_path(vault, rel_path, Some(&path))?;
+            path
+        }
         None => create_note(vault, rel_path, heading)?,
     };
 
@@ -295,6 +345,7 @@ pub fn read_daily_note(vault: &Path, date_opt: Option<&str>) -> Result<(String, 
 /// Creates a note that does not exist yet, seeded with its frontmatter and the
 /// requested heading. Caller holds the vault lock.
 fn create_note(vault: &Path, rel_path: &str, heading: &str) -> Result<PathBuf> {
+    ensure_writable_note_path(vault, rel_path, None)?;
     let rel = if rel_path.trim().ends_with(".md") {
         rel_path.trim().to_string()
     } else {
@@ -302,6 +353,7 @@ fn create_note(vault: &Path, rel_path: &str, heading: &str) -> Result<PathBuf> {
     };
     let target =
         contained_path(vault, &rel).with_context(|| format!("Path '{}' escapes the vault", rel))?;
+    ensure_writable_note_path(vault, rel_path, Some(&target))?;
 
     let seed = format!(
         "# {}\n\n{}\n",

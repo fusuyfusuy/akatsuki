@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -246,6 +246,7 @@ fn init_tables(con: &Connection) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct ScannedFile {
     rel_path: String,
     hash: String,
@@ -299,32 +300,55 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         .collect();
 
     // 3. Parallel Blake3 Merkle Scan via Rayon
-    let scanned_files: Vec<ScannedFile> = paths
+    enum ScanOutcome {
+        Ok(ScannedFile),
+        Err(String, String),
+    }
+
+    let scan_results: Vec<ScanOutcome> = paths
         .par_iter()
         .filter_map(|abs| {
             let rel = abs.strip_prefix(vault).ok()?.to_string_lossy().to_string();
-            let content = fs::read_to_string(abs).ok()?;
-            let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-            let size = content.len();
-
-            Some(ScannedFile {
-                rel_path: rel,
-                hash,
-                size,
-                content,
-            })
+            match fs::read_to_string(abs) {
+                Ok(content) => {
+                    let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+                    let size = content.len();
+                    Some(ScanOutcome::Ok(ScannedFile {
+                        rel_path: rel,
+                        hash,
+                        size,
+                        content,
+                    }))
+                }
+                Err(e) => Some(ScanOutcome::Err(rel, e.to_string())),
+            }
         })
         .collect();
 
     let mut current_map: HashMap<String, ScannedFile> = HashMap::new();
-    for f in scanned_files {
-        current_map.insert(f.rel_path.clone(), f);
+    let mut read_errors: HashMap<String, String> = HashMap::new();
+
+    for res in scan_results {
+        match res {
+            ScanOutcome::Ok(f) => {
+                current_map.insert(f.rel_path.clone(), f);
+            }
+            ScanOutcome::Err(rel, err) => {
+                read_errors.insert(rel, err);
+            }
+        }
     }
+
+    let mut parse_errors: Vec<String> = Vec::new();
+    for (rel, err) in &read_errors {
+        parse_errors.push(format!("'{}': read error: {}", rel, err));
+    }
+    parse_errors.sort();
 
     // 4. Calculate Diffs
     let mut to_delete = Vec::new();
     for rel in indexed_hashes.keys() {
-        if !current_map.contains_key(rel) {
+        if !current_map.contains_key(rel) && !read_errors.contains_key(rel) {
             to_delete.push(rel.clone());
         }
     }
@@ -332,14 +356,20 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
     let mut to_update = Vec::new();
     let mut unchanged_count = 0;
 
-    for (rel, file) in current_map {
-        match indexed_hashes.get(&rel) {
+    for (rel, file) in &current_map {
+        match indexed_hashes.get(rel) {
             Some(existing_hash) if existing_hash == &file.hash => {
                 unchanged_count += 1;
             }
             _ => {
-                to_update.push(file);
+                to_update.push(file.clone());
             }
+        }
+    }
+
+    for rel in read_errors.keys() {
+        if indexed_hashes.contains_key(rel) {
+            unchanged_count += 1;
         }
     }
 
@@ -350,10 +380,8 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         .filter(|f| !indexed_hashes.contains_key(&f.rel_path))
         .count();
     let total_count = unchanged_count + updated_count;
-    let mut parse_errors: Vec<String> = Vec::new();
 
     if !apply {
-        let mut parse_errors = Vec::new();
         for file in &to_update {
             if let Err(e) = parse_frontmatter(&file.content) {
                 parse_errors.push(format!("'{}': {}", file.rel_path, e));
@@ -370,14 +398,25 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
             duration_ms: t0.elapsed().as_secs_f64() * 1000.0,
         });
     }
-    if to_delete.is_empty() && to_update.is_empty() {
+
+    let mut missing_vectors = false;
+    if crate::vectors::feature_enabled() {
+        let mut stmt = con.prepare("SELECT DISTINCT rel_path FROM note_vectors")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let with_vecs: HashSet<String> = rows.flatten().collect();
+        if current_map.keys().any(|rel| !with_vecs.contains(rel)) {
+            missing_vectors = true;
+        }
+    }
+
+    if to_delete.is_empty() && to_update.is_empty() && !missing_vectors {
         return Ok(SyncReport {
             added: 0,
             updated: 0,
             deleted: 0,
             unchanged: unchanged_count,
             total: total_count,
-            parse_errors: Vec::new(),
+            parse_errors,
             vectors: None,
             duration_ms: t0.elapsed().as_secs_f64() * 1000.0,
         });
@@ -684,18 +723,33 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         }
     }
 
-    tx.commit()?;
+    if crate::vectors::feature_enabled() {
+        let mut existing_vector_rels: HashSet<String> = HashSet::new();
+        {
+            let mut stmt = tx.prepare("SELECT DISTINCT rel_path FROM note_vectors")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for r in rows.flatten() {
+                existing_vector_rels.insert(r);
+            }
+        }
+        for (rel, file) in &current_map {
+            if !existing_vector_rels.contains(rel) && !vector_sources.iter().any(|(r, _)| r == rel) {
+                vector_sources.push((rel.clone(), file.content.clone()));
+            }
+        }
+    }
+    vector_sources.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let vectors = crate::vectors::sync_note_vectors(con, &vector_sources)?;
+    let vectors = crate::vectors::sync_note_vectors_tx(&tx, &vector_sources)?;
 
-    let meta_tx = con.transaction()?;
     for file in &to_update {
-        meta_tx.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO file_meta (rel_path, blake3_hash, size, indexed_at) VALUES (?1, ?2, ?3, ?4)",
             params![&file.rel_path, file.hash, file.size as i64, &now_iso],
         )?;
     }
-    meta_tx.commit()?;
+
+    tx.commit()?;
 
     Ok(SyncReport {
         added: added_count,

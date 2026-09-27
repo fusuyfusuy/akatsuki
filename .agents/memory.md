@@ -1,7 +1,7 @@
 # Project Memory
 
 ## Active Epics & Scale
-- Scale: Native compiled Rust knowledge secretariat (akatsuki v0.2.0, ~4.5k LOC Rust across storage, index, search, vectors, graph, mutations, verify, mcp, cli).
+- Scale: Native compiled Rust knowledge secretariat (akatsuki v0.2.1, ~6k LOC Rust across storage, index, search, vectors, graph, mutations, verify, mcp, cli).
 - Architecture: Dual-layer Markdown Git source-of-truth with SQLite WAL projection (`.akatsuki/cache.db`, schema version 0.2.2 auto-rebuilt on mismatch), parallel Blake3 content-hash change detection via Rayon, optional pure-Rust Candle embeddings (`intfloat/multilingual-e5-small`) behind `--features vectors` fused with BM25 through RRF, and a native JSON-RPC 2.0 MCP stdio server with 20 tools.
 - Legacy Python implementation is retained under `python/` as a parity reference only; it is not built, installed, or executed.
 

@@ -555,7 +555,7 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
     }
 }
 
-fn get_tool_definitions() -> Vec<Value> {
+pub fn get_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "akatsuki_search",
@@ -580,6 +580,7 @@ fn get_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "note": { "type": "string", "description": "Note title, stem, or relative path (e.g. 'Dokploy API Guide', '40-Systems/Cluster-Topology.md')" },
                     "path": { "type": "string", "description": "Alias for note" },
+                    "target": { "type": "string", "description": "Alias for note" },
                     "section": { "type": "string", "description": "Optional section heading to extract" },
                     "budget": { "type": "integer", "description": "Optional character budget to truncate output" }
                 }
@@ -617,6 +618,7 @@ fn get_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "target": { "type": "string", "description": "Origin note stem or service name" },
                     "note": { "type": "string", "description": "Alias for target" },
+                    "path": { "type": "string", "description": "Alias for target" },
                     "depth": { "type": "integer", "default": 2, "description": "Traversal depth" },
                     "direction": { "type": "string", "enum": ["both", "down", "up"], "default": "both" }
                 }
@@ -688,6 +690,7 @@ fn get_tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "note": { "type": "string", "description": "Optional note filter" },
+                    "target": { "type": "string", "description": "Alias for note" },
                     "dry_run": { "type": "boolean", "default": false }
                 }
             }

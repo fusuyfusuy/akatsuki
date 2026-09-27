@@ -698,17 +698,17 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
         Err(e) => return (1, String::new(), format!("Failed to spawn bash: {}", e)),
     };
 
-    let stdout_handle = child.stdout.take().map(|mut pipe| {
+    let stdout_handle = child.stdout.take().map(|pipe| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
+            let _ = pipe.take(2 * 1024 * 1024).read_to_end(&mut buf);
             buf
         })
     });
-    let stderr_handle = child.stderr.take().map(|mut pipe| {
+    let stderr_handle = child.stderr.take().map(|pipe| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
+            let _ = pipe.take(2 * 1024 * 1024).read_to_end(&mut buf);
             buf
         })
     });
@@ -721,11 +721,17 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
             Ok(Some(_)) => break,
             Ok(None) => {}
             Err(e) => {
+                eprintln!("Failed to await invariant: {}", e);
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg(format!("-{}", child.id()))
+                    .status();
+                let _ = child.wait();
                 return (
                     1,
                     String::new(),
                     format!("Failed to await invariant: {}", e),
-                )
+                );
             }
         }
         if Instant::now() >= deadline {
