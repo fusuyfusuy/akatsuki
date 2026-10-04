@@ -38,7 +38,6 @@ fn ensure_writable_note_path(
                     rel_path
                 );
             }
-            break;
         }
     }
 
@@ -53,13 +52,15 @@ fn ensure_writable_note_path(
         let norm_vault = crate::storage::normalize_path(&abs_vault);
         let norm_target = crate::storage::normalize_path(target);
         if let Ok(rel) = norm_target.strip_prefix(&norm_vault) {
-            if let Some(std::path::Component::Normal(first)) = rel.components().next() {
-                let s = first.to_string_lossy();
-                if s == ".akatsuki" || s == ".akatsuki.lock" || s.starts_with(".akatsuki") {
-                    bail!(
-                        "Cannot mutate internal akatsuki metadata files: {}",
-                        rel_path
-                    );
+            for comp in rel.components() {
+                if let std::path::Component::Normal(c) = comp {
+                    let s = c.to_string_lossy();
+                    if s == ".akatsuki" || s == ".akatsuki.lock" || s.starts_with(".akatsuki") {
+                        bail!(
+                            "Cannot mutate internal akatsuki metadata files: {}",
+                            rel_path
+                        );
+                    }
                 }
             }
         }

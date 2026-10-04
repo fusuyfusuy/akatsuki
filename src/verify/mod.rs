@@ -681,9 +681,65 @@ pub fn run_verification_tests(
     })
 }
 
+/// Security gate for invariant assertion commands.
+/// Rejects dangerous, destructive, or system-modifying operations before bash execution.
+fn is_dangerous_invariant_command(command: &str) -> bool {
+    // 1. Output redirection (> or >>)
+    if command.contains('>') {
+        return true;
+    }
+
+    // 2. Fork bombs
+    if command.contains(":(){ :|:& };:") || command.contains(":(){:|:&};:") {
+        return true;
+    }
+
+    let lower = command.to_lowercase();
+
+    // 3. Low-level disk or filesystem manipulation
+    if lower.contains("dd if=") || lower.contains("mkfs") {
+        return true;
+    }
+
+    // 4. Token-based matching for destructive commands
+    let is_boundary = |c: char| {
+        c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`' | '$' | '<')
+    };
+    for token in lower.split(is_boundary) {
+        let trimmed = token.trim_matches(|c: char| c == '"' || c == '\'' || c == '\\');
+        match trimmed {
+            "rm" | "rmdir" | "reboot" | "shutdown" | "passwd" | "poweroff" | "halt" | "init" => {
+                if trimmed == "init" {
+                    if lower.contains("init 0") || lower.contains("init 6") {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 5. Additional explicit patterns
+    if lower.contains("rm -rf") || lower.contains("rm -r") || lower.contains("rm -f") {
+        return true;
+    }
+
+    false
+}
+
 /// Executes one invariant under a hard ceiling. A wedged assertion (`nc -z`, an
 /// unbounded `curl`) must never stall the caller, let alone the MCP request loop.
 fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
+    if is_dangerous_invariant_command(command) {
+        return (
+            1,
+            String::new(),
+            "Security violation: command contains prohibited destructive or system-modifying operations".to_string(),
+        );
+    }
+
     use std::io::Read;
     use std::os::unix::process::CommandExt;
 

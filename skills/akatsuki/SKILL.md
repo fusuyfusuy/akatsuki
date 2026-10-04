@@ -16,7 +16,7 @@ KERNEL:
   VAULT:  ~/configs/knowledge-base/akatsuki (or $AKATSUKI_VAULT, or --vault <dir>)
   STORAGE: Markdown (source of truth) + .akatsuki/cache.db (derived projection, SQLite WAL)
   INVARIANTS:
-    1_TELEMETRY:  Telegraphic Caveman (<= 280 chars soft limit; No articles/copulas/pronouns)
+    1_TELEMETRY:  Telegraphic Caveman (<= 140 chars; No articles/copulas/pronouns)
     2_PURITY:     Pure Markdown & Strict YAML — zero Obsidian plugin lock-in
     3_BUDGETING:  Token-Bounded Reads (contract > read --budget > full read)
     4_INTEGRITY:  Zero Orphan Notes — wikilink resolution verify == exit 0
@@ -81,7 +81,7 @@ ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
    - Heading matching is emoji/punctuation tolerant: `--heading Overview` addresses `## 📌 Overview`.
    - Every mutation stamps `updated` + `updated_by` and appends an audit line to today's daily note.
 5. **VERIFY (Integrity Gate)**:
-   - `akatsuki lint ∧ akatsuki verify == exit 0`
+   - `(akatsuki lint AND akatsuki verify) == exit 0`
    - Wikilinks and markdown links both resolve; every domain note is indexed by its MOC or `INDEX.md`.
 6. **LOG (Outbound Telemetry)**:
    - `akatsuki log --project <proj> --summary "<verb> <target> -> <delta>; <evidence>"`
