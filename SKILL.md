@@ -81,7 +81,7 @@ ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
    - Heading matching is emoji/punctuation tolerant: `--heading Overview` addresses `## 📌 Overview`.
    - Every mutation stamps `updated` + `updated_by` and appends an audit line to today's daily note.
 5. **VERIFY (Integrity Gate)**:
-   - `akatsuki lint ∧ akatsuki verify == exit 0`
+   - `(akatsuki lint AND akatsuki verify) == exit 0`
    - Wikilinks and markdown links both resolve; every domain note is indexed by its MOC or `INDEX.md`.
 6. **LOG (Outbound Telemetry)**:
    - `akatsuki log --project <proj> --summary "<verb> <target> -> <delta>; <evidence>"`

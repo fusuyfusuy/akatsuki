@@ -16,7 +16,7 @@ KERNEL:
   VAULT:  ~/configs/knowledge-base/akatsuki (or $AKATSUKI_VAULT, or --vault <dir>)
   STORAGE: Markdown (source of truth) + .akatsuki/cache.db (derived projection, SQLite WAL)
   INVARIANTS:
-    1_TELEMETRY:  Telegraphic Caveman (<= 140 chars; No articles/copulas/pronouns)
+    1_TELEMETRY:  Telegraphic Caveman (<= 280 chars soft limit; No articles/copulas/pronouns)
     2_PURITY:     Pure Markdown & Strict YAML — zero Obsidian plugin lock-in
     3_BUDGETING:  Token-Bounded Reads (contract > read --budget > full read)
     4_INTEGRITY:  Zero Orphan Notes — wikilink resolution verify == exit 0
