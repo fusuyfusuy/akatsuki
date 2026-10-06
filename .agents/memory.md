@@ -1,7 +1,7 @@
 # Project Memory
 
 ## Active Epics & Scale
-- Scale: Native compiled Rust knowledge secretariat (akatsuki v0.2.1, ~6k LOC Rust across storage, index, search, vectors, graph, mutations, verify, mcp, cli).
+- Scale: Native compiled Rust knowledge secretariat (akatsuki v0.2.2, ~6k LOC Rust across storage, index, search, vectors, graph, mutations, verify, mcp, cli).
 - Architecture: Dual-layer Markdown Git source-of-truth with SQLite WAL projection (`.akatsuki/cache.db`, schema version 0.2.2 auto-rebuilt on mismatch), parallel Blake3 content-hash change detection via Rayon, optional pure-Rust Candle embeddings (`intfloat/multilingual-e5-small`) behind `--features vectors` fused with BM25 through RRF, and a native JSON-RPC 2.0 MCP stdio server with 20 tools.
 - Legacy Python implementation is retained under `python/` as a parity reference only; it is not built, installed, or executed.
 
@@ -10,7 +10,6 @@
 - `python/` legacy tree (3.5k LOC, 30 tracked files) retained <- migration parity reference -> delete once Rust parity is signed off.
 - Vector weights (~470 MB e5-small) are a local asset only <- CI has no model provisioning -> provision in CI when vector-path tests must run there.
 - `read --toc` / section-miss affordance not implemented <- legacy nicety, low demand -> implement when agents ask for a table of contents.
-- `get entities.<domain-stem>.<field>` unreachable for dotted stems (keypath splits on `.`) <- legacy behaviour preserved -> fix with a longest-stem-first keypath resolver when it bites.
 
 ## Domain Vocabulary & Gotchas
 - Spill Trap: Antigravity dumps tool outputs > 4000 bytes to disk (`output.txt`). MCP `akatsuki_search` caps matches to 5 with dense breadcrumbs (~1.6 KB) to prevent agents wasting turns reading spilled files.

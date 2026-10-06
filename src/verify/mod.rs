@@ -310,8 +310,13 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
 
         for cap in wikilink_re.captures_iter(&clean) {
             let whole = cap.get(0).context("wikilink match without a full span")?;
-            // An escaped `\[[` is documentation, not a link.
-            if whole.start() > 0 && clean.as_bytes()[whole.start() - 1] == b'\\' {
+            // An escaped `\[[` is documentation, not a link. An even number of backslashes means the backslashes are escaped.
+            let backslashes = clean[..whole.start()]
+                .bytes()
+                .rev()
+                .take_while(|b| *b == b'\\')
+                .count();
+            if backslashes % 2 == 1 {
                 continue;
             }
             let target = cap[1].trim();
@@ -684,8 +689,14 @@ pub fn run_verification_tests(
 /// Security gate for invariant assertion commands.
 /// Rejects dangerous, destructive, or system-modifying operations before bash execution.
 fn is_dangerous_invariant_command(command: &str) -> bool {
-    // 1. Output redirection (> or >>)
-    if command.contains('>') {
+    // 1. Output redirection (> or >>), excluding standard discards to /dev/null and fd duplicates
+    let sanitized_redir = command
+        .replace(">/dev/null", "")
+        .replace("> /dev/null", "")
+        .replace("2>&1", "")
+        .replace(">&2", "")
+        .replace("1>&2", "");
+    if sanitized_redir.contains('>') {
         return true;
     }
 
@@ -758,20 +769,31 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
         Err(e) => return (1, String::new(), format!("Failed to spawn bash: {}", e)),
     };
 
-    let stdout_handle = child.stdout.take().map(|pipe| {
+    let (tx_out, rx_out) = std::sync::mpsc::channel();
+    let (tx_err, rx_err) = std::sync::mpsc::channel();
+    let _stdout_handle = child.stdout.take().map(|pipe| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.take(2 * 1024 * 1024).read_to_end(&mut buf);
-            buf
+            let _ = tx_out.send(buf);
         })
     });
-    let stderr_handle = child.stderr.take().map(|pipe| {
+    let _stderr_handle = child.stderr.take().map(|pipe| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.take(2 * 1024 * 1024).read_to_end(&mut buf);
-            buf
+            let _ = tx_err.send(buf);
         })
     });
+
+    let kill_group = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{}", child.id()))
+            .status();
+        let _ = child.wait();
+    };
 
     let timeout = invariant_timeout();
     let deadline = Instant::now() + timeout;
@@ -782,11 +804,7 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
             Ok(None) => {}
             Err(e) => {
                 eprintln!("Failed to await invariant: {}", e);
-                let _ = Command::new("kill")
-                    .arg("-KILL")
-                    .arg(format!("-{}", child.id()))
-                    .status();
-                let _ = child.wait();
+                kill_group(&mut child);
                 return (
                     1,
                     String::new(),
@@ -796,21 +814,17 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{}", child.id()))
-                .status();
-            let _ = child.wait();
+            kill_group(&mut child);
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let stdout = stdout_handle
-        .and_then(|h| h.join().ok())
+    let stdout = rx_out
+        .recv_timeout(Duration::from_millis(500))
         .unwrap_or_default();
-    let stderr = stderr_handle
-        .and_then(|h| h.join().ok())
+    let stderr = rx_err
+        .recv_timeout(Duration::from_millis(500))
         .unwrap_or_default();
 
     if timed_out {

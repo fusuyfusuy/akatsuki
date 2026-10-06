@@ -218,10 +218,25 @@ pub fn replace_section_in_note(
         )
     })?;
 
-    let mut rebuilt: Vec<String> = lines[..=start].iter().map(|l| l.to_string()).collect();
-    let replacement = new_section_content.trim_end();
+    let replacement = new_section_content.trim();
+    let first_line = replacement.lines().next().unwrap_or("");
+    let replacement_has_heading = crate::storage::heading_at(first_line)
+        .map(|(_, name)| {
+            let target = crate::storage::normalize_heading(heading);
+            name == target || name.contains(&target) || target.contains(&name)
+        })
+        .unwrap_or(false);
+
+    let mut rebuilt: Vec<String> = if replacement_has_heading {
+        lines[..start].iter().map(|l| l.to_string()).collect()
+    } else {
+        lines[..=start].iter().map(|l| l.to_string()).collect()
+    };
+
     if !replacement.is_empty() {
-        rebuilt.push(String::new());
+        if !rebuilt.is_empty() && !replacement_has_heading {
+            rebuilt.push(String::new());
+        }
         rebuilt.extend(replacement.lines().map(|l| l.to_string()));
     }
     if end < lines.len() {
@@ -417,7 +432,19 @@ fn sync_index(vault: &Path) -> Result<()> {
 
 /// Walks (creating intermediate maps) a dotted keypath and stores `value` at its end.
 fn set_keypath(fm: &mut Value, keypath: &str, value: Value) -> Result<()> {
-    let segments: Vec<&str> = keypath
+    let trimmed = keypath.trim();
+    if trimmed.is_empty() {
+        bail!("Empty keypath");
+    }
+
+    if let Some(map) = fm.as_object_mut() {
+        if map.contains_key(trimmed) {
+            map.insert(trimmed.to_string(), value);
+            return Ok(());
+        }
+    }
+
+    let segments: Vec<&str> = trimmed
         .split('.')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -451,6 +478,11 @@ fn parse_scalar(raw: &str) -> Value {
     if let Ok(number) = raw.parse::<i64>() {
         return json!(number);
     }
+    if let Ok(float) = raw.parse::<f64>() {
+        if float.is_finite() && raw.contains('.') {
+            return json!(float);
+        }
+    }
     if let Ok(flag) = raw.parse::<bool>() {
         return json!(flag);
     }
@@ -458,6 +490,9 @@ fn parse_scalar(raw: &str) -> Value {
         || (raw.starts_with('{') && raw.ends_with('}'));
     if looks_structured {
         if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+            return parsed;
+        }
+        if let Ok(parsed) = serde_yaml::from_str::<Value>(raw) {
             return parsed;
         }
     }

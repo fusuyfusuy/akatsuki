@@ -397,10 +397,14 @@ pub fn execute_sql_query(vault: &Path, sql: &str) -> Result<Vec<serde_json::Valu
         .map(|s| s.to_string())
         .collect();
 
+    const MAX_SQL_ROWS: usize = 500;
     let mut rows = stmt.query([])?;
     let mut results = Vec::new();
 
     while let Some(row) = rows.next()? {
+        if results.len() >= MAX_SQL_ROWS {
+            break;
+        }
         let mut obj = serde_json::Map::new();
         for (i, name) in col_names.iter().enumerate() {
             let val_ref = row.get_ref(i)?;
@@ -443,105 +447,100 @@ fn traverse_value_keypath(cur: &serde_json::Value, p: &str) -> Option<serde_json
 }
 
 pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
-    let parts: Vec<&str> = keypath
-        .split('.')
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .collect();
-    if parts.is_empty() {
+    let clean_key = keypath.trim();
+    if clean_key.is_empty() {
         anyhow::bail!("Error: Empty keypath.");
     }
 
-    let category = parts[0];
     let con = open_synced_db(vault)?;
 
-    if category == "services" && parts.len() >= 2 {
-        let svc_name = parts[1];
-        let pattern = format!("{}%", svc_name);
-        let mut stmt = con.prepare("SELECT name, container_prefix, ports, host, network, replicas, role, rel_path FROM services WHERE name = ?1 OR name LIKE ?2 LIMIT 1")?;
-        let mut rows = stmt.query(params![svc_name, pattern])?;
-        if let Some(row) = rows.next()? {
-            let mut obj = serde_json::Map::new();
-            obj.insert("name".to_string(), serde_json::Value::String(row.get(0)?));
-            obj.insert(
-                "container_prefix".to_string(),
-                serde_json::Value::String(row.get(1)?),
-            );
-            obj.insert("ports".to_string(), serde_json::Value::String(row.get(2)?));
-            obj.insert("host".to_string(), serde_json::Value::String(row.get(3)?));
-            obj.insert(
-                "network".to_string(),
-                serde_json::Value::String(row.get(4)?),
-            );
-            obj.insert(
-                "replicas".to_string(),
-                serde_json::Value::String(row.get(5)?),
-            );
-            obj.insert("role".to_string(), serde_json::Value::String(row.get(6)?));
-            obj.insert(
-                "rel_path".to_string(),
-                serde_json::Value::String(row.get(7)?),
-            );
+    // 1. Longest-stem-first matching for "services."
+    if let Some(rest) = clean_key.strip_prefix("services.") {
+        let parts: Vec<&str> = rest.split('.').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+        if !parts.is_empty() {
+            let mut stmt = con.prepare("SELECT name, container_prefix, ports, host, network, replicas, role, rel_path FROM services WHERE name = ?1 OR container_prefix = ?1 LIMIT 1")?;
+            for i in (1..=parts.len()).rev() {
+                let candidate_svc = parts[..i].join(".");
+                let mut rows = stmt.query(params![candidate_svc])?;
+                if let Some(row) = rows.next()? {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("name".to_string(), serde_json::Value::String(row.get(0)?));
+                    obj.insert("container_prefix".to_string(), serde_json::Value::String(row.get(1)?));
+                    obj.insert("ports".to_string(), serde_json::Value::String(row.get(2)?));
+                    obj.insert("host".to_string(), serde_json::Value::String(row.get(3)?));
+                    obj.insert("network".to_string(), serde_json::Value::String(row.get(4)?));
+                    obj.insert("replicas".to_string(), serde_json::Value::String(row.get(5)?));
+                    obj.insert("role".to_string(), serde_json::Value::String(row.get(6)?));
+                    obj.insert("rel_path".to_string(), serde_json::Value::String(row.get(7)?));
 
-            if parts.len() == 2 {
-                return Ok(serde_json::Value::Object(obj));
+                    if i == parts.len() {
+                        return Ok(serde_json::Value::Object(obj));
+                    }
+                    let mut cur = serde_json::Value::Object(obj);
+                    for p in &parts[i..] {
+                        if let Some(next) = traverse_value_keypath(&cur, p) {
+                            cur = next;
+                        } else {
+                            anyhow::bail!("Property '{}' not found in service '{}'", p, candidate_svc);
+                        }
+                    }
+                    return Ok(cur);
+                }
             }
-            let prop = parts[2];
-            if let Some(val) = obj.get(prop) {
-                return Ok(val.clone());
-            } else {
-                anyhow::bail!("Property '{}' not found in service '{}'", prop, svc_name);
-            }
-        } else {
-            anyhow::bail!("Service '{}' not found in services catalog", svc_name);
         }
     }
 
-    if category == "entities" && parts.len() >= 2 {
-        let ent_stem = parts[1];
-        let mut stmt = con.prepare(
-            "SELECT metadata_json FROM entities WHERE stem = ?1 OR rel_path = ?1 LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![ent_stem])?;
-        if let Some(row) = rows.next()? {
-            let raw: String = row.get(0)?;
-            let mut cur: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
-                format!("Entity '{}' carries unreadable metadata_json", ent_stem)
-            })?;
+    // 2. Longest-stem-first matching for "entities."
+    if let Some(rest) = clean_key.strip_prefix("entities.") {
+        let parts: Vec<&str> = rest.split('.').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+        if !parts.is_empty() {
+            let mut stmt = con.prepare("SELECT metadata_json FROM entities WHERE stem = ?1 OR rel_path = ?1 LIMIT 1")?;
+            for i in (1..=parts.len()).rev() {
+                let candidate_stem = parts[..i].join(".");
+                let mut rows = stmt.query(params![candidate_stem])?;
+                if let Some(row) = rows.next()? {
+                    let raw: String = row.get(0)?;
+                    let mut cur: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+                        format!("Entity '{}' carries unreadable metadata_json", candidate_stem)
+                    })?;
+                    for p in &parts[i..] {
+                        if let Some(next) = traverse_value_keypath(&cur, p) {
+                            cur = next;
+                        } else {
+                            anyhow::bail!("Property '{}' not found in entity '{}'", p, candidate_stem);
+                        }
+                    }
+                    return Ok(cur);
+                }
+            }
+        }
+    }
 
-            for p in &parts[2..] {
+    // 3. Direct frontmatter lookup on note file (with longest-stem matching for dotted files)
+    let parts: Vec<&str> = clean_key.split('.').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    for i in (1..=parts.len()).rev() {
+        let candidate_stem = parts[..i].join(".");
+        if let Some(note_path) = resolve_note_file(vault, &candidate_stem) {
+            let content = std::fs::read_to_string(&note_path)?;
+            let (fm, _) = parse_frontmatter(&content)
+                .with_context(|| format!("Note '{}' has invalid frontmatter", note_path.display()))?;
+            if i == parts.len() {
+                return Ok(fm);
+            }
+            let mut cur = fm;
+            for p in &parts[i..] {
                 if let Some(next) = traverse_value_keypath(&cur, p) {
                     cur = next;
                 } else {
-                    anyhow::bail!("Property '{}' not found in entity '{}'", p, ent_stem);
+                    anyhow::bail!(
+                        "Key '{}' not found in frontmatter of '{}'",
+                        p,
+                        note_path.display()
+                    );
                 }
             }
             return Ok(cur);
         }
-        anyhow::bail!("Entity '{}' not found in vault index", ent_stem);
-    }
-
-    // Frontmatter lookup on note file
-    if let Some(note_path) = resolve_note_file(vault, category) {
-        let content = std::fs::read_to_string(&note_path)?;
-        let (fm, _) = parse_frontmatter(&content)
-            .with_context(|| format!("Note '{}' has invalid frontmatter", note_path.display()))?;
-        if parts.len() == 1 {
-            return Ok(fm);
-        }
-        let mut cur = fm;
-        for p in &parts[1..] {
-            if let Some(next) = traverse_value_keypath(&cur, p) {
-                cur = next;
-            } else {
-                anyhow::bail!(
-                    "Key '{}' not found in frontmatter of '{}'",
-                    p,
-                    note_path.display()
-                );
-            }
-        }
-        return Ok(cur);
     }
 
     anyhow::bail!("Could not resolve keypath '{}'", keypath);

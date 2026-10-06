@@ -4,7 +4,11 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 use crate::constants::RAW_EXTS;
 
@@ -343,10 +347,20 @@ pub fn write_atomic(target: &Path, content: &str) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let pid = std::process::id();
+    let count = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let rand_id = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let tmp_path = target.with_extension(format!("tmp.{}.{}", pid, rand_id));
+    let tmp_path = target.with_extension(format!("tmp.{}.{}.{}", pid, count, rand_id));
 
-    fs::write(&tmp_path, content)?;
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .with_context(|| format!("Failed to create tmp file: {}", tmp_path.display()))?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
 
     if target.exists() {
         let perms = match fs::metadata(target) {
@@ -471,7 +485,13 @@ pub fn resolve_note_file(vault: &Path, query: &str) -> Option<PathBuf> {
 
 pub fn normalize_heading(s: &str) -> String {
     s.chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '_')
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .to_lowercase()
         .split_whitespace()

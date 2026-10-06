@@ -66,6 +66,8 @@ ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
 1. **TURN-0 (Inbound Orientation)**:
    - Live Topology & Ports: `akatsuki services` | MCP: `akatsuki_services()`
    - Project Stacks: `akatsuki projects` | MCP: `akatsuki_projects()`
+   - Cluster Battle Scars & Known Fixes: `akatsuki contract Cluster-Battle-Scars` | CLI: `work-query fix "<error>"`
+   - Longitudinal History: `work-query search "<topic>"` | `work-query repo <repo>`
    - Knowledge Search: `akatsuki search "<topic>" --with-graph` | MCP: `akatsuki_search(query="<topic>", with_graph=True)`
 2. **CONTRACT (Token-Dense Slicing)**:
    - `akatsuki contract <note>` | MCP: `akatsuki_contract(note="<note>")`

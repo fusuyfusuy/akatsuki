@@ -56,7 +56,7 @@ pub fn parse_wikilinks(body: &str) -> Vec<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
 
     let fence_re =
-        FENCE_RE.get_or_init(|| Regex::new(r"(?s)```.*?```").expect("valid fence regex"));
+        FENCE_RE.get_or_init(|| Regex::new(r"(?s)(```.*?```|~~~.*?~~~)").expect("valid fence regex"));
     let inline_re = INLINE_RE.get_or_init(|| Regex::new(r"`[^`\n]+`").expect("valid inline regex"));
     let wikilink_re = RE.get_or_init(|| {
         Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]").expect("valid wikilink regex")
@@ -71,7 +71,12 @@ pub fn parse_wikilinks(body: &str) -> Vec<String> {
             Some(w) => w,
             None => continue,
         };
-        if whole.start() > 0 && clean.as_bytes().get(whole.start() - 1) == Some(&b'\\') {
+        let backslashes = clean[..whole.start()]
+            .bytes()
+            .rev()
+            .take_while(|b| *b == b'\\')
+            .count();
+        if backslashes % 2 == 1 {
             continue;
         }
         let clean_stem = extract_target_stem(&caps[1]);
@@ -659,7 +664,22 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
                 {
                     continue;
                 }
-                let raw_cols: Vec<&str> = trimmed.split('|').collect();
+                let mut raw_cols: Vec<String> = Vec::new();
+                let mut col = String::new();
+                let mut chars = trimmed.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '\\' && chars.peek() == Some(&'|') {
+                        col.push('|');
+                        chars.next();
+                    } else if c == '|' {
+                        raw_cols.push(col.trim().to_string());
+                        col.clear();
+                    } else {
+                        col.push(c);
+                    }
+                }
+                raw_cols.push(col.trim().to_string());
+
                 if raw_cols.len() >= 6 {
                     let svc_name = raw_cols[1].replace(['*', '`'], "").trim().to_string();
                     let container = raw_cols[2].replace('`', "").trim().to_string();
@@ -710,9 +730,13 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
                     .unwrap_or("");
                 let ports = s
                     .get("ports")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| s.get("port").and_then(|v| v.as_str()))
-                    .unwrap_or("");
+                    .or_else(|| s.get("port"))
+                    .map(|v| match v {
+                        Value::Array(items) => scalar_join(items),
+                        Value::String(s) => s.clone(),
+                        other => scalar_text(other),
+                    })
+                    .unwrap_or_default();
                 let s_host = s
                     .get("host")
                     .and_then(|v| v.as_str())
@@ -721,7 +745,14 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
                     .get("network")
                     .and_then(|v| v.as_str())
                     .unwrap_or(network.as_deref().unwrap_or("default"));
-                let replicas = s.get("replicas").and_then(|v| v.as_str()).unwrap_or("1");
+                let replicas = s
+                    .get("replicas")
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => scalar_text(other),
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "1".to_string());
                 let role = s.get("role").and_then(|v| v.as_str()).unwrap_or("");
 
                 if !name.is_empty() {

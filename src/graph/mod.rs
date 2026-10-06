@@ -1,6 +1,6 @@
 //! Knowledge graph, blast radius calculation, map traversal, and contract extraction.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::open_synced_db;
 use crate::storage::{parse_frontmatter, resolve_note_file};
+
+/// Escapes SQL LIKE special wildcard characters ('%', '_', '\').
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
 
 /// Upstream dependents, downstream dependencies, and boundary sinks for a target.
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,12 +98,13 @@ fn blast_radius_with(con: &Connection, stem: &str) -> Result<BlastRadius> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let escaped_stem = escape_like(stem);
     let exact_rel = format!("{}.md", stem);
-    let nested_rel = format!("%/{}.md", stem);
-    let descendant_rel = format!("%/{}/%", stem);
+    let nested_rel = format!("%/{}.md", escaped_stem);
+    let descendant_rel = format!("%/{}/%", escaped_stem);
     let mut stmt_down = con.prepare(
         "SELECT target_stem, relation_type FROM relations \
-         WHERE source_rel = ?1 OR source_rel LIKE ?2 OR source_rel LIKE ?3",
+         WHERE source_rel = ?1 OR source_rel LIKE ?2 ESCAPE '\\' OR source_rel LIKE ?3 ESCAPE '\\'",
     )?;
     let downstream: Vec<DownstreamRef> = stmt_down
         .query_map(params![exact_rel, nested_rel, descendant_rel], |r| {
@@ -107,10 +115,10 @@ fn blast_radius_with(con: &Connection, stem: &str) -> Result<BlastRadius> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let sink_rel = format!("%/{}.md", stem);
+    let sink_rel = format!("%/{}.md", escaped_stem);
     let mut stmt_svc = con.prepare(
         "SELECT name, container_prefix, ports, host, network, rel_path FROM services \
-         WHERE name = ?1 OR container_prefix = ?1 OR rel_path LIKE ?2",
+         WHERE name = ?1 OR container_prefix = ?1 OR rel_path LIKE ?2 ESCAPE '\\'",
     )?;
     let boundary_sinks: Vec<ServiceItem> = stmt_svc
         .query_map(params![stem, sink_rel], |r| {
@@ -322,17 +330,19 @@ fn traverse_down(
     current_depth: usize,
     max_depth: usize,
     ancestors: &[String],
+    visited: &mut HashSet<String>,
 ) -> Result<Vec<TreeNode>> {
     if current_depth >= max_depth {
         return Ok(Vec::new());
     }
 
+    let escaped_stem = escape_like(stem);
     let exact_rel = format!("{}.md", stem);
-    let nested_rel = format!("%/{}.md", stem);
-    let descendant_rel = format!("%/{}/%", stem);
+    let nested_rel = format!("%/{}.md", escaped_stem);
+    let descendant_rel = format!("%/{}/%", escaped_stem);
     let mut stmt = con.prepare(
         "SELECT target_stem, relation_type FROM relations \
-         WHERE source_rel = ?1 OR source_rel LIKE ?2 OR source_rel LIKE ?3",
+         WHERE source_rel = ?1 OR source_rel LIKE ?2 ESCAPE '\\' OR source_rel LIKE ?3 ESCAPE '\\'",
     )?;
     let rows: Vec<(String, String)> = stmt
         .query_map(params![exact_rel, nested_rel, descendant_rel], |r| {
@@ -344,10 +354,10 @@ fn traverse_down(
     for (child_stem, relation_type) in rows {
         let cycle = ancestors.iter().any(|a| a == &child_stem);
         let mut nested = Vec::new();
-        if !cycle {
+        if !cycle && visited.insert(child_stem.clone()) {
             let mut path = ancestors.to_vec();
             path.push(child_stem.clone());
-            nested = traverse_down(con, &child_stem, current_depth + 1, max_depth, &path)?;
+            nested = traverse_down(con, &child_stem, current_depth + 1, max_depth, &path, visited)?;
         }
         children.push(TreeNode {
             rel_path: resolve_stem_rel_path(con, &child_stem)?,
@@ -367,6 +377,7 @@ fn traverse_up(
     current_depth: usize,
     max_depth: usize,
     ancestors: &[String],
+    visited: &mut HashSet<String>,
 ) -> Result<Vec<TreeNode>> {
     if current_depth >= max_depth {
         return Ok(Vec::new());
@@ -383,10 +394,10 @@ fn traverse_up(
         let child_stem = path_stem(&source_rel);
         let cycle = ancestors.iter().any(|a| a == &child_stem);
         let mut nested = Vec::new();
-        if !cycle {
+        if !cycle && visited.insert(child_stem.clone()) {
             let mut path = ancestors.to_vec();
             path.push(child_stem.clone());
-            nested = traverse_up(con, &child_stem, current_depth + 1, max_depth, &path)?;
+            nested = traverse_up(con, &child_stem, current_depth + 1, max_depth, &path, visited)?;
         }
         children.push(TreeNode {
             stem: child_stem,
@@ -456,13 +467,18 @@ pub fn traverse_graph(
     let stem = target_stem(target);
     let root = vec![stem.clone()];
 
+    let mut down_visited = HashSet::new();
+    down_visited.insert(stem.clone());
     let downstream = if direction == "both" || direction == "down" {
-        traverse_down(&con, &stem, 0, depth, &root)?
+        traverse_down(&con, &stem, 0, depth, &root, &mut down_visited)?
     } else {
         Vec::new()
     };
+
+    let mut up_visited = HashSet::new();
+    up_visited.insert(stem.clone());
     let upstream = if direction == "both" || direction == "up" {
-        traverse_up(&con, &stem, 0, depth, &root)?
+        traverse_up(&con, &stem, 0, depth, &root, &mut up_visited)?
     } else {
         Vec::new()
     };
@@ -475,10 +491,11 @@ pub fn traverse_graph(
     let mut sinks: Vec<MapSink> = Vec::new();
     let mut stmt = con.prepare(
         "SELECT name, ports, host, network, rel_path FROM services \
-         WHERE name = ?1 OR container_prefix = ?1 OR rel_path LIKE ?2",
+         WHERE name = ?1 OR container_prefix = ?1 OR rel_path LIKE ?2 ESCAPE '\\'",
     )?;
     for sink_stem in &stems {
-        let rows = stmt.query_map(params![sink_stem, format!("%/{}.md", sink_stem)], |r| {
+        let escaped_sink = escape_like(sink_stem);
+        let rows = stmt.query_map(params![sink_stem, format!("%/{}.md", escaped_sink)], |r| {
             Ok(MapSink {
                 name: r.get(0)?,
                 ports: r.get(1)?,
