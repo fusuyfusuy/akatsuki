@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use crate::index::{open_cache_db, sync_vault_index};
 use crate::storage::{
     auto_heal_frontmatter, contained_path, dump_frontmatter, is_raw_path, locate_section,
-    machine_id, parse_frontmatter, resolve_note_file, write_atomic, VaultLock,
+    locate_section_exact, machine_id, parse_frontmatter, patch_frontmatter_keys, resolve_note_file,
+    resolve_note_file_unique, split_frontmatter, write_atomic, VaultLock,
 };
 
 /// The project that owns vault-maintenance entries in the daily audit trail.
@@ -68,6 +69,29 @@ fn ensure_writable_note_path(
     Ok(())
 }
 
+/// Rejects line breaks and other control characters in single-line fields (paths,
+/// headings, keypaths, log text): they would forge extra bullets, headings or
+/// audit lines in the notes these fields are written into.
+fn reject_control_chars(field: &str, value: &str) -> Result<()> {
+    if value.chars().any(|c| c.is_control() && c != '\t') {
+        bail!(
+            "{} must not contain line breaks or control characters",
+            field
+        );
+    }
+    Ok(())
+}
+
+/// Re-applies CRLF line endings when `original` used them, so a one-line edit does
+/// not turn into a whole-file diff.
+fn restore_eol(original: &str, out: String) -> String {
+    if original.contains("\r\n") {
+        out.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        out
+    }
+}
+
 pub fn write_note(
     vault: &Path,
     rel_path: &str,
@@ -75,6 +99,7 @@ pub fn write_note(
     overwrite: bool,
     raw: bool,
 ) -> Result<PathBuf> {
+    reject_control_chars("Note path", rel_path)?;
     ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
@@ -112,7 +137,7 @@ pub fn write_note(
 
     write_atomic(&target_path, &payload)?;
     record_audit(vault, "write", &target_rel)?;
-    sync_index(vault)?;
+    sync_index(vault);
 
     Ok(target_path)
 }
@@ -123,9 +148,14 @@ pub fn append_work_log(
     summary: &str,
     device: Option<&str>,
 ) -> Result<String> {
+    reject_control_chars("Project", project)?;
+    reject_control_chars("Summary", summary)?;
+    if let Some(device) = device {
+        reject_control_chars("Device", device)?;
+    }
     let _lock = VaultLock::acquire(vault)?;
     let entry = append_work_log_inner(vault, project, summary, device)?;
-    sync_index(vault)?;
+    sync_index(vault);
     Ok(entry)
 }
 
@@ -198,78 +228,63 @@ pub fn replace_section_in_note(
     heading: &str,
     new_section_content: &str,
 ) -> Result<()> {
+    reject_control_chars("Note path", rel_path)?;
+    reject_control_chars("Heading", heading)?;
     ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
-    let note_path = resolve_note_file(vault, rel_path)
-        .with_context(|| format!("Note '{}' not found in vault", rel_path))?;
+    let note_path = resolve_note_file_unique(vault, rel_path)?;
     ensure_writable_note_path(vault, rel_path, Some(&note_path))?;
 
     let text = fs::read_to_string(&note_path)?;
     let (mut fm, body) = parse_frontmatter(&text)
         .with_context(|| format!("Note '{}' has invalid frontmatter", note_path.display()))?;
 
-    let lines: Vec<&str> = body.lines().collect();
-    let (start, _level, end) = locate_section(&lines, heading).with_context(|| {
-        format!(
-            "Heading '{}' not found in note '{}'",
-            heading,
-            note_path.display()
-        )
-    })?;
-
-    let replacement = new_section_content.trim();
-    let first_line = replacement.lines().next().unwrap_or("");
-    let replacement_has_heading = crate::storage::heading_at(first_line)
-        .map(|(_, name)| {
-            let target = crate::storage::normalize_heading(heading);
-            name == target || name.contains(&target) || target.contains(&name)
-        })
-        .unwrap_or(false);
-
-    let mut rebuilt: Vec<String> = if replacement_has_heading {
-        lines[..start].iter().map(|l| l.to_string()).collect()
-    } else {
-        lines[..=start].iter().map(|l| l.to_string()).collect()
-    };
-
-    if !replacement.is_empty() {
-        if !rebuilt.is_empty() && !replacement_has_heading {
-            rebuilt.push(String::new());
-        }
-        rebuilt.extend(replacement.lines().map(|l| l.to_string()));
-    }
-    if end < lines.len() {
-        rebuilt.push(String::new());
-        rebuilt.extend(lines[end..].iter().map(|l| l.to_string()));
-    }
-
     stamp_provenance(&mut fm);
-    write_atomic(&note_path, &dump_frontmatter(&fm, &rebuilt.join("\n")))?;
+    let edit = |b: &str| {
+        replaced_body(b, heading, new_section_content).with_context(|| {
+            format!(
+                "Heading '{}' not found in note '{}' (writers require an exact heading match)",
+                heading,
+                note_path.display()
+            )
+        })
+    };
+    let out = rewrite_note(&text, &fm, &body, Some(Vec::new()), &edit)?;
+    write_atomic(&note_path, &out)?;
     record_audit(vault, "replace", &format!("{} #{}", rel_path, heading))?;
-    sync_index(vault)?;
+    sync_index(vault);
 
     Ok(())
 }
 
+/// Sets a keypath from a CLI/MCP string, typing it through `parse_scalar`.
 pub fn set_note_property(vault: &Path, rel_path: &str, keypath: &str, value: &str) -> Result<()> {
+    set_note_value(vault, rel_path, keypath, parse_scalar(value))
+}
+
+/// Sets a keypath to an already-typed value (no string re-interpretation).
+pub fn set_note_value(vault: &Path, rel_path: &str, keypath: &str, value: Value) -> Result<()> {
+    reject_control_chars("Note path", rel_path)?;
+    reject_control_chars("Keypath", keypath)?;
     ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
-    let note_path = resolve_note_file(vault, rel_path)
-        .with_context(|| format!("Note '{}' not found in vault", rel_path))?;
+    let note_path = resolve_note_file_unique(vault, rel_path)?;
     ensure_writable_note_path(vault, rel_path, Some(&note_path))?;
 
     let text = fs::read_to_string(&note_path)?;
     let (mut fm, body) = parse_frontmatter(&text)
         .with_context(|| format!("Note '{}' has invalid frontmatter", note_path.display()))?;
 
-    set_keypath(&mut fm, keypath, parse_scalar(value))?;
+    let top_level = (!keypath.trim().contains('.')).then(|| vec![(keypath.trim(), value.clone())]);
+    set_keypath(&mut fm, keypath, value)?;
     stamp_provenance(&mut fm);
 
-    write_atomic(&note_path, &dump_frontmatter(&fm, &body))?;
+    let out = rewrite_note(&text, &fm, &body, top_level, &|b| Ok(b.to_string()))?;
+    write_atomic(&note_path, &out)?;
     record_audit(vault, "set", &format!("{} {}", rel_path, keypath))?;
-    sync_index(vault)?;
+    sync_index(vault);
 
     Ok(())
 }
@@ -280,49 +295,30 @@ pub fn append_section_in_note(
     heading: &str,
     content_to_append: &str,
 ) -> Result<()> {
+    reject_control_chars("Note path", rel_path)?;
+    reject_control_chars("Heading", heading)?;
     ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
-    let note_path = match resolve_note_file(vault, rel_path) {
-        Some(path) => {
-            ensure_writable_note_path(vault, rel_path, Some(&path))?;
-            path
-        }
-        None => create_note(vault, rel_path, heading)?,
+    // A missing note is created; an ambiguous one is an error, never a guess.
+    let note_path = if resolve_note_file(vault, rel_path).is_some() {
+        let path = resolve_note_file_unique(vault, rel_path)?;
+        ensure_writable_note_path(vault, rel_path, Some(&path))?;
+        path
+    } else {
+        create_note(vault, rel_path, heading)?
     };
 
     let text = fs::read_to_string(&note_path)?;
     let (mut fm, body) = parse_frontmatter(&text)
         .with_context(|| format!("Note '{}' has invalid frontmatter", note_path.display()))?;
 
-    let appended = content_to_append.trim_end();
-    let lines: Vec<&str> = body.lines().collect();
-
-    let updated_body = match locate_section(&lines, heading) {
-        Some((_start, _level, end)) => {
-            let mut rebuilt: Vec<String> = lines[..end].iter().map(|l| l.to_string()).collect();
-            while rebuilt.last().is_some_and(|l| l.trim().is_empty()) {
-                rebuilt.pop();
-            }
-            rebuilt.push(String::new());
-            rebuilt.extend(appended.lines().map(|l| l.to_string()));
-            rebuilt.push(String::new());
-            rebuilt.extend(lines[end..].iter().map(|l| l.to_string()));
-            rebuilt.join("\n")
-        }
-        // Parity: a missing heading is created at the end of the note.
-        None => format!(
-            "{}\n\n{}\n\n{}\n",
-            body.trim_end(),
-            normalize_section_heading(heading),
-            appended
-        ),
-    };
-
     stamp_provenance(&mut fm);
-    write_atomic(&note_path, &dump_frontmatter(&fm, &updated_body))?;
+    let edit = |b: &str| Ok(appended_body(b, heading, content_to_append));
+    let out = rewrite_note(&text, &fm, &body, Some(Vec::new()), &edit)?;
+    write_atomic(&note_path, &out)?;
     record_audit(vault, "append", &format!("{} #{}", rel_path, heading))?;
-    sync_index(vault)?;
+    sync_index(vault);
 
     Ok(())
 }
@@ -362,6 +358,95 @@ pub fn read_daily_note(vault: &Path, date_opt: Option<&str>) -> Result<(String, 
             false,
         ))
     }
+}
+
+/// New body with `heading`'s section replaced by `new_section_content`; `None`
+/// when no section matches the heading exactly.
+fn replaced_body(body: &str, heading: &str, new_section_content: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let (start, _level, end) = locate_section_exact(&lines, heading)?;
+
+    let replacement = new_section_content.trim();
+    let first_line = replacement.lines().next().unwrap_or("");
+    let replacement_has_heading = crate::storage::heading_at(first_line)
+        .map(|(_, name)| name == crate::storage::normalize_heading(heading))
+        .unwrap_or(false);
+
+    let mut rebuilt: Vec<String> = if replacement_has_heading {
+        lines[..start].iter().map(|l| l.to_string()).collect()
+    } else {
+        lines[..=start].iter().map(|l| l.to_string()).collect()
+    };
+
+    if !replacement.is_empty() {
+        if !rebuilt.is_empty() && !replacement_has_heading {
+            rebuilt.push(String::new());
+        }
+        rebuilt.extend(replacement.lines().map(|l| l.to_string()));
+    }
+    if end < lines.len() {
+        rebuilt.push(String::new());
+        rebuilt.extend(lines[end..].iter().map(|l| l.to_string()));
+    }
+    Some(rebuilt.join("\n"))
+}
+
+/// New body with `content_to_append` added to `heading`'s section; a missing
+/// heading is created at the end of the note.
+fn appended_body(body: &str, heading: &str, content_to_append: &str) -> String {
+    let appended = content_to_append.trim_end();
+    let lines: Vec<&str> = body.lines().collect();
+    match locate_section_exact(&lines, heading) {
+        Some((_start, _level, end)) => {
+            let mut rebuilt: Vec<String> = lines[..end].iter().map(|l| l.to_string()).collect();
+            while rebuilt.last().is_some_and(|l| l.trim().is_empty()) {
+                rebuilt.pop();
+            }
+            rebuilt.push(String::new());
+            rebuilt.extend(appended.lines().map(|l| l.to_string()));
+            rebuilt.push(String::new());
+            rebuilt.extend(lines[end..].iter().map(|l| l.to_string()));
+            rebuilt.join("\n")
+        }
+        None => format!(
+            "{}\n\n{}\n\n{}\n",
+            body.trim_end(),
+            normalize_section_heading(heading),
+            appended
+        ),
+    }
+}
+
+/// The `updated` / `updated_by` provenance keys as currently stamped in `fm`.
+fn provenance_edits(fm: &Value) -> Vec<(&'static str, Value)> {
+    ["updated", "updated_by"]
+        .into_iter()
+        .filter_map(|key| fm.get(key).map(|v| (key, v.clone())))
+        .collect()
+}
+
+/// Assembles the note to write. When the note has a well-formed frontmatter block
+/// and `extra` is `Some`, only the touched top-level scalar keys (`extra` plus the
+/// provenance stamp) are patched textually, so comments, `1.10`, `0x1F` and blank
+/// lines survive and the body is edited from its raw bytes. `None` (nested
+/// keypaths) or a shape the patcher refuses falls back to the structural
+/// parse/dump roundtrip.
+fn rewrite_note(
+    text: &str,
+    fm: &Value,
+    parsed_body: &str,
+    extra: Option<Vec<(&str, Value)>>,
+    edit: &dyn Fn(&str) -> Result<String>,
+) -> Result<String> {
+    if let (Some(mut edits), Some((_, raw_body))) = (extra, split_frontmatter(text)) {
+        edits.extend(provenance_edits(fm));
+        if let Ok(patched) = patch_frontmatter_keys(text, &edits) {
+            if let Some((block, _)) = split_frontmatter(&patched) {
+                return Ok(restore_eol(text, format!("{}{}", block, edit(raw_body)?)));
+            }
+        }
+    }
+    Ok(restore_eol(text, dump_frontmatter(fm, &edit(parsed_body)?)))
 }
 
 /// Creates a note that does not exist yet, seeded with its frontmatter and the
@@ -424,10 +509,15 @@ fn record_audit(vault: &Path, action: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn sync_index(vault: &Path) -> Result<()> {
-    let mut con = open_cache_db(vault)?;
-    sync_vault_index(vault, &mut con)?;
-    Ok(())
+/// Refreshes the projection after a mutation has already been committed to disk.
+/// Non-fatal on purpose: the note and its audit line are durable, so reporting an
+/// error would make a retrying caller duplicate the write; every read path
+/// re-syncs on open.
+fn sync_index(vault: &Path) {
+    let synced = open_cache_db(vault).and_then(|mut con| sync_vault_index(vault, &mut con));
+    if let Err(e) = synced {
+        eprintln!("⚠ index sync failed after a successful write (retried on next read): {e:#}");
+    }
 }
 
 /// Walks (creating intermediate maps) a dotted keypath and stores `value` at its end.
@@ -473,13 +563,27 @@ fn set_keypath(fm: &mut Value, keypath: &str, value: Value) -> Result<()> {
     }
 }
 
-/// Interprets a CLI/MCP string as the YAML scalar it looks like.
+/// Interprets a CLI/MCP string as the YAML scalar it looks like. Numbers are
+/// typed only in their canonical spelling, so `007`, `1.10` and `+5` stay strings
+/// instead of being silently rewritten; a quoted value (`"123"`) is the string
+/// inside the quotes.
 fn parse_scalar(raw: &str) -> Value {
+    let quoted = raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')));
+    if quoted {
+        return json!(&raw[1..raw.len() - 1]);
+    }
     if let Ok(number) = raw.parse::<i64>() {
-        return json!(number);
+        if number.to_string() == raw {
+            return json!(number);
+        }
     }
     if let Ok(float) = raw.parse::<f64>() {
-        if float.is_finite() && raw.contains('.') {
+        if float.is_finite()
+            && raw.contains('.')
+            && serde_json::Number::from_f64(float).is_some_and(|n| n.to_string() == raw)
+        {
             return json!(float);
         }
     }

@@ -13,7 +13,7 @@ description: >
 KERNEL:
   TARGET: Autonomous Agent Knowledge Secretariat & Cross-Project Topology
   BINARY: akatsuki (CLI) | akatsuki mcp (JSON-RPC 2.0 stdio)
-  VAULT:  ~/configs/knowledge-base/akatsuki (or $AKATSUKI_VAULT, or --vault <dir>)
+  VAULT:  ~/configs/knowledge-base/akatsuvault (or $AKATSUKI_VAULT, or --vault <dir>)
   STORAGE: Markdown (source of truth) + .akatsuki/cache.db (derived projection, SQLite WAL)
   INVARIANTS:
     1_TELEMETRY:  Telegraphic Caveman (<= 280 chars soft limit; No articles/copulas/pronouns)
@@ -95,11 +95,11 @@ ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
 
 ### `search` — Hybrid BM25 & Dense Vector Search
 - **Retrieval Modes** (`--mode`, `-m`):
-  - `hybrid` (default): Okapi BM25 fused with dense embeddings via Reciprocal Rank Fusion ($k=60$) **when the binary was built with `--features vectors` and the weights are present**. Otherwise BM25, and the output carries an explicit `⚠ semantic ranking unavailable…` line.
+  - `hybrid` (default): Okapi BM25 fused with dense embeddings via Reciprocal Rank Fusion ($k=60$) **when the binary was built with `--features vectors` and the weights are present**. Otherwise BM25, and the text output carries an explicit `⚠ semantic ranking unavailable…` line (MCP appends it to the result; `--json` prints it to stderr so stdout stays a JSON array).
   - `bm25`: SQLite FTS5, `unicode61 remove_diacritics 2`, column weights (title 10 / tags 5 / summary 5 / body 1), prefix + suffix-stem term expansion (`caching` reaches `cache`).
   - `vector`: pure cosine over 384-dimensional e5 vectors. Errors (exit 1) if the feature or the weights are missing — it never degrades silently.
 - **Freshness**: every query reconciles the projection first; a vault that was never reconciled still answers correctly.
-- `--domain <d>` / `--limit <N>` (default 10; MCP default 5) / `--with-graph` attaches 1-hop relations and container/port allocations.
+- `--domain <d>` / `--limit <N>` (default 10, clamped to [1,100]; MCP default 5) / `--with-graph` attaches 1-hop relations and container/port allocations.
 - Vector index maintenance is incremental: only notes whose Blake3 content hash changed are re-embedded.
 
 ### `contract` — Boundary Contract Slicing
@@ -156,7 +156,7 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`. Every tool call is panic-isola
 | MCP Tool | CLI Equivalent | Key Arguments |
 | :--- | :--- | :--- |
 | `akatsuki_search` | `akatsuki search` | `query`, `mode`, `domain`, `limit`, `with_graph` |
-| `akatsuki_read` | `akatsuki read` | `note` (or `path`), `section`, `budget` |
+| `akatsuki_read` | `akatsuki read` | `note` (or `path`, `target`), `section`, `budget` |
 | `akatsuki_contract` | `akatsuki contract` | `note` (or `target`, `path`) |
 | `akatsuki_blast` | `akatsuki blast` | `target` (or `note`, `path`) |
 | `akatsuki_map` | `akatsuki map` | `target` (or `note`, `path`), `depth`, `direction` |

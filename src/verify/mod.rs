@@ -20,14 +20,27 @@ use crate::storage::{parse_frontmatter, write_atomic, VaultLock};
 /// Default hard ceiling for a single embedded invariant assertion.
 const DEFAULT_INVARIANT_TIMEOUT_SECS: u64 = 10;
 
+/// Longest ceiling `AKATSUKI_INVARIANT_TIMEOUT` may request (24 h); larger values
+/// would overflow `Instant` arithmetic.
+const MAX_INVARIANT_TIMEOUT_SECS: u64 = 86_400;
+
+/// Wall-clock budget for all invariants of one `test` run.
+const INVARIANT_TOTAL_BUDGET_SECS: u64 = 300;
+
 /// `AKATSUKI_INVARIANT_TIMEOUT` overrides the ceiling in seconds, for slow hosts
-/// and for the regression suite.
-fn invariant_timeout() -> Duration {
-    std::env::var("AKATSUKI_INVARIANT_TIMEOUT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_INVARIANT_TIMEOUT_SECS))
+/// and for the regression suite. A set-but-invalid value is an error, never a
+/// silent fallback.
+fn invariant_timeout() -> Result<Duration> {
+    let Ok(raw) = std::env::var("AKATSUKI_INVARIANT_TIMEOUT") else {
+        return Ok(Duration::from_secs(DEFAULT_INVARIANT_TIMEOUT_SECS));
+    };
+    let secs: u64 = raw.trim().parse().with_context(|| {
+        format!("AKATSUKI_INVARIANT_TIMEOUT '{raw}' is not a whole number of seconds")
+    })?;
+    if secs == 0 {
+        bail!("AKATSUKI_INVARIANT_TIMEOUT must be >= 1 second");
+    }
+    Ok(Duration::from_secs(secs.min(MAX_INVARIANT_TIMEOUT_SECS)))
 }
 
 /// Markdown notes that participate in the link graph: every `.md` under the vault
@@ -464,20 +477,34 @@ pub struct ReconcileReport {
 /// needs quoting, leaving every other byte of the file untouched.
 fn quote_colon_scalars(text: &str, rel: &str, actions: &mut Vec<String>) -> Option<String> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    if lines.first().is_none_or(|line| !line.starts_with("---")) {
+    if lines.first().is_none_or(|line| line.trim_end() != "---") {
         return None;
     }
-    let closing = (1..lines.len()).find(|&i| lines[i].trim() == "---")?;
+    let closing = (1..lines.len()).find(|&i| lines[i].trim_end() == "---")?;
     let fm_start = lines[0].len();
     let fm_end: usize = lines[..closing].iter().map(|line| line.len()).sum();
 
     let mut changed = false;
+    let mut block_indent: Option<usize> = None;
     let mut rewritten = String::with_capacity(fm_end - fm_start);
     for line in text[fm_start..fm_end].split_inclusive('\n') {
         // Keep the line's own terminator: only the quoted lines may change.
         let body = line.strip_suffix('\n').unwrap_or(line);
         let body = body.strip_suffix('\r').unwrap_or(body);
         let terminator = &line[body.len()..];
+        let indent_len = body.len() - body.trim_start().len();
+
+        // Lines inside a `|` / `>` block scalar are literal text, never `key: value`.
+        if let Some(parent_indent) = block_indent {
+            if body.trim().is_empty() || indent_len > parent_indent {
+                rewritten.push_str(line);
+                continue;
+            }
+            block_indent = None;
+        }
+        if is_block_scalar_header(body) {
+            block_indent = Some(indent_len);
+        }
 
         let stripped = body.trim();
         if stripped.contains(':') && !stripped.starts_with('-') && !stripped.starts_with('#') {
@@ -492,7 +519,7 @@ fn quote_colon_scalars(text: &str, rel: &str, actions: &mut Vec<String>) -> Opti
                     let indent = &body[..body.len() - body.trim_start().len()];
                     rewritten.push_str(&format!(
                         "{indent}{key}: \"{}\"{terminator}",
-                        value.replace('"', "\\\"")
+                        value.replace('\\', "\\\\").replace('"', "\\\"")
                     ));
                     actions.push(format!("Auto-quoted frontmatter field '{key}' in {rel}"));
                     changed = true;
@@ -513,6 +540,18 @@ fn quote_colon_scalars(text: &str, rel: &str, actions: &mut Vec<String>) -> Opti
     Some(new_content)
 }
 
+/// True for a `key: |` / `key: >` line (optional chomping/indent indicators).
+fn is_block_scalar_header(line: &str) -> bool {
+    let Some((_, value)) = line.split_once(':') else {
+        return false;
+    };
+    let value = value.trim();
+    value.starts_with(['|', '>'])
+        && value[1..]
+            .chars()
+            .all(|c| matches!(c, '+' | '-' | '0'..='9'))
+}
+
 /// Reconciles the vault with its projection: quotes colon-bearing frontmatter scalars,
 /// appends unindexed notes to their parent MOC, then synchronizes the index.
 ///
@@ -520,6 +559,15 @@ fn quote_colon_scalars(text: &str, rel: &str, actions: &mut Vec<String>) -> Opti
 /// performs the full scan, reports the actions it would take, and writes nothing.
 pub fn reconcile_vault(vault: &Path, dry_run: bool) -> Result<ReconcileReport> {
     let mut actions = Vec::new();
+
+    // Held across every read-modify-write below so a concurrent edit between the
+    // read and the rename can never be overwritten with stale bytes. Not nested:
+    // nothing under this scope acquires the lock again (ADR-0003).
+    let heal_lock = if dry_run {
+        None
+    } else {
+        Some(VaultLock::acquire(vault)?)
+    };
 
     for (rel, abs) in linkable_notes(vault)? {
         let text = match fs::read_to_string(&abs) {
@@ -535,10 +583,7 @@ pub fn reconcile_vault(vault: &Path, dry_run: bool) -> Result<ReconcileReport> {
         if dry_run {
             continue;
         }
-        {
-            let _lock = VaultLock::acquire(vault)?;
-            write_atomic(&abs, &new_content)?;
-        }
+        write_atomic(&abs, &new_content)?;
     }
 
     for (rel, parent_moc_rel) in audit_links(vault)?.unindexed {
@@ -565,11 +610,9 @@ pub fn reconcile_vault(vault: &Path, dry_run: bool) -> Result<ReconcileReport> {
             moc_text.push('\n');
         }
         moc_text.push_str(&format!("- {target_link}\n"));
-        {
-            let _lock = VaultLock::acquire(vault)?;
-            write_atomic(&parent_moc, &moc_text)?;
-        }
+        write_atomic(&parent_moc, &moc_text)?;
     }
+    drop(heal_lock);
 
     let mut con = open_cache_db(vault)?;
     let sync = if dry_run {
@@ -646,7 +689,23 @@ pub fn run_verification_tests(
     let mut results = Vec::new();
     let mut passed = 0;
     let mut failed = 0;
+    let started = Instant::now();
     for (src, cmd) in rows {
+        if !dry_run && started.elapsed() > Duration::from_secs(INVARIANT_TOTAL_BUDGET_SECS) {
+            failed += 1;
+            results.push(TestItem {
+                source: src,
+                command: cmd,
+                passed: false,
+                executed: false,
+                exit_code: 124,
+                stdout: String::new(),
+                stderr: format!(
+                    "Not run: aggregate budget of {INVARIANT_TOTAL_BUDGET_SECS}s exhausted"
+                ),
+            });
+            continue;
+        }
         if dry_run {
             results.push(TestItem {
                 source: src,
@@ -713,9 +772,8 @@ fn is_dangerous_invariant_command(command: &str) -> bool {
     }
 
     // 4. Token-based matching for destructive commands
-    let is_boundary = |c: char| {
-        c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`' | '$' | '<')
-    };
+    let is_boundary =
+        |c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`' | '$' | '<');
     for token in lower.split(is_boundary) {
         let trimmed = token.trim_matches(|c: char| c == '"' || c == '\'' || c == '\\');
         match trimmed {
@@ -740,6 +798,67 @@ fn is_dangerous_invariant_command(command: &str) -> bool {
     false
 }
 
+/// Environment variables an invariant keeps under `AKATSUKI_INVARIANT_ENV=clean`.
+const CLEAN_ENV_ALLOWLIST: [&str; 3] = ["PATH", "HOME", "LANG"];
+
+/// Spawns `bash -c` in its own process group with stdin closed. Vault-authored
+/// shell is executed by design (see README trust model); the environment is
+/// inherited unless `AKATSUKI_INVARIANT_ENV=clean` scrubs it to an allowlist.
+fn spawn_invariant(command: &str, cwd: &Path) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+
+    let script = format!("set -eo pipefail;\n{}", command);
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(&script)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    if std::env::var("AKATSUKI_INVARIANT_ENV").is_ok_and(|v| v == "clean") {
+        cmd.env_clear();
+        for key in CLEAN_ENV_ALLOWLIST {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+    }
+    cmd.spawn()
+}
+
+/// Captures at most 2 MiB from `pipe` on a thread, then keeps draining (and
+/// discarding) so the child never receives SIGPIPE for being chatty.
+fn drain_capped<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> Option<std::sync::mpsc::Receiver<Vec<u8>>> {
+    use std::io::Read;
+
+    let mut pipe = pipe?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.by_ref().take(2 * 1024 * 1024).read_to_end(&mut buf);
+        let _ = tx.send(buf);
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+    });
+    Some(rx)
+}
+
+/// SIGKILLs the whole process group led by `child` (also reaps stragglers such as
+/// `(sleep 30 &)` after a normal exit; ESRCH on an empty group is ignored).
+fn reap_group(child: &mut std::process::Child) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{}", child.id()))
+        .status();
+}
+
+fn received(rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
+    rx.and_then(|rx| rx.recv_timeout(Duration::from_millis(500)).ok())
+        .unwrap_or_default()
+}
+
 /// Executes one invariant under a hard ceiling. A wedged assertion (`nc -z`, an
 /// unbounded `curl`) must never stall the caller, let alone the MCP request loop.
 fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
@@ -750,61 +869,32 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
             "Security violation: command contains prohibited destructive or system-modifying operations".to_string(),
         );
     }
+    let timeout = match invariant_timeout() {
+        Ok(timeout) => timeout,
+        Err(e) => return (1, String::new(), format!("{e:#}")),
+    };
 
-    use std::io::Read;
-    use std::os::unix::process::CommandExt;
-
-    let script = format!("set -eo pipefail;\n{}", command);
-    let spawn = Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn();
-
-    let mut child = match spawn {
+    let mut child = match spawn_invariant(command, cwd) {
         Ok(child) => child,
         Err(e) => return (1, String::new(), format!("Failed to spawn bash: {}", e)),
     };
+    let rx_out = drain_capped(child.stdout.take());
+    let rx_err = drain_capped(child.stderr.take());
 
-    let (tx_out, rx_out) = std::sync::mpsc::channel();
-    let (tx_err, rx_err) = std::sync::mpsc::channel();
-    let _stdout_handle = child.stdout.take().map(|pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.take(2 * 1024 * 1024).read_to_end(&mut buf);
-            let _ = tx_out.send(buf);
-        })
-    });
-    let _stderr_handle = child.stderr.take().map(|pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.take(2 * 1024 * 1024).read_to_end(&mut buf);
-            let _ = tx_err.send(buf);
-        })
-    });
-
-    let kill_group = |child: &mut std::process::Child| {
-        let _ = child.kill();
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{}", child.id()))
-            .status();
-        let _ = child.wait();
-    };
-
-    let timeout = invariant_timeout();
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
+    let mut status = None;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(done)) => {
+                status = Some(done);
+                break;
+            }
             Ok(None) => {}
             Err(e) => {
                 eprintln!("Failed to await invariant: {}", e);
-                kill_group(&mut child);
+                reap_group(&mut child);
+                let _ = child.wait();
                 return (
                     1,
                     String::new(),
@@ -814,18 +904,16 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            kill_group(&mut child);
+            let _ = child.kill();
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    reap_group(&mut child);
+    let _ = child.wait();
 
-    let stdout = rx_out
-        .recv_timeout(Duration::from_millis(500))
-        .unwrap_or_default();
-    let stderr = rx_err
-        .recv_timeout(Duration::from_millis(500))
-        .unwrap_or_default();
+    let stdout = received(rx_out);
+    let stderr = received(rx_err);
 
     if timed_out {
         return (
@@ -838,7 +926,7 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
         );
     }
 
-    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+    let code = status.and_then(|s| s.code()).unwrap_or(1);
     (
         code,
         String::from_utf8_lossy(&stdout).trim().to_string(),

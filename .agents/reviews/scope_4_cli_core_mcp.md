@@ -1,62 +1,61 @@
 ---
-scope: "Scope 4: CLI Interface & MCP Server Gateway"
-score: 9.5
-status: "EXEMPLARY"
+scope: scope_4_cli_core_mcp (src/cli/mod.rs, src/mcp/mod.rs)
+score: 7.4
+status: MODERATE
 critical_findings: 0
 invariant_breaches: []
 ---
 
-# Scope 4 Audit: CLI Interface & MCP Server Gateway
+# Scope 4 — CLI core & MCP stdio gateway (intra-gateway defects)
 
-## 1. Executive Summary
-- **Health Score**: 9.5 / 10.0 (EXEMPLARY).
-- **Substrate**: Native Clap v4 CLI dispatcher ([`src/cli/mod.rs:20-642`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L20-L642)) and JSON-RPC 2.0 stdio MCP server ([`src/mcp/mod.rs:21-556`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L21-L556)) exposing 20 architectural knowledge tools.
-- **Verdict**: The CLI interface and MCP daemon exhibit exceptional structural rigor. Prior invariant breaches—including exit code 0 masking under `--json` in `lint` and `verify`, uncoerced scalar values in `akatsuki_set`, unvalidated enums in `Map.direction`, and schema parameter omissions—have been comprehensively remediated and verified by regression tests (`tests/regression_tests.rs:1-603`). Panic containment (`catch_unwind`), stdio JSON-RPC notification compliance, and token spill protection (< 2.5 KB responses) are robust. Zero critical findings or invariant breaches remain.
+Method: crafted JSON-RPC piped into `target/debug/akatsuki --vault /tmp/av/v mcp` (1-note temp vault); CLI exit codes probed directly. No source or test files modified. Prior = DEFECTIVE. Gateway-parity seams excluded (see scope_seams.md).
 
----
+Negative results (vectors tried, no defect): path traversal via `akatsuki_read`/`write_note` (`../`, absolute, `projects/../../x`) rejected; `akatsuki_query` DROP/DELETE rejected, `load_extension` → `not authorized`; `akatsuki_daily` date `../../x` rejected; no stdout pollution (banner on stderr, [L22](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L22)); 50 MB line survived (RSS 154 MB, both pings answered); 50 searches in 0.37 s (1-note vault; per-call reconcile cost not visible at this scale, larger vaults unmeasured); `Cargo.toml` has no `panic=abort`, so [catch_unwind](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L95) is effective (no panic was triggered in probes).
 
-## 2. Verification of Prior Remediations
-1. **Exit Code 1 Integrity on `--json` Failure**:
-   - `std::process::exit(1)` is now positioned after both text and JSON serialization in `Commands::Lint` ([`src/cli/mod.rs:541-543`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L541-L543)) and `Commands::Verify` ([`src/cli/mod.rs:563-565`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L563-L565)). CI automation running `--json` correctly fails with exit code 1 on schema/link violations (asserted in [`tests/regression_tests.rs:182-193`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L182-L193)).
-2. **Native Scalar Coercion in `akatsuki_set`**:
-   - [`src/mcp/mod.rs:447-455`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L447-L455) parses `Value::String`, `Value::Number`, `Value::Bool`, `Value::Array`, and `Value::Object`, serializing non-string inputs rather than discarding them to empty strings (asserted in [`tests/regression_tests.rs:299-325`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L299-L325)).
-3. **Clap Enum Validation for `Map.direction`**:
-   - [`src/cli/mod.rs:86-87`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L86-L87) enforces `value_parser = ["both", "down", "up"]`, causing invalid directions to cleanly exit 2 via Clap before execution (asserted in [`tests/regression_tests.rs:492-508`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L492-L508)).
-4. **Tool Schema Alignment**:
-   - `budget` is formally declared in `akatsuki_read` ([`src/mcp/mod.rs:584`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L584)); `raw` is declared in `akatsuki_write_note` ([`src/mcp/mod.rs:663`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L663)).
-5. **Bidirectional Parameter Aliasing**:
-   - `akatsuki_contract`, `akatsuki_blast`, and `akatsuki_map` accept `note`, `target`, and `path` interchangeably ([`src/mcp/mod.rs:218-223, 239-244, 260-265`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L218-L223); asserted in [`tests/regression_tests.rs:512-566`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L512-L566)).
+## Findings
 
----
+### F1 (Moderate) — Batch arrays and non-object messages silently dropped
+[mcp/mod.rs#L55-L62](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L55-L62): `req.get("id")` on Array/String/Number yields `None` → treated as notification → skipped.
+Counterexample: `[{"jsonrpc":"2.0","id":2,"method":"ping"}]`, `"str"`, `42` → zero output. Spec requires batch handling or `-32600 Invalid Request` with `id:null`. A host awaiting id 2 hangs until its own timeout.
 
-## 3. Dimensional Audit Findings
+### F2 (Moderate) — Missing `method` → -32601 not -32600; `jsonrpc` version unchecked; id type unchecked
+[mcp/mod.rs#L56](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L56), [L128-L132](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L128-L132).
+Counterexamples: `{"jsonrpc":"2.0","id":3}` → `-32601 "Method '' not found"`; `{"jsonrpc":"1.0","id":4,"method":"ping"}` → success; `id:{"a":1}` echoed back as valid; `id:null` request answered as a normal request.
 
-### A. Correctness
-- **Clap Parsing & Flag Handling**: Global `--vault` option ([`src/cli/mod.rs:23-24`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L23-L24)) operates consistently across all 22 subcommands. `allow_hyphen_values = true` on `Write`, `Replace`, and `Append` ([`src/cli/mod.rs:135, 150, 172`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L135)) allows raw markdown bullet lists (`- item`) without triggering argument syntax errors.
-- **Exit Code Conventions**: Syntax errors and invalid enum arguments trigger exit code 2. Verification/lint failures trigger exit code 1. Runtime failures bubble through `anyhow::Result` to exit 1 ([`src/main.rs:6-9`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/main.rs#L6-L9)). All human/json diagnostic outputs route to stdout while error traces route to stderr.
-- **JSON-RPC 2.0 Compliance**: Handlers for `initialize`, `tools/list`, `tools/call`, and `ping` conform to MCP protocol version `2024-11-05` ([`src/mcp/mod.rs:65-127`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L65-L127)). Id-less notifications are strictly dropped without generating replies ([`src/mcp/mod.rs:60-62`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L60-L62); [`tests/regression_tests.rs:144-159`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L144-L159)). Parse errors emit code `-32700` and unknown methods emit `-32601`.
-- **Schema Parity**: Exactly 20 tools declared in `get_tool_definitions()` ([`src/mcp/mod.rs:558-786`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L558-L786)) map 1:1 to `dispatch_tool` arms ([`src/mcp/mod.rs:142-555`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L142-L555)).
+### F3 (Moderate) — Unknown tool / missing `params.name` / non-object `params` are not protocol errors
+[mcp/mod.rs#L87-L91](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L87-L91): `unwrap_or("")` coerces absent name.
+Counterexamples: `params:[]` → `isError:true "Tool '' not implemented"`; `arguments:[]` accepted; unknown tool `nope` → isError result rather than `-32602`. Clients cannot distinguish malformed request from tool-level failure.
 
-### B. Robustness
-- **Panic Isolation**: Tool execution in `tools/call` is enclosed in `std::panic::catch_unwind(AssertUnwindSafe(...))` ([`src/mcp/mod.rs:95-107`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L95-L107)). Panicking handlers return `{ "content": [...], "isError": true }` with `panic_message` ([`src/mcp/mod.rs:812-820`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L812-L820)) without terminating the daemon.
-- **Stdin EOF & Stream Resilience**: Stdin line loop terminates cleanly on EOF ([`src/mcp/mod.rs:30-34`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L30-L34)). Malformed JSON frames emit standard `-32700` responses and continue loop execution without crashing ([`src/mcp/mod.rs:43-52`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L43-L52)).
-- **Token Spill Trap Prevention**: Compact search hit formatting (`format_hits_compact`), UTF-8 multibyte truncation ([`tests/regression_tests.rs:31-51`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L31-51)), and `MCP_DEFAULT_LIMIT = 5` ([`src/constants.rs:36`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/constants.rs#L36)) restrict search responses to ~1.6 KB (under Antigravity 4000-byte spill trap). `akatsuki_read` enforces token budgets via `apply_token_budget` ([`src/storage/mod.rs:629-655`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L629-L655)), preserving frontmatter while truncating body text.
+### F4 (Moderate) — Invalid UTF-8 on stdin kills the server silently, exit 0
+[mcp/mod.rs#L30-L34](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L30-L34): `lines()` returns `Err(InvalidData)` on any non-UTF-8 byte → `break` → `Ok(())`.
+Counterexample: `printf '\xff\n'` then valid ping → no `-32700`, ping unanswered, exit code 0 (indistinguishable from clean EOF), nothing on stderr.
 
-### C. Performance
-- **Stdio I/O Buffering**: `stdin.lock().lines()` provides efficient buffered input consumption. Responses are formatted into single strings and flushed immediately via `stdout.flush()?` ([`src/mcp/mod.rs:50, 136`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L50)), preventing pipe deadlocks.
-- **Database & Re-Indexing Invariant**: Tool calls requiring database state invoke `open_synced_db(vault)` ([`src/index/mod.rs:110-114`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/index/mod.rs#L110-L114)), which opens SQLite and executes `sync_vault_index` on every invocation ([`src/mcp/mod.rs:287, 319`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L287)). While this guarantees zero stale reads across process boundaries, in a persistent MCP daemon with hundreds of notes, scanning directories and computing BLAKE3 hashes per tool call adds redundant I/O.
+### F5 (Moderate) — Argument coercion degrades invalid input silently; `dry_run` fails open
+- [L809-L810](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L809-L810) `arg_usize`: `-1`, floats, junk strings → `None` → default limit (verified `limit:-1` returned results); `u64::MAX` accepted uncapped at gateway (verified); `limit:0` returns "No notes found" (same text as a true miss).
+- [L145](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L145): `query:123` → `unwrap_or("")` → `isError:false "No notes found matching query."` False negative reported as success.
+- [L797-L801](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L797-L801) `arg_bool` unrecognized string → `None`; [L403](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L403) `unwrap_or(false)` → `dry_run:"ture"` (typo) runs live bash assertions. Fail-open on the safety flag; violates DATA_LOSS "no silent fallbacks".
 
-### D. Security
-- **Path Traversal Protection**: Note resolution and mutations enforce `contained_path` ([`src/storage/mod.rs:192-236`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/storage/mod.rs#L192-L236)), strictly blocking directory traversal attacks ([`tests/regression_tests.rs:76-84, 266-272`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L76-L84)).
-- **Read-Only SQL Invariants**: `execute_sql_query` strictly rejects mutating statements and enforces `stmt.readonly()` ([`src/search/mod.rs:377-393`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/search/mod.rs#L377-L393)), blocking mutating CTEs and schema tampering ([`tests/regression_tests.rs:232-261`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L232-L261)).
-- **Invariant Execution Containment**: `akatsuki_test` / `Commands::Test` executes `bash:verify` commands under process groups with strict timeouts (`invariant_timeout()`, default 10s) and asynchronous pipe-draining threads ([`src/verify/mod.rs:687-725`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/verify/mod.rs#L687-L725)), preventing hanging processes ([`tests/regression_tests.rs:89-111, 330-353`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/tests/regression_tests.rs#L89-L111)).
-- **Information Exposure**: Diagnostic errors return cleanly sanitized messages; sensitive system paths and credentials are not exposed in stdout/stderr error streams.
+### F6 (Minor) — `akatsuki_query` silently discards trailing statements
+Counterexample: `select 1; delete from notes` → `isError:false`, `[{"1":1}]`. Only the first statement runs; the rest vanish without notice. Not exploitable (authorizer verified; `WITH x AS (…) delete` and `load_extension` fail), but misleads caller.
 
----
+### F7 (Minor) — `akatsuki_test` overloads `isError` with assertion failure
+[mcp/mod.rs#L405-L408](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L405-L408): `isError = rep.failed > 0`; completed run with failures is flagged like a crash. CLI `lint` exits 1 on `!passed` ([cli/mod.rs#L541-L543](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/cli/mod.rs#L541-L543)) — consistent with CLI, but MCP clients lose the distinction.
 
-## 4. Minor Residual Polish Items
+### F8 (Minor) — CLI errors under `--json` are plain text; single exit code
+`read nonexist --json` and `query "delete…" --json` print `Error: …` on stderr, rc 1 ([main.rs#L6-L9](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/main.rs#L6-L9) via `Result`). Every failure class (not found, security violation, I/O) → rc 1; `--vault /nonexist read a` reports "Note 'a' not found", masking the missing-vault root cause.
 
-| Priority | Component | Item & Location | Rationale |
-| :--- | :--- | :--- | :--- |
-| **Low** | Schema Aliasing | Declare `target` in `akatsuki_read` ([`src/mcp/mod.rs:580`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L580)) & `akatsuki_test` ([`src/mcp/mod.rs:689`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L689)); declare `path` in `akatsuki_map` ([`src/mcp/mod.rs:617`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L617)). | Handler code supports these aliases; documenting them in JSON schema ensures client LLM discovery. |
-| **Low** | Daemon DB Cache | Cache SQLite `Connection` and debounce vault hash scans in `run_mcp_server` ([`src/mcp/mod.rs:21`](file:///home/fusuyfusuy/Projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L21)). | Reduces repetitive disk scans during rapid multi-turn MCP tool invocation bursts. |
+### F9 (Minor) — `blast <unknown>` returns success with empty graph
+`blast zzz --json` → rc 0, empty upstream/downstream/boundary_sinks; unknown target indistinguishable from isolated node. MCP path [L238-L257](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L238-L257) identical.
+
+### F10 (Minor) — No bound on request line length
+[mcp/mod.rs#L30](file:///home/devhax/projects/fusuyfusuy/akatsuki/src/mcp/mod.rs#L30): unbounded line buffer; 50 MB line → 154 MB RSS (~3x amplification). Multi-GB line → OOM. Low probability for local stdio.
+
+## Failure-vector ledger (quota ≥3)
+| Vector | Result |
+|---|---|
+| Boundary poison (batch, non-object, bad UTF-8, wrong types) | F1, F3, F4, F5 defects |
+| Concurrency/timeout | Single-threaded sequential loop; per-assertion 10 s timeout in `akatsuki_test` but no aggregate cap — N assertions can block the loop N×10 s, no cancellation (static reading, not measured). Panic containment present, untriggered. |
+| Resource saturation | F10; `limit` uncapped at gateway (F5) |
+
+## Score
+7.4 — no traversal, data-integrity, or stdout-pollution breach found; protocol-conformance gaps (F1–F4) and fail-open `dry_run` coercion (F5) keep it Moderate.

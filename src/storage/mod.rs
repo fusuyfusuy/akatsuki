@@ -7,10 +7,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-use crate::constants::RAW_EXTS;
+use crate::constants::{LOCK_TIMEOUT_SECS, RAW_EXTS};
 
 pub struct VaultLock {
     _file: File,
@@ -27,14 +28,30 @@ impl VaultLock {
             .open(&lock_path)
             .with_context(|| format!("Failed to open lockfile: {}", lock_path.display()))?;
 
-        file.lock_exclusive().with_context(|| {
-            format!(
-                "Failed to acquire exclusive lock on {}",
-                lock_path.display()
-            )
-        })?;
-
-        Ok(Self { _file: file })
+        let deadline = Instant::now() + Duration::from_secs(LOCK_TIMEOUT_SECS);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                    if Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "Vault lock {} held for more than {}s",
+                            lock_path.display(),
+                            LOCK_TIMEOUT_SECS
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to acquire exclusive lock on {}",
+                            lock_path.display()
+                        )
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -77,83 +94,100 @@ pub fn machine_id() -> String {
     "local".to_string()
 }
 
-pub fn resolve_vault_path(explicit: Option<&Path>) -> PathBuf {
+/// Expand a leading `~`/`~/` using the home directory, then `$VAR` references.
+fn expand_path(s: &str) -> PathBuf {
+    let expanded = shellexpand(s);
+    let home = dirs::home_dir();
+    match (expanded.strip_prefix('~'), home) {
+        (Some(""), Some(h)) => h,
+        (Some(rest), Some(h)) if rest.starts_with('/') => h.join(rest.trim_start_matches('/')),
+        _ => PathBuf::from(expanded),
+    }
+}
+
+fn canonical_dir(p: PathBuf) -> PathBuf {
+    p.canonicalize().unwrap_or(p)
+}
+
+fn vault_from_config_file(home: &Path) -> Option<PathBuf> {
+    let content = fs::read_to_string(home.join(".config/knowledge-base/env")).ok()?;
+    content.lines().find_map(|line| {
+        let trim = line.trim();
+        let val = trim
+            .strip_prefix("export AKATSUKI_VAULT=")
+            .or_else(|| trim.strip_prefix("AKATSUKI_VAULT="))?;
+        let pb = expand_path(val.trim_matches(|c| c == '"' || c == '\''));
+        pb.is_dir().then(|| canonical_dir(pb))
+    })
+}
+
+fn is_vault_marker_dir(dir: &Path) -> Option<PathBuf> {
+    if dir.join("40-Systems").is_dir() && dir.join("20-Projects").is_dir() {
+        return Some(dir.to_path_buf());
+    }
+    let av = dir.join("akatsuvault");
+    if av.join("40-Systems").is_dir() && av.join("20-Projects").is_dir() {
+        return Some(av);
+    }
+    let ak = dir.join("akatsuki");
+    if ak.join("40-Systems").is_dir() && ak.join("20-Projects").is_dir() {
+        return Some(ak);
+    }
+    let marked = dir.join(".akatsuki").is_dir()
+        || (dir.join("INDEX.md").is_file() && dir.join("AGENTS.md").is_file());
+    marked.then(|| dir.to_path_buf())
+}
+
+fn vault_from_cwd_walk(home: Option<&Path>) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    cwd.ancestors()
+        .filter(|dir| home != Some(*dir))
+        .find_map(is_vault_marker_dir)
+        .map(canonical_dir)
+}
+
+/// Resolve the vault root: explicit path, `AKATSUKI_VAULT`, config file, marker walk
+/// from the cwd (never `$HOME` itself), then well-known home directories.
+/// An explicit or env-provided path that is not a directory is an error; there is
+/// no cwd fallback.
+pub fn resolve_vault_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = explicit {
-        if let Ok(canon) = p.canonicalize() {
-            return canon;
-        }
-        return p.to_path_buf();
+        let pb = expand_path(&p.to_string_lossy());
+        anyhow::ensure!(
+            pb.is_dir(),
+            "vault path is not a directory: {}",
+            pb.display()
+        );
+        return Ok(canonical_dir(pb));
     }
-
     if let Ok(env_p) = std::env::var("AKATSUKI_VAULT") {
-        let pb = PathBuf::from(shellexpand(&env_p));
-        if pb.is_dir() {
-            if let Ok(c) = pb.canonicalize() {
-                return c;
-            }
-            return pb;
-        }
+        let pb = expand_path(&env_p);
+        anyhow::ensure!(
+            pb.is_dir(),
+            "AKATSUKI_VAULT is not a directory: {}",
+            pb.display()
+        );
+        return Ok(canonical_dir(pb));
     }
-
-    // Check ~/.config/knowledge-base/env
-    if let Some(home) = dirs::home_dir() {
-        let cfg_env = home.join(".config/knowledge-base/env");
-        if cfg_env.is_file() {
-            if let Ok(content) = fs::read_to_string(&cfg_env) {
-                for line in content.lines() {
-                    let trim = line.trim();
-                    if let Some(val) = trim
-                        .strip_prefix("export AKATSUKI_VAULT=")
-                        .or_else(|| trim.strip_prefix("AKATSUKI_VAULT="))
-                    {
-                        let clean = val.trim_matches(|c| c == '"' || c == '\'');
-                        let pb = PathBuf::from(shellexpand(clean));
-                        if pb.is_dir() {
-                            return pb.canonicalize().unwrap_or(pb);
-                        }
-                    }
-                }
-            }
-        }
+    let home = dirs::home_dir();
+    if let Some(v) = home.as_deref().and_then(vault_from_config_file) {
+        return Ok(v);
     }
-
-    // Upward directory walk
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut curr: Option<&Path> = Some(&cwd);
-        while let Some(dir) = curr {
-            if dir.join("40-Systems").is_dir() && dir.join("20-Projects").is_dir() {
-                return dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-            }
-            if dir.join("akatsuki/40-Systems").is_dir() && dir.join("akatsuki/20-Projects").is_dir()
-            {
-                let ak = dir.join("akatsuki");
-                return ak.canonicalize().unwrap_or(ak);
-            }
-            if dir.join(".akatsuki").is_dir()
-                || (dir.join("INDEX.md").is_file() && dir.join("AGENTS.md").is_file())
-            {
-                return dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-            }
-            curr = dir.parent();
-        }
+    if let Some(v) = vault_from_cwd_walk(home.as_deref()) {
+        return Ok(v);
     }
-
-    // Well-known defaults
-    if let Some(home) = dirs::home_dir() {
-        let candidates = [
-            home.join("configs/knowledge-base/akatsuki"),
-            home.join(".config/akatsuki"),
-            home.join(".akatsuki"),
-            home.join("akatsuki"),
-        ];
-        for c in candidates {
-            if c.is_dir() {
-                return c.canonicalize().unwrap_or(c);
-            }
-        }
-    }
-
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let defaults = [
+        "configs/knowledge-base/akatsuvault",
+        "configs/knowledge-base/akatsuki",
+        ".config/akatsuki",
+        ".akatsuki",
+        "akatsuki",
+    ];
+    home.iter()
+        .flat_map(|h| defaults.iter().map(move |d| h.join(d)))
+        .find(|c| c.is_dir())
+        .map(canonical_dir)
+        .ok_or_else(|| anyhow::anyhow!("no vault found: pass --vault or set AKATSUKI_VAULT"))
 }
 
 pub fn shellexpand(s: &str) -> String {
@@ -287,18 +321,8 @@ pub fn parse_frontmatter(content: &str) -> Result<(Value, String)> {
         None => return Ok((serde_json::json!({}), content.to_string())),
     };
 
-    let mut offset = 0usize;
-    let mut close: Option<(usize, usize)> = None;
-    for line in after_open.split_inclusive('\n') {
-        if line.trim_end_matches(['\r', '\n']).trim() == "---" {
-            close = Some((offset, offset + line.len()));
-            break;
-        }
-        offset += line.len();
-    }
-
-    let (yaml_end, body_start) =
-        close.context("Malformed frontmatter: opening '---' fence is never closed")?;
+    let (yaml_end, body_start) = closing_fence(after_open)
+        .context("Malformed frontmatter: opening '---' fence is never closed")?;
 
     let parsed: Value = serde_yaml::from_str(&after_open[..yaml_end])
         .context("Invalid YAML frontmatter: value is not parseable")?;
@@ -324,14 +348,139 @@ pub fn parse_frontmatter(content: &str) -> Result<(Value, String)> {
     Ok((meta, body))
 }
 
+/// A frontmatter fence is exactly `---` at column 0 (trailing whitespace allowed).
+fn is_fence(line: &str) -> bool {
+    line.trim_end() == "---"
+}
+
 /// Text following the opening `---` fence line, or `None` when the note does not
 /// begin with a frontmatter fence.
 fn opening_fence(content: &str) -> Option<&str> {
     let line_end = content.find('\n')?;
-    if content[..line_end].trim_end_matches('\r').trim() != "---" {
+    if !is_fence(&content[..line_end]) {
         return None;
     }
     Some(&content[line_end + 1..])
+}
+
+/// `(yaml_end, body_start)` offsets of the first column-0 closing fence in `after_open`.
+fn closing_fence(after_open: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for line in after_open.split_inclusive('\n') {
+        if is_fence(line) {
+            return Some((offset, offset + line.len()));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// `(frontmatter block including both fences, body)` when `text` starts with a
+/// well-formed frontmatter block; `None` otherwise (no fence, unclosed, or BOM).
+pub fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let after_open = opening_fence(text)?;
+    let (_, body_start) = closing_fence(after_open)?;
+    let block_len = text.len() - after_open.len() + body_start;
+    Some((&text[..block_len], &text[block_len..]))
+}
+
+/// The note text with a well-formed frontmatter block removed; text with no
+/// fence or an unclosed fence is returned whole (lenient, never errors).
+fn body_after_frontmatter(content: &str) -> &str {
+    let text = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let Some(after_open) = opening_fence(text) else {
+        return text;
+    };
+    match closing_fence(after_open) {
+        Some((_, body_start)) => &after_open[body_start..],
+        None => text,
+    }
+}
+
+/// Line span `[start, end)` of top-level `key` in `lines` (key line plus its
+/// indented / sequence continuation lines). `Err` when the YAML uses a shape this
+/// patcher refuses to edit textually (quoted key, anchors, aliases, merge keys).
+fn find_key_span(lines: &[&str], key: &str) -> Result<Option<(usize, usize)>> {
+    let prefix = format!("{}:", key);
+    let mut start = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with(['"', '\''])
+            || line.starts_with("<<")
+            || line.contains(": &")
+            || line.contains(": *")
+        {
+            anyhow::bail!("frontmatter shape needs the structural rewrite path");
+        }
+        if start.is_none() && line.starts_with(&prefix) {
+            start = Some(i);
+        }
+    }
+    let Some(start) = start else {
+        return Ok(None);
+    };
+    let mut end = start + 1;
+    while end < lines.len() {
+        let line = lines[end];
+        let continuation =
+            line.starts_with([' ', '\t']) || line.starts_with("- ") || line.trim().is_empty();
+        if !continuation {
+            break;
+        }
+        end += 1;
+    }
+    while end > start + 1 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    Ok(Some((start, end)))
+}
+
+/// YAML text of a scalar value; collections are refused (structural path).
+fn render_scalar(value: &Value) -> Result<String> {
+    match value {
+        Value::Array(_) | Value::Object(_) => {
+            anyhow::bail!("collection values need the structural rewrite path")
+        }
+        other => Ok(serde_yaml::to_string(other)?.trim_end().to_string()),
+    }
+}
+
+/// Replaces (or appends) top-level scalar keys in the raw frontmatter text,
+/// leaving every other byte of the note untouched.
+pub fn patch_frontmatter_keys(raw: &str, edits: &[(&str, Value)]) -> Result<String> {
+    let after_open = opening_fence(raw).context("Malformed frontmatter: no opening '---' fence")?;
+    let (yaml_end, _) = closing_fence(after_open)
+        .context("Malformed frontmatter: opening '---' fence is never closed")?;
+    let eol = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+
+    let mut yaml = after_open[..yaml_end].to_string();
+    for (key, value) in edits {
+        let rendered = render_scalar(value)?.replace('\n', eol);
+        let lines: Vec<&str> = yaml.split_inclusive('\n').collect();
+        yaml = match find_key_span(&lines, key)? {
+            Some((start, end)) => {
+                let mut out: String = lines[..start].concat();
+                out.push_str(&format!("{}: {}{}", key, rendered, eol));
+                out.push_str(&lines[end..].concat());
+                out
+            }
+            None => {
+                let sep = if yaml.is_empty() || yaml.ends_with('\n') {
+                    ""
+                } else {
+                    eol
+                };
+                format!("{}{}{}: {}{}", yaml, sep, key, rendered, eol)
+            }
+        };
+    }
+
+    let open_len = raw.len() - after_open.len();
+    Ok(format!(
+        "{}{}{}",
+        &raw[..open_len],
+        yaml,
+        &after_open[yaml_end..]
+    ))
 }
 
 pub fn dump_frontmatter(meta: &Value, body: &str) -> String {
@@ -352,10 +501,11 @@ pub fn write_atomic(target: &Path, content: &str) -> Result<()> {
     let tmp_path = target.with_extension(format!("tmp.{}.{}.{}", pid, count, rand_id));
 
     {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options
             .open(&tmp_path)
             .with_context(|| format!("Failed to create tmp file: {}", tmp_path.display()))?;
         file.write_all(content.as_bytes())?;
@@ -387,62 +537,99 @@ pub fn write_atomic(target: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// First note matching `query`, in a deterministic order (see `resolve_all`).
 pub fn resolve_note_file(vault: &Path, query: &str) -> Option<PathBuf> {
+    resolve_all(vault, query).into_iter().next()
+}
+
+/// The single note matching `query`; an ambiguous or missing match is an error
+/// so a mutation can never land on an arbitrary one of several same-named notes.
+pub fn resolve_note_file_unique(vault: &Path, query: &str) -> Result<PathBuf> {
+    let mut found = resolve_all(vault, query);
+    match found.len() {
+        0 => anyhow::bail!("Note not found: {}", query),
+        1 => Ok(found.remove(0)),
+        _ => {
+            let listed: Vec<String> = found
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(vault)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            anyhow::bail!("Ambiguous note '{}': matches {}", query, listed.join(", "))
+        }
+    }
+}
+
+/// Every note matching `query`. An exact vault-relative path wins outright;
+/// otherwise stem/title matches are returned exact-stem first, then by rel_path.
+fn resolve_all(vault: &Path, query: &str) -> Vec<PathBuf> {
     let q = query.trim().trim_matches(|c| c == '\'' || c == '"');
     if q.is_empty() || q.starts_with('/') || q.starts_with('~') {
-        return None;
+        return Vec::new();
     }
 
     let clean_q = q.strip_suffix(".md").unwrap_or(q);
-
-    // 1. Exact path inside vault
-    if let Some(p) = contained_path(vault, q) {
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let with_md = format!("{}.md", clean_q);
-    if let Some(p) = contained_path(vault, &with_md) {
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-
-    // 2. Normalized space <-> hyphen candidates
     let hyphenated = clean_q.replace(' ', "-");
     let spaced = clean_q.replace('-', " ");
 
-    if let Some(p) = contained_path(vault, &format!("{}.md", hyphenated)) {
-        if p.is_file() {
-            return Some(p);
+    // 1-2. Exact path, then normalized space <-> hyphen path candidates.
+    let direct = [
+        q.to_string(),
+        format!("{}.md", clean_q),
+        format!("{}.md", hyphenated),
+    ];
+    for rel in &direct {
+        if let Some(p) = contained_path(vault, rel).filter(|p| p.is_file()) {
+            return vec![p];
         }
     }
 
-    // 3. Fast SQLite cache lookup if index exists
+    let from_cache = cache_candidates(vault, clean_q, &hyphenated, &spaced);
+    if !from_cache.is_empty() {
+        return from_cache;
+    }
+    walk_candidates(vault, clean_q, &hyphenated, &spaced)
+}
+
+/// Cache lookup: exact-stem rows first, then rel_path order; rows whose file is
+/// gone or whose path is not contained in the vault are dropped.
+fn cache_candidates(vault: &Path, clean_q: &str, hyphenated: &str, spaced: &str) -> Vec<PathBuf> {
     let cache_db = vault.join(".akatsuki/cache.db");
-    if cache_db.is_file() {
-        if let Ok(con) = rusqlite::Connection::open_with_flags(
-            &cache_db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ) {
-            let sql = "SELECT rel_path FROM entities WHERE stem = ?1 COLLATE NOCASE OR stem = ?2 COLLATE NOCASE OR title = ?1 COLLATE NOCASE OR title = ?3 COLLATE NOCASE LIMIT 1";
-            if let Ok(mut stmt) = con.prepare(sql) {
-                if let Ok(rel) = stmt
-                    .query_row(rusqlite::params![clean_q, hyphenated, spaced], |row| {
-                        row.get::<_, String>(0)
-                    })
-                {
-                    if let Some(p) = contained_path(vault, &rel) {
-                        if p.is_file() {
-                            return Some(p);
-                        }
-                    }
-                }
-            }
-        }
+    if !cache_db.is_file() {
+        return Vec::new();
     }
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        &cache_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ) else {
+        return Vec::new();
+    };
+    let sql = "SELECT rel_path FROM entities \
+               WHERE stem = ?1 COLLATE NOCASE OR stem = ?2 COLLATE NOCASE \
+               OR title = ?1 COLLATE NOCASE OR title = ?3 COLLATE NOCASE \
+               ORDER BY (stem = ?1 COLLATE NOCASE) DESC, rel_path";
+    let Ok(mut stmt) = con.prepare(sql) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(rusqlite::params![clean_q, hyphenated, spaced], |row| {
+        row.get::<_, String>(0)
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter_map(|rel| contained_path(vault, &rel))
+        .filter(|p| p.is_file())
+        .collect()
+}
 
-    // 4. Filesystem scan fallback comparing stems
+/// Filesystem fallback comparing stems. Hidden entries below the vault root are
+/// skipped (the root itself may legitimately be a dot-directory); matches are
+/// sorted so the result never depends on readdir order.
+fn walk_candidates(vault: &Path, clean_q: &str, hyphenated: &str, spaced: &str) -> Vec<PathBuf> {
     let ignored_dirs = [
         ".git",
         ".akatsuki",
@@ -454,33 +641,33 @@ pub fn resolve_note_file(vault: &Path, query: &str) -> Option<PathBuf> {
     ];
     let walker = walkdir::WalkDir::new(vault).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
-        !ignored_dirs.iter().any(|ig| *ig == name)
+        let hidden = e.depth() > 0 && name.starts_with('.');
+        !hidden && !ignored_dirs.iter().any(|ig| *ig == name)
     });
 
     let q_stem_lower = clean_q.to_lowercase();
     let q_hyphen_lower = hyphenated.to_lowercase();
     let q_space_lower = spaced.to_lowercase();
 
-    for entry in walker.flatten() {
-        if entry.file_type().is_file() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "md") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    let stem_lower = stem.to_lowercase();
-                    let stem_space = stem_lower.replace('-', " ");
-                    if stem_lower == q_stem_lower
-                        || stem_lower == q_hyphen_lower
-                        || stem_space == q_space_lower
-                        || stem_space == q_stem_lower
-                    {
-                        return Some(path.to_path_buf());
-                    }
-                }
-            }
-        }
-    }
-
-    None
+    let mut found: Vec<PathBuf> = walker
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .filter(|path| {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                return false;
+            };
+            let stem_lower = stem.to_lowercase();
+            let stem_space = stem_lower.replace('-', " ");
+            stem_lower == q_stem_lower
+                || stem_lower == q_hyphen_lower
+                || stem_space == q_space_lower
+                || stem_space == q_stem_lower
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 pub fn normalize_heading(s: &str) -> String {
@@ -499,8 +686,13 @@ pub fn normalize_heading(s: &str) -> String {
         .join(" ")
 }
 
-/// Level and normalized text of a markdown heading line.
+/// Level and normalized text of a markdown heading line. A line indented by
+/// four or more columns is an indented code block, never a heading.
 pub fn heading_at(line: &str) -> Option<(usize, String)> {
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    if line[..indent].contains('\t') || indent >= 4 {
+        return None;
+    }
     let trimmed = line.trim();
     if !trimmed.starts_with('#') {
         return None;
@@ -511,6 +703,51 @@ pub fn heading_at(line: &str) -> Option<(usize, String)> {
         return None;
     }
     Some((level, normalize_heading(rest)))
+}
+
+/// Fence marker character and run length when `line` opens a fenced code block.
+fn fence_open(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let run = trimmed.chars().take_while(|c| *c == marker).count();
+    (run >= 3).then_some((marker, run))
+}
+
+/// True when `line` closes a fence opened with `marker` repeated `open_len` times.
+fn fence_closes(line: &str, marker: char, open_len: usize) -> bool {
+    let trimmed = line.trim();
+    let run = trimmed.chars().take_while(|c| *c == marker).count();
+    run >= open_len && trimmed[run..].is_empty()
+}
+
+/// First heading accepted by `predicate`, ending at the next heading of the same
+/// or higher level; headings inside fenced code blocks are ignored.
+fn scan_section(lines: &[&str], predicate: &dyn Fn(&str) -> bool) -> Option<(usize, usize, usize)> {
+    let mut in_fence: Option<(char, usize)> = None;
+    let mut found: Option<(usize, usize)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if let Some((marker, open_len)) = in_fence {
+            if fence_closes(line, marker, open_len) {
+                in_fence = None;
+            }
+            continue;
+        }
+        if let Some(opened) = fence_open(line) {
+            in_fence = Some(opened);
+            continue;
+        }
+        let Some((level, name)) = heading_at(line) else {
+            continue;
+        };
+        match found {
+            None if predicate(&name) => found = Some((index, level)),
+            Some((start, start_level)) if level <= start_level => {
+                return Some((start, start_level, index));
+            }
+            _ => {}
+        }
+    }
+    found.map(|(start, level)| (start, level, lines.len()))
 }
 
 /// Locates a section by heading: exact normalized match first, substring second.
@@ -524,53 +761,22 @@ pub fn locate_section(lines: &[&str], heading: &str) -> Option<(usize, usize, us
     if target.is_empty() {
         return None;
     }
+    scan_section(lines, &|name| name == target)
+        .or_else(|| scan_section(lines, &|name| name.contains(&target)))
+}
 
-    let scan = |predicate: &dyn Fn(&str) -> bool| -> Option<(usize, usize, usize)> {
-        let mut in_fence: Option<char> = None;
-        let mut found: Option<(usize, usize)> = None;
-        for (index, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            if let Some(fence_char) = in_fence {
-                let fence_prefix = if fence_char == '`' { "```" } else { "~~~" };
-                if trimmed.starts_with(fence_prefix) {
-                    in_fence = None;
-                }
-                continue;
-            }
-
-            if trimmed.starts_with("```") {
-                in_fence = Some('`');
-                continue;
-            } else if trimmed.starts_with("~~~") {
-                in_fence = Some('~');
-                continue;
-            }
-
-            let Some((level, name)) = heading_at(line) else {
-                continue;
-            };
-            match found {
-                None => {
-                    if predicate(&name) {
-                        found = Some((index, level));
-                    }
-                }
-                Some((_, matched_level)) if level <= matched_level => {
-                    let (start, start_level) = found.expect("checked");
-                    return Some((start, start_level, index));
-                }
-                Some(_) => {}
-            }
-        }
-
-        found.map(|(start, level)| (start, level, lines.len()))
-    };
-
-    scan(&|name| name == target).or_else(|| scan(&|name| name.contains(&target)))
+/// Exact-match variant for writers: a typo or short heading must never resolve
+/// to an unrelated section that merely contains the text.
+pub fn locate_section_exact(lines: &[&str], heading: &str) -> Option<(usize, usize, usize)> {
+    let target = normalize_heading(heading);
+    if target.is_empty() {
+        return None;
+    }
+    scan_section(lines, &|name| name == target)
 }
 
 pub fn extract_section(content: &str, section_name: &str) -> Option<String> {
-    let lines: Vec<&str> = content.lines().collect();
+    let lines: Vec<&str> = body_after_frontmatter(content).lines().collect();
     let (start, _level, end) = locate_section(&lines, section_name)?;
     Some(lines[start..end].join("\n"))
 }
@@ -617,8 +823,12 @@ pub fn auto_heal_frontmatter(content: &str, rel_path: &str) -> Result<String> {
 
     let existing_text = |map: &serde_json::Map<String, Value>, key: &str| -> Option<String> {
         map.get(key)
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.trim().to_string()),
+                Value::Number(n) => Some(n.to_string()),
+                Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            })
             .filter(|s| !s.is_empty())
     };
 
@@ -671,14 +881,14 @@ pub fn apply_token_budget(text: &str, budget: Option<usize>) -> String {
     let Some(budget) = budget.filter(|b| *b > 0) else {
         return text.to_string();
     };
-    let char_budget = budget * 4;
+    let char_budget = budget.saturating_mul(4);
     if text.len() <= char_budget {
         return text.to_string();
     }
 
     let mut packed = String::new();
     let mut used = 0usize;
-    let mut in_frontmatter = text.starts_with("---");
+    let mut in_frontmatter = opening_fence(text).is_some();
     let mut fences = 0usize;
     let mut frontmatter_chars = 0usize;
 
@@ -687,7 +897,7 @@ pub fn apply_token_budget(text: &str, budget: Option<usize>) -> String {
             packed.push_str(line);
             used += line.len();
             frontmatter_chars += line.len();
-            if line.trim() == "---" {
+            if is_fence(line) {
                 fences += 1;
                 if fences == 2 {
                     in_frontmatter = false;

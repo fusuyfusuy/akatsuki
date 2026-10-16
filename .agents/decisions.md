@@ -23,3 +23,9 @@
 - **Context**: The Python implementation used `.akatsuki/index.db` + `.akatsuki/vectors.db`; the Rust rewrite uses `.akatsuki/cache.db` with a different column set.
 - **Decision**: Treat the cache as a pure projection: version it in `schema_meta` and drop/rebuild on mismatch instead of migrating columns in place.
 - **Consequences**: Schema changes are cheap and can never leave a half-migrated index; the cost is a full re-index after an upgrade.
+
+## ADR-0005: Boundary Review Remediation Rulings
+- **Status**: Accepted
+- **Context**: A 20-task boundary review (`.agents/reviews/`) found contract drift across storage, index, search, verify, mcp and cli.
+- **Decision**: (D1) textual frontmatter patcher for top-level keys; (D2) invariants get `stdin=null`, env scrub opt-in via `AKATSUKI_INVARIANT_ENV=clean`; (D3) `search --json` prints the degradation notice to stderr; (D4) empty content is a valid write; (D5) canonical-only scalar coercion; (D6) vault resolution errors instead of falling back to cwd; (D7) ambiguous stems fail mutations; (D8) `--json` errors emit `{"error":..}` with exit 1; (D9) edges deduped in-memory, no DDL change; (D10) no version bump.
+- **Consequences**: Stricter inputs may reject previously tolerated calls (bad booleans, missing `value`, unknown map direction); rusqlite gained the `limits` feature; new notes are created mode 0600.

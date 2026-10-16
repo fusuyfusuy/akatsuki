@@ -235,7 +235,7 @@ pub enum Commands {
 }
 
 pub fn run_cli(cli: Cli) -> Result<()> {
-    let vault = resolve_vault_path(cli.vault.as_deref());
+    let vault = resolve_vault_path(cli.vault.as_deref())?;
 
     match cli.command {
         Commands::Search {
@@ -255,6 +255,9 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&hits)?);
+                if let Some(note) = degradation {
+                    eprintln!("⚠ {}", note);
+                }
             } else if compact {
                 println!("{}", format_hits_compact(&hits));
                 if let Some(note) = degradation {
@@ -381,7 +384,10 @@ pub fn run_cli(cli: Cli) -> Result<()> {
         }
         Commands::Projects { json } => {
             let con = open_synced_db(&vault)?;
-            let mut stmt = con.prepare("SELECT stem, title, status, repo, host, network, summary FROM entities WHERE domain = '20-Projects'")?;
+            let mut stmt = con.prepare(
+                "SELECT stem, title, status, repo, host, network, summary FROM entities \
+                 WHERE domain = '20-Projects' AND COALESCE(type, '') != 'moc' AND stem != 'Projects-MOC' AND stem NOT LIKE '%-MOC'",
+            )?;
             let rows = stmt.query_map([], |r| {
                 Ok(serde_json::json!({
                     "stem": r.get::<_, String>(0)?,

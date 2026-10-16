@@ -55,8 +55,8 @@ pub fn parse_wikilinks(body: &str) -> Vec<String> {
     static INLINE_RE: OnceLock<Regex> = OnceLock::new();
     static RE: OnceLock<Regex> = OnceLock::new();
 
-    let fence_re =
-        FENCE_RE.get_or_init(|| Regex::new(r"(?s)(```.*?```|~~~.*?~~~)").expect("valid fence regex"));
+    let fence_re = FENCE_RE
+        .get_or_init(|| Regex::new(r"(?s)(```.*?```|~~~.*?~~~)").expect("valid fence regex"));
     let inline_re = INLINE_RE.get_or_init(|| Regex::new(r"`[^`\n]+`").expect("valid inline regex"));
     let wikilink_re = RE.get_or_init(|| {
         Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]").expect("valid wikilink regex")
@@ -99,6 +99,9 @@ pub struct SyncReport {
     pub duration_ms: f64,
 }
 pub fn open_cache_db(vault: &Path) -> Result<Connection> {
+    if !vault.is_dir() {
+        anyhow::bail!("Vault directory not found: {}", vault.display());
+    }
     let ak_dir = vault.join(".akatsuki");
     fs::create_dir_all(&ak_dir)?;
     let db_path = ak_dir.join("cache.db");
@@ -132,20 +135,44 @@ pub fn open_synced_db(vault: &Path) -> Result<Connection> {
 /// Bumped whenever the projection's shape changes; a mismatch rebuilds the cache.
 const SCHEMA_VERSION: &str = "0.2.2";
 
-fn init_tables(con: &Connection) -> Result<()> {
-    con.execute_batch("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, val TEXT);")?;
-
-    let stored: Option<String> = con
+fn stored_schema_version(con: &Connection) -> Result<Option<String>> {
+    Ok(con
         .query_row(
             "SELECT val FROM schema_meta WHERE key = 'version'",
             [],
             |r| r.get(0),
         )
-        .optional()?;
+        .optional()?)
+}
 
-    if stored.as_deref() != Some(SCHEMA_VERSION) {
-        // The cache is a pure projection of the markdown vault, so a version bump
-        // rebuilds it wholesale instead of migrating columns in place.
+/// Brings the projection schema to `SCHEMA_VERSION`. The cache is a pure
+/// projection of the markdown vault, so a version bump rebuilds it wholesale
+/// instead of migrating columns in place; the DROP + version stamp + CREATE run
+/// in one IMMEDIATE transaction so a concurrent process never observes (or is
+/// left with) a half-built schema. A warm, current cache takes no write lock.
+fn init_tables(con: &Connection) -> Result<()> {
+    con.execute_batch("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, val TEXT);")?;
+
+    if stored_schema_version(con)?.as_deref() == Some(SCHEMA_VERSION) {
+        return create_tables(con);
+    }
+
+    con.execute_batch("BEGIN IMMEDIATE")?;
+    let rebuilt = rebuild_schema(con);
+    match rebuilt {
+        Ok(()) => con.execute_batch("COMMIT")?,
+        Err(e) => {
+            let _ = con.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Runs inside the IMMEDIATE transaction opened by `init_tables`; re-checks the
+/// version because another process may have rebuilt while this one waited.
+fn rebuild_schema(con: &Connection) -> Result<()> {
+    if stored_schema_version(con)?.as_deref() != Some(SCHEMA_VERSION) {
         con.execute_batch(
             r#"
             DROP TABLE IF EXISTS notes_fts;
@@ -163,7 +190,10 @@ fn init_tables(con: &Connection) -> Result<()> {
             params![SCHEMA_VERSION],
         )?;
     }
+    create_tables(con)
+}
 
+fn create_tables(con: &Connection) -> Result<()> {
     con.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS file_meta (
@@ -279,20 +309,38 @@ pub fn sync_vault_index_dry_run(vault: &Path, con: &mut Connection) -> Result<Sy
     sync_vault_index_with(vault, con, false)
 }
 
+/// Inserts one relation edge unless this note already declared the same
+/// `(target, type)` pair; empty targets are ignored.
+fn insert_relation(
+    tx: &Connection,
+    seen: &mut HashSet<(String, String)>,
+    source_rel: &str,
+    target: &str,
+    relation_type: &str,
+) -> Result<()> {
+    if target.is_empty() || !seen.insert((target.to_string(), relation_type.to_string())) {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, ?3)",
+        params![source_rel, target, relation_type],
+    )?;
+    Ok(())
+}
+
+fn load_indexed_hashes(con: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = con.prepare("SELECT rel_path, blake3_hash FROM file_meta")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Result<SyncReport> {
     let t0 = std::time::Instant::now();
 
     // 1. Gather all existing indexed hashes
-    let mut indexed_hashes: HashMap<String, String> = HashMap::new();
-    {
-        let mut stmt = con.prepare("SELECT rel_path, blake3_hash FROM file_meta")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for r in rows.flatten() {
-            indexed_hashes.insert(r.0, r.1);
-        }
-    }
+    let indexed_hashes = load_indexed_hashes(con)?;
 
     // 2. Discover markdown files
     let ignored_dirs = [
@@ -305,15 +353,44 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         "_templates",
     ];
     let walker = walkdir::WalkDir::new(vault).into_iter().filter_entry(|e| {
+        // The vault root itself may be named like an ignored directory.
         let name = e.file_name().to_string_lossy();
-        !ignored_dirs.iter().any(|ig| *ig == name)
+        e.depth() == 0 || !ignored_dirs.iter().any(|ig| *ig == name)
     });
 
-    let paths: Vec<PathBuf> = walker
-        .flatten()
-        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "md"))
-        .map(|e| e.into_path())
-        .collect();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    // Unreadable directories and symlinked notes must never read as "deleted":
+    // their indexed rows are retained until the filesystem answers authoritatively.
+    let mut protected: Vec<String> = Vec::new();
+    let mut walk_errors: Vec<String> = Vec::new();
+    for entry in walker {
+        match entry {
+            Ok(e) if e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "md") => {
+                paths.push(e.into_path());
+            }
+            Ok(e) if e.path_is_symlink() && e.path().extension().is_some_and(|x| x == "md") => {
+                if let Ok(rel) = e.path().strip_prefix(vault) {
+                    protected.push(rel.to_string_lossy().to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                if let Some(rel) = err.path().and_then(|p| p.strip_prefix(vault).ok()) {
+                    let rel = rel.to_string_lossy().to_string();
+                    walk_errors.push(format!("'{}': unreadable: {}", rel, err));
+                    protected.push(rel);
+                }
+            }
+        }
+    }
+    let is_protected = |rel: &str| {
+        protected.iter().any(|p| {
+            rel == p
+                || rel
+                    .strip_prefix(p.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        })
+    };
 
     // 3. Parallel Blake3 Merkle Scan via Rayon
     enum ScanOutcome {
@@ -359,12 +436,13 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
     for (rel, err) in &read_errors {
         parse_errors.push(format!("'{}': read error: {}", rel, err));
     }
+    parse_errors.extend(walk_errors);
     parse_errors.sort();
 
     // 4. Calculate Diffs
     let mut to_delete = Vec::new();
     for rel in indexed_hashes.keys() {
-        if !current_map.contains_key(rel) && !read_errors.contains_key(rel) {
+        if !current_map.contains_key(rel) && !read_errors.contains_key(rel) && !is_protected(rel) {
             to_delete.push(rel.clone());
         }
     }
@@ -376,6 +454,10 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         match indexed_hashes.get(rel) {
             Some(existing_hash) if existing_hash == &file.hash => {
                 unchanged_count += 1;
+                // Already-indexed notes that fail to parse stay reported on every sync.
+                if let Err(e) = parse_frontmatter(&file.content) {
+                    parse_errors.push(format!("'{}': {}", rel, e));
+                }
             }
             _ => {
                 to_update.push(file.clone());
@@ -439,7 +521,15 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
     }
 
     // 5. Apply SQLite Transactions
-    let tx = con.transaction()?;
+    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    // Another process may have synced while this one waited for the write lock.
+    // Apply only rows whose stored hash is still the one this scan started from;
+    // anything else was already advanced by that process and must not be rolled
+    // back to the (now stale) bytes read before the lock.
+    let current_hashes = load_indexed_hashes(&tx)?;
+    to_delete.retain(|rel| current_hashes.get(rel) == indexed_hashes.get(rel));
+    to_update.retain(|f| current_hashes.get(&f.rel_path) == indexed_hashes.get(&f.rel_path));
 
     for del_rel in to_delete {
         tx.execute(
@@ -549,8 +639,14 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
             .map(|s| s.to_string());
         let metadata_json = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
-        // Clean prior records
-        tx.execute("DELETE FROM notes_fts WHERE rel_path = ?1", params![rel])?;
+        // Clean prior records. `rel_path` is UNINDEXED in the FTS table, so each
+        // DELETE scans it: skip it for notes that were never indexed.
+        if indexed_hashes.contains_key(rel) {
+            tx.execute("DELETE FROM notes_fts WHERE rel_path = ?1", params![rel])?;
+        }
+        // Old vectors describe old text: drop them so the missing-vector probe
+        // re-embeds this note even when embedding is skipped on this run.
+        tx.execute("DELETE FROM note_vectors WHERE rel_path = ?1", params![rel])?;
         tx.execute("DELETE FROM entities WHERE rel_path = ?1", params![rel])?;
         tx.execute("DELETE FROM services WHERE rel_path = ?1", params![rel])?;
         tx.execute("DELETE FROM relations WHERE source_rel = ?1", params![rel])?;
@@ -576,6 +672,8 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
             ],
         )?;
 
+        let mut seen_relations: HashSet<(String, String)> = HashSet::new();
+
         // Frontmatter-declared relations keep the YAML key verbatim as the type,
         // so declared dependencies are visible to blast/map/contract.
         if let Some(Value::Object(declared)) = fm.get("relations") {
@@ -584,22 +682,12 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
                     Value::Array(items) => {
                         for item in items {
                             let target = extract_target_stem(&scalar_text(item));
-                            if !target.is_empty() {
-                                tx.execute(
-                                    "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, ?3)",
-                                    params![rel, target, relation_type],
-                                )?;
-                            }
+                            insert_relation(&tx, &mut seen_relations, rel, &target, relation_type)?;
                         }
                     }
                     other => {
                         let target = extract_target_stem(&scalar_text(other));
-                        if !target.is_empty() {
-                            tx.execute(
-                                "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, ?3)",
-                                params![rel, target, relation_type],
-                            )?;
-                        }
+                        insert_relation(&tx, &mut seen_relations, rel, &target, relation_type)?;
                     }
                 }
             }
@@ -608,10 +696,7 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         // Body wikilinks resolve through note stems; escaped links (`\[[x]]`) are
         // documentation, not references.
         for clean_stem in parse_wikilinks(&body) {
-            tx.execute(
-                "INSERT INTO relations (source_rel, target_stem, relation_type) VALUES (?1, ?2, 'references')",
-                params![rel, clean_stem],
-            )?;
+            insert_relation(&tx, &mut seen_relations, rel, &clean_stem, "references")?;
         }
         // Invariants: declared in frontmatter, or bulleted under an `Invariants`
         // heading.
@@ -765,10 +850,22 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         }
     }
 
+    for file in &to_update {
+        tx.execute(
+            "INSERT OR REPLACE INTO file_meta (rel_path, blake3_hash, size, indexed_at) VALUES (?1, ?2, ?3, ?4)",
+            params![&file.rel_path, file.hash, file.size as i64, &now_iso],
+        )?;
+    }
+
+    tx.commit()?;
+
+    // Embeddings run in their own transaction after the lexical projection is
+    // durable: an embedder failure must never roll back text rows or poison every
+    // read command, and is reported (ADR-0002) instead of swallowed.
     if crate::vectors::feature_enabled() {
         let mut existing_vector_rels: HashSet<String> = HashSet::new();
         {
-            let mut stmt = tx.prepare("SELECT DISTINCT rel_path FROM note_vectors")?;
+            let mut stmt = con.prepare("SELECT DISTINCT rel_path FROM note_vectors")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for r in rows.flatten() {
                 existing_vector_rels.insert(r);
@@ -783,16 +880,9 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
     }
     vector_sources.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let vectors = crate::vectors::sync_note_vectors_tx(&tx, &vector_sources)?;
-
-    for file in &to_update {
-        tx.execute(
-            "INSERT OR REPLACE INTO file_meta (rel_path, blake3_hash, size, indexed_at) VALUES (?1, ?2, ?3, ?4)",
-            params![&file.rel_path, file.hash, file.size as i64, &now_iso],
-        )?;
-    }
-
-    tx.commit()?;
+    let vectors = crate::vectors::sync_note_vectors(con, &vector_sources).unwrap_or_else(|e| {
+        format!("failed: {e:#} (text index is current; vectors will be retried)")
+    });
 
     Ok(SyncReport {
         added: added_count,

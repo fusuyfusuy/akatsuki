@@ -1,13 +1,13 @@
 //! Knowledge graph, blast radius calculation, map traversal, and contract extraction.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::index::open_synced_db;
+use crate::index::{extract_target_stem, open_synced_db};
 use crate::storage::{parse_frontmatter, resolve_note_file};
 
 /// Escapes SQL LIKE special wildcard characters ('%', '_', '\').
@@ -51,30 +51,16 @@ pub struct ServiceItem {
     pub rel_path: String,
 }
 
-/// Normalizes a user-supplied target into the note stem used by the index.
-fn target_stem(target: &str) -> String {
-    let trimmed = target.trim().trim_end_matches(".md");
-    Path::new(trimmed)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(trimmed)
-        .to_string()
-}
-
-/// Stem of a vault-relative path, mirroring `Path.stem` on the note reference.
-fn path_stem(rel_path: &str) -> String {
-    Path::new(rel_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(rel_path)
-        .to_string()
-}
+/// Edges leaving a note: by root-level `<stem>.md` or by any indexed note with that stem.
+const DOWNSTREAM_SQL: &str = "SELECT target_stem, relation_type FROM relations \
+     WHERE source_rel = ?1 OR source_rel IN (SELECT rel_path FROM entities WHERE stem = ?2)";
 
 /// Vault-relative path of a stem, falling back to `{stem}.md` for unindexed notes.
+/// Duplicate stems resolve to the lexicographically first path.
 fn resolve_stem_rel_path(con: &Connection, stem: &str) -> Result<String> {
     let rel: Option<String> = con
         .query_row(
-            "SELECT rel_path FROM entities WHERE stem = ?1 LIMIT 1",
+            "SELECT rel_path FROM entities WHERE stem = ?1 ORDER BY rel_path LIMIT 1",
             params![stem],
             |r| r.get::<_, Option<String>>(0),
         )
@@ -100,14 +86,9 @@ fn blast_radius_with(con: &Connection, stem: &str) -> Result<BlastRadius> {
 
     let escaped_stem = escape_like(stem);
     let exact_rel = format!("{}.md", stem);
-    let nested_rel = format!("%/{}.md", escaped_stem);
-    let descendant_rel = format!("%/{}/%", escaped_stem);
-    let mut stmt_down = con.prepare(
-        "SELECT target_stem, relation_type FROM relations \
-         WHERE source_rel = ?1 OR source_rel LIKE ?2 ESCAPE '\\' OR source_rel LIKE ?3 ESCAPE '\\'",
-    )?;
+    let mut stmt_down = con.prepare(DOWNSTREAM_SQL)?;
     let downstream: Vec<DownstreamRef> = stmt_down
-        .query_map(params![exact_rel, nested_rel, descendant_rel], |r| {
+        .query_map(params![exact_rel, stem], |r| {
             Ok(DownstreamRef {
                 target_stem: r.get(0)?,
                 relation_type: r.get(1)?,
@@ -144,7 +125,20 @@ fn blast_radius_with(con: &Connection, stem: &str) -> Result<BlastRadius> {
 /// Calculates upstream dependents, downstream dependencies, and boundary sinks.
 pub fn calculate_blast_radius(vault: &Path, target: &str) -> Result<BlastRadius> {
     let con = open_synced_db(vault)?;
-    blast_radius_with(&con, &target_stem(target))
+    let stem = extract_target_stem(target);
+    let radius = blast_radius_with(&con, &stem)?;
+    let known: bool = con.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entities WHERE stem = ?1)",
+        params![stem],
+        |r| r.get(0),
+    )?;
+    if !known && radius.upstream.is_empty() && radius.boundary_sinks.is_empty() {
+        anyhow::bail!(
+            "Target '{}' not found: no indexed note, inbound link or service",
+            target
+        );
+    }
+    Ok(radius)
 }
 
 /// A relation row attached to a contract's note.
@@ -330,34 +324,25 @@ fn traverse_down(
     current_depth: usize,
     max_depth: usize,
     ancestors: &[String],
-    visited: &mut HashSet<String>,
 ) -> Result<Vec<TreeNode>> {
     if current_depth >= max_depth {
         return Ok(Vec::new());
     }
 
-    let escaped_stem = escape_like(stem);
     let exact_rel = format!("{}.md", stem);
-    let nested_rel = format!("%/{}.md", escaped_stem);
-    let descendant_rel = format!("%/{}/%", escaped_stem);
-    let mut stmt = con.prepare(
-        "SELECT target_stem, relation_type FROM relations \
-         WHERE source_rel = ?1 OR source_rel LIKE ?2 ESCAPE '\\' OR source_rel LIKE ?3 ESCAPE '\\'",
-    )?;
+    let mut stmt = con.prepare(DOWNSTREAM_SQL)?;
     let rows: Vec<(String, String)> = stmt
-        .query_map(params![exact_rel, nested_rel, descendant_rel], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
+        .query_map(params![exact_rel, stem], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut children = Vec::with_capacity(rows.len());
     for (child_stem, relation_type) in rows {
         let cycle = ancestors.iter().any(|a| a == &child_stem);
         let mut nested = Vec::new();
-        if !cycle && visited.insert(child_stem.clone()) {
+        if !cycle {
             let mut path = ancestors.to_vec();
             path.push(child_stem.clone());
-            nested = traverse_down(con, &child_stem, current_depth + 1, max_depth, &path, visited)?;
+            nested = traverse_down(con, &child_stem, current_depth + 1, max_depth, &path)?;
         }
         children.push(TreeNode {
             rel_path: resolve_stem_rel_path(con, &child_stem)?,
@@ -377,7 +362,6 @@ fn traverse_up(
     current_depth: usize,
     max_depth: usize,
     ancestors: &[String],
-    visited: &mut HashSet<String>,
 ) -> Result<Vec<TreeNode>> {
     if current_depth >= max_depth {
         return Ok(Vec::new());
@@ -391,13 +375,13 @@ fn traverse_up(
 
     let mut children = Vec::with_capacity(rows.len());
     for (source_rel, relation_type) in rows {
-        let child_stem = path_stem(&source_rel);
+        let child_stem = extract_target_stem(&source_rel);
         let cycle = ancestors.iter().any(|a| a == &child_stem);
         let mut nested = Vec::new();
-        if !cycle && visited.insert(child_stem.clone()) {
+        if !cycle {
             let mut path = ancestors.to_vec();
             path.push(child_stem.clone());
-            nested = traverse_up(con, &child_stem, current_depth + 1, max_depth, &path, visited)?;
+            nested = traverse_up(con, &child_stem, current_depth + 1, max_depth, &path)?;
         }
         children.push(TreeNode {
             stem: child_stem,
@@ -464,21 +448,17 @@ pub fn traverse_graph(
     };
 
     let con = open_synced_db(vault)?;
-    let stem = target_stem(target);
+    let stem = extract_target_stem(target);
     let root = vec![stem.clone()];
 
-    let mut down_visited = HashSet::new();
-    down_visited.insert(stem.clone());
     let downstream = if direction == "both" || direction == "down" {
-        traverse_down(&con, &stem, 0, depth, &root, &mut down_visited)?
+        traverse_down(&con, &stem, 0, depth, &root)?
     } else {
         Vec::new()
     };
 
-    let mut up_visited = HashSet::new();
-    up_visited.insert(stem.clone());
     let upstream = if direction == "both" || direction == "up" {
-        traverse_up(&con, &stem, 0, depth, &root, &mut up_visited)?
+        traverse_up(&con, &stem, 0, depth, &root)?
     } else {
         Vec::new()
     };

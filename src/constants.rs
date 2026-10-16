@@ -35,3 +35,15 @@ pub const DEFAULT_EMBED_MODEL: &str = "intfloat/multilingual-e5-small";
 pub const DEFAULT_EMBED_DIM: usize = 384;
 pub const MCP_DEFAULT_LIMIT: usize = 5;
 pub const CLI_DEFAULT_LIMIT: usize = 10;
+
+/// Longest a mutation waits for `.akatsuki.lock` before failing loudly.
+pub const LOCK_TIMEOUT_SECS: u64 = 10;
+
+/// Hard ceiling on hits returned by any search entry point (CLI and MCP).
+pub const MAX_SEARCH_LIMIT: usize = 100;
+
+/// Wall-clock budget for one read-only SQL query before it is interrupted.
+pub const SQL_DEADLINE_SECS: u64 = 5;
+
+/// SQLite length limit for any single string/blob produced by a query.
+pub const SQL_MAX_VALUE_BYTES: i32 = 8 * 1024 * 1024;

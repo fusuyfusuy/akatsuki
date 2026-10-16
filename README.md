@@ -156,7 +156,7 @@ akatsuki mcp [--vault <dir>]
 | MCP Tool | CLI Equivalent | Key Arguments | Description |
 | :--- | :--- | :--- | :--- |
 | `akatsuki_search` | `akatsuki search` | `query`, `mode`, `domain`, `limit`, `with_graph` | Fast hybrid/BM25 search with contextual snippets and optional graph context. |
-| `akatsuki_read` | `akatsuki read` | `note` (or `path`), `section`, `budget` | Read full notes or extract individual headings with token budget packing. |
+| `akatsuki_read` | `akatsuki read` | `note` (or `path`, `target`), `section`, `budget` | Read full notes or extract individual headings with token budget packing. |
 | `akatsuki_contract` | `akatsuki contract` | `note` (or `target`, `path`) | Extract machine boundary contracts (APIs, ports, schemas, invariants). |
 | `akatsuki_blast` | `akatsuki blast` | `target` (or `note`, `path`) | Compute upstream callers and downstream dependencies for blast radius analysis. |
 | `akatsuki_map` | `akatsuki map` | `target`, `depth`, `direction` | Hierarchical knowledge graph traversal (`up`, `down`, or `both`). |
@@ -165,7 +165,7 @@ akatsuki mcp [--vault <dir>]
 | `akatsuki_record_log` | `akatsuki log` | `project`, `summary`, `device` | Append telegraphic ledger entries to today's active worklog under kernel lock. |
 | `akatsuki_write_note` | `akatsuki write` | `path`, `content`, `overwrite`, `raw` | Create or replace vault notes with auto-completed frontmatter. |
 | `akatsuki_get` | `akatsuki get` | `key` (or `keypath`) | $O(1)$ exact metadata lookup across frontmatter and projection tables. |
-| `akatsuki_query` | `akatsuki query` | `sql` | Read-only SQL queries (`SELECT`/`WITH`) against SQLite projection tables. |
+| `akatsuki_query` | `akatsuki query` | `sql` | Read-only SQL queries (`SELECT`/`WITH`/`EXPLAIN`, single statement, 5s deadline) against SQLite projection tables. |
 | `akatsuki_set` | `akatsuki set` | `note`, `key`, `value` | Surgically update YAML frontmatter keys with JSON/primitive typed values. |
 | `akatsuki_replace_section`| `akatsuki replace` | `note`, `heading`, `content` | Surgically replace section contents while preserving the heading line. |
 | `akatsuki_append_section` | `akatsuki append` | `note`, `heading`, `content` | Append markdown bullets or text under a specific heading. |
@@ -182,11 +182,23 @@ akatsuki mcp [--vault <dir>]
 
 Akatsuki locates the target knowledge base automatically using a multi-tiered resolution ladder:
 
-1. **CLI Flag**: `--vault /path/to/vault` (or `-V`)
-2. **Environment Variable**: `AKATSUKI_VAULT=/path/to/vault`
-3. **Upward Directory Walk**: Traverses upwards looking for `.akatsuki/` or `INDEX.md` + `AGENTS.md`.
-4. **Well-Known Locations**: Checks `~/configs/knowledge-base/akatsuki`, `~/.akatsuki`, `~/akatsuki`.
-5. **Fallback**: Current working directory.
+1. **CLI Flag**: `--vault /path/to/vault` (`~` and `$VAR` expanded; must be an existing directory)
+2. **Environment Variable**: `AKATSUKI_VAULT=/path/to/vault` (same rules; a set but invalid value is an error)
+3. **Config File**: `AKATSUKI_VAULT=` line in `~/.config/knowledge-base/env`.
+4. **Upward Directory Walk**: Traverses upwards from the cwd (never matching `$HOME` itself) looking for `40-Systems/` + `20-Projects/`, `.akatsuki/`, or `INDEX.md` + `AGENTS.md`.
+5. **Well-Known Locations**: Checks `~/configs/knowledge-base/akatsuvault`, `~/configs/knowledge-base/akatsuki`, `~/.config/akatsuki`, `~/.akatsuki`, `~/akatsuki`.
+6. **No vault found**: exits 1 with an error. There is no cwd fallback.
+
+### Environment Variables
+
+| Variable | Effect |
+| :--- | :--- |
+| `AKATSUKI_VAULT` | Vault root (see ladder above). |
+| `AKATSUKI_HOST` | Host identity stamped on mutations (then `HOSTNAME`, then `hostname`). |
+| `AKATSUKI_INVARIANT_TIMEOUT` | Per-assertion timeout in seconds (default 10, max 86400; `0` or non-numeric is an error). A 300s total budget applies per run. |
+| `AKATSUKI_INVARIANT_ENV` | `clean` runs `bash:verify` blocks with a scrubbed environment (default inherits). |
+
+**Trust model**: `bash:verify` blocks are shell code authored in the vault and executed by `akatsuki test` by design (stdin closed, own process group, output capped at 2 MB). Only run it on vaults you trust.
 
 ---
 
