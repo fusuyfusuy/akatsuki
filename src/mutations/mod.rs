@@ -196,10 +196,12 @@ fn append_work_log_inner(
     };
 
     // Log lines are chronological: the newest entry ends the section, matching
-    // the legacy ledger layout.
+    // the legacy ledger layout. Isolate the markdown body from YAML frontmatter
+    // before heading lookup so `#` comments inside frontmatter cannot hijack the splice.
     let target_heading = "## 📝 Work Log & Session Notes";
-    let lines: Vec<&str> = content.lines().collect();
-    let new_content = match locate_section(&lines, target_heading) {
+    let (prefix, body) = split_frontmatter(&content).unwrap_or(("", content.as_str()));
+    let lines: Vec<&str> = body.lines().collect();
+    let new_body = match locate_section(&lines, target_heading) {
         Some((_start, _level, end)) => {
             let mut rebuilt: Vec<String> = lines[..end].iter().map(|l| l.to_string()).collect();
             while rebuilt.last().is_some_and(|l| l.trim().is_empty()) {
@@ -212,11 +214,12 @@ fn append_work_log_inner(
         }
         None => format!(
             "{}\n\n{}\n\n{}\n",
-            content.trim_end(),
+            body.trim_end(),
             target_heading,
             entry
         ),
     };
+    let new_content = restore_eol(&content, format!("{}{}", prefix, new_body));
 
     write_atomic(&daily_file, &new_content)?;
     Ok(entry)

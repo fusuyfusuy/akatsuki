@@ -15,7 +15,7 @@ use crate::constants::{DOMAIN_MOCS, ROOT_ANCHORS};
 use crate::index::{
     open_cache_db, open_synced_db, sync_vault_index, sync_vault_index_dry_run, SyncReport,
 };
-use crate::storage::{parse_frontmatter, write_atomic, VaultLock};
+use crate::storage::{parse_frontmatter, strip_fenced_code, write_atomic, VaultLock};
 
 /// Default hard ceiling for a single embedded invariant assertion.
 const DEFAULT_INVARIANT_TIMEOUT_SECS: u64 = 10;
@@ -75,10 +75,7 @@ fn relative_slash_path(vault: &Path, path: &Path) -> String {
 
 /// Lowercased file stem, the key a wikilink target resolves against.
 fn file_stem_lower(path: &str) -> String {
-    Path::new(path)
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().to_lowercase())
-        .unwrap_or_else(|| path.to_lowercase())
+    file_stem_of(path).to_lowercase()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -300,8 +297,7 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
         inbound.insert(rel.clone(), HashSet::new());
     }
 
-    let fence_re = Regex::new(r"(?s)```.*?```")?;
-    let inline_re = Regex::new(r"`[^`\n]+`")?;
+    let inline_re = Regex::new(r"`+[^`\n]+`+")?;
     let wikilink_re = Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]")?;
     let mdlink_re = Regex::new(r"\[(?:[^\]]*)\]\(([^)#\s]+)(?:#[^)]*)?\)")?;
 
@@ -318,7 +314,7 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
         };
 
         // Strip code blocks so documented examples are not audited as real links.
-        let without_fences = fence_re.replace_all(&text, "");
+        let without_fences = strip_fenced_code(&text);
         let clean = inline_re.replace_all(&without_fences, "");
 
         for cap in wikilink_re.captures_iter(&clean) {
@@ -355,10 +351,7 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
 
         for cap in mdlink_re.captures_iter(&clean) {
             let target = cap[1].trim();
-            if ["http://", "https://", "file://", "mailto:", "#"]
-                .iter()
-                .any(|prefix| target.starts_with(prefix))
-            {
+            if is_external_or_anchor_link(target) {
                 continue;
             }
             let joined = abs.parent().unwrap_or(vault).join(target);
@@ -664,14 +657,14 @@ pub fn run_verification_tests(
     let _ = sync_vault_index(vault, &mut con)?;
 
     let sql = if note_filter.is_some() {
-        "SELECT source_rel, command FROM verifications WHERE source_rel LIKE ?1"
+        "SELECT source_rel, command FROM verifications WHERE source_rel LIKE ?1 ESCAPE '\\'"
     } else {
         "SELECT source_rel, command FROM verifications"
     };
 
     let mut stmt = con.prepare(sql)?;
     let rows: Vec<(String, String)> = if let Some(filt) = note_filter {
-        let pat = format!("%{}%", filt);
+        let pat = format!("%{}%", crate::graph::escape_like(filt));
         stmt.query_map([pat], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?
     } else {
@@ -745,11 +738,27 @@ pub fn run_verification_tests(
     })
 }
 
+/// Returns true if `target` is a fragment (`#...`) or has an RFC 3986 URI scheme (`scheme:...`).
+fn is_external_or_anchor_link(target: &str) -> bool {
+    if target.starts_with('#') {
+        return true;
+    }
+    if let Some((scheme, _)) = target.split_once(':') {
+        let mut chars = scheme.chars();
+        return scheme.len() >= 2
+            && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    }
+    false
+}
+
 /// Security gate for invariant assertion commands.
 /// Rejects dangerous, destructive, or system-modifying operations before bash execution.
 fn is_dangerous_invariant_command(command: &str) -> bool {
     // 1. Output redirection (> or >>), excluding standard discards to /dev/null and fd duplicates
     let sanitized_redir = command
+        .replace(">>/dev/null", "")
+        .replace(">> /dev/null", "")
         .replace(">/dev/null", "")
         .replace("> /dev/null", "")
         .replace("2>&1", "")

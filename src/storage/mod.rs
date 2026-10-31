@@ -386,7 +386,7 @@ pub fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
 
 /// The note text with a well-formed frontmatter block removed; text with no
 /// fence or an unclosed fence is returned whole (lenient, never errors).
-fn body_after_frontmatter(content: &str) -> &str {
+pub(crate) fn body_after_frontmatter(content: &str) -> &str {
     let text = content.strip_prefix('\u{feff}').unwrap_or(content);
     let Some(after_open) = opening_fence(text) else {
         return text;
@@ -706,18 +706,45 @@ pub fn heading_at(line: &str) -> Option<(usize, String)> {
 }
 
 /// Fence marker character and run length when `line` opens a fenced code block.
-fn fence_open(line: &str) -> Option<(char, usize)> {
+/// Per CommonMark §4.5, info strings for backtick code blocks cannot contain backticks
+/// (a single-line `` ```code``` `` is an inline code span, not a fenced block).
+pub(crate) fn fence_open(line: &str) -> Option<(char, usize)> {
     let trimmed = line.trim_start();
     let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
     let run = trimmed.chars().take_while(|c| *c == marker).count();
-    (run >= 3).then_some((marker, run))
+    let info = &trimmed[run..];
+    if run < 3 || (marker == '`' && info.contains('`')) {
+        return None;
+    }
+    Some((marker, run))
 }
 
 /// True when `line` closes a fence opened with `marker` repeated `open_len` times.
-fn fence_closes(line: &str, marker: char, open_len: usize) -> bool {
+pub(crate) fn fence_closes(line: &str, marker: char, open_len: usize) -> bool {
     let trimmed = line.trim();
     let run = trimmed.chars().take_while(|c| *c == marker).count();
     run >= open_len && trimmed[run..].is_empty()
+}
+
+/// Returns `text` with fenced code blocks (` ``` ` or `~~~` of length >= 3) removed.
+pub(crate) fn strip_fenced_code(text: &str) -> String {
+    let mut in_fence: Option<(char, usize)> = None;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if let Some((marker, open_len)) = in_fence {
+            if fence_closes(trimmed, marker, open_len) {
+                in_fence = None;
+            }
+            continue;
+        }
+        if let Some(opened) = fence_open(trimmed) {
+            in_fence = Some(opened);
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// First heading accepted by `predicate`, ending at the next heading of the same

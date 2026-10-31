@@ -11,7 +11,7 @@ use crate::index::{extract_target_stem, open_synced_db};
 use crate::storage::{parse_frontmatter, resolve_note_file};
 
 /// Escapes SQL LIKE special wildcard characters ('%', '_', '\').
-fn escape_like(s: &str) -> String {
+pub(crate) fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")

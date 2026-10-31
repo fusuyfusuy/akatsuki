@@ -7,13 +7,13 @@ use std::path::Path;
 
 use crate::constants::MCP_DEFAULT_LIMIT;
 use crate::graph::{calculate_blast_radius, extract_contract, traverse_graph};
-use crate::index::open_synced_db;
 use crate::mutations::{
     append_section_in_note, append_work_log, read_daily_note, replace_section_in_note,
     set_note_value, write_note,
 };
 use crate::search::{
-    execute_sql_query, format_hits_compact, get_keypath, list_notes, search_vault,
+    execute_sql_query, format_hits_compact, get_keypath, list_notes, list_projects, list_services,
+    search_vault,
 };
 use crate::storage::{extract_section, resolve_note_file};
 use crate::verify::{lint_vault, reconcile_vault, run_verification_tests, verify_links};
@@ -270,20 +270,7 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
         }
         "akatsuki_read" => {
             // Parameter aliasing: accept note, path, or target
-            let target_query = args
-                .get("note")
-                .or_else(|| args.get("path"))
-                .or_else(|| args.get("target"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if target_query.is_empty() {
-                return (
-                    "Error: Missing required parameter 'note' (or 'path').".to_string(),
-                    true,
-                );
-            }
-
+            let target_query = tri!(req_str(args, &["note", "path", "target"]));
             let section = tri!(opt_str(args, "section"));
             let budget = tri!(arg_usize(args, "budget"));
 
@@ -314,18 +301,7 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             }
         }
         "akatsuki_contract" => {
-            let note = args
-                .get("note")
-                .or_else(|| args.get("target"))
-                .or_else(|| args.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if note.is_empty() {
-                return (
-                    "Error: Missing required parameter 'note'.".to_string(),
-                    true,
-                );
-            }
+            let note = tri!(req_str(args, &["note", "target", "path"]));
             match extract_contract(vault, note) {
                 Ok(contract) => (
                     serde_json::to_string_pretty(&contract).unwrap_or_default(),
@@ -335,18 +311,7 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             }
         }
         "akatsuki_blast" => {
-            let target = args
-                .get("target")
-                .or_else(|| args.get("note"))
-                .or_else(|| args.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if target.is_empty() {
-                return (
-                    "Error: Missing required parameter 'target'.".to_string(),
-                    true,
-                );
-            }
+            let target = tri!(req_str(args, &["target", "note", "path"]));
             match calculate_blast_radius(vault, target) {
                 Ok(blast) => (
                     serde_json::to_string_pretty(&blast).unwrap_or_default(),
@@ -356,12 +321,6 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             }
         }
         "akatsuki_map" => {
-            let target = args
-                .get("target")
-                .or_else(|| args.get("note"))
-                .or_else(|| args.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             let depth = tri!(arg_usize(args, "depth")).unwrap_or(2);
             let direction = tri!(opt_str(args, "direction")).unwrap_or("both");
             if !matches!(direction, "both" | "up" | "down") {
@@ -370,13 +329,7 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
                     true,
                 );
             }
-
-            if target.is_empty() {
-                return (
-                    "Error: Missing required parameter 'target'.".to_string(),
-                    true,
-                );
-            }
+            let target = tri!(req_str(args, &["target", "note", "path"]));
 
             match traverse_graph(vault, target, depth, direction) {
                 Ok(graph) => (
@@ -386,70 +339,19 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
                 Err(e) => (format!("Map traversal failed: {}", e), true),
             }
         }
-        "akatsuki_services" => match open_synced_db(vault) {
-            Ok(con) => {
-                let sql = "SELECT name, container_prefix, ports, replicas, role, host, network FROM services";
-                match con.prepare(sql) {
-                    Ok(mut stmt) => {
-                        let rows = stmt.query_map([], |r| {
-                            Ok(json!({
-                                "name": r.get::<_, String>(0)?,
-                                "container_prefix": r.get::<_, String>(1)?,
-                                "ports": r.get::<_, String>(2)?,
-                                "replicas": r.get::<_, String>(3)?,
-                                "role": r.get::<_, String>(4)?,
-                                "host": r.get::<_, String>(5)?,
-                                "network": r.get::<_, String>(6)?,
-                            }))
-                        });
-                        match rows {
-                            Ok(iter) => {
-                                let items: Vec<Value> = iter.filter_map(Result::ok).collect();
-                                (
-                                    serde_json::to_string_pretty(&items).unwrap_or_default(),
-                                    false,
-                                )
-                            }
-                            Err(e) => (format!("Query failed: {}", e), true),
-                        }
-                    }
-                    Err(e) => (format!("Prepare failed: {}", e), true),
-                }
-            }
-            Err(e) => (format!("Database open failed: {}", e), true),
+        "akatsuki_services" => match list_services(vault) {
+            Ok(items) => (
+                serde_json::to_string_pretty(&items).unwrap_or_default(),
+                false,
+            ),
+            Err(e) => (format!("Query failed: {}", e), true),
         },
-        "akatsuki_projects" => match open_synced_db(vault) {
-            Ok(con) => {
-                let sql = "SELECT stem, title, status, repo, host, network, summary FROM entities \
-                           WHERE domain = '20-Projects' AND COALESCE(type, '') != 'moc' AND stem != 'Projects-MOC' AND stem NOT LIKE '%-MOC'";
-                match con.prepare(sql) {
-                    Ok(mut stmt) => {
-                        let rows = stmt.query_map([], |r| {
-                            Ok(json!({
-                                "stem": r.get::<_, String>(0)?,
-                                "title": r.get::<_, String>(1)?,
-                                "status": r.get::<_, Option<String>>(2)?,
-                                "repo": r.get::<_, Option<String>>(3)?,
-                                "host": r.get::<_, Option<String>>(4)?,
-                                "network": r.get::<_, Option<String>>(5)?,
-                                "summary": r.get::<_, Option<String>>(6)?,
-                            }))
-                        });
-                        match rows {
-                            Ok(iter) => {
-                                let items: Vec<Value> = iter.filter_map(Result::ok).collect();
-                                (
-                                    serde_json::to_string_pretty(&items).unwrap_or_default(),
-                                    false,
-                                )
-                            }
-                            Err(e) => (format!("Query failed: {}", e), true),
-                        }
-                    }
-                    Err(e) => (format!("Prepare failed: {}", e), true),
-                }
-            }
-            Err(e) => (format!("Database open failed: {}", e), true),
+        "akatsuki_projects" => match list_projects(vault) {
+            Ok(items) => (
+                serde_json::to_string_pretty(&items).unwrap_or_default(),
+                false,
+            ),
+            Err(e) => (format!("Query failed: {}", e), true),
         },
         "akatsuki_record_log" => {
             let project = tri!(opt_str(args, "project")).unwrap_or("");

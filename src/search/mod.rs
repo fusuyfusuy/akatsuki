@@ -206,12 +206,10 @@ pub fn run_bm25_search(
     for q_clause in clauses {
         let results: Vec<SearchHit> = if let Some(dom) = domain_filter {
             stmt.query_map(params![q_clause, dom, limit as i64], map_hit)?
-                .filter_map(Result::ok)
-                .collect()
+                .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             stmt.query_map(params![q_clause, "", limit as i64], map_hit)?
-                .filter_map(Result::ok)
-                .collect()
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
 
         if !results.is_empty() {
@@ -272,8 +270,7 @@ fn attach_graph_metadata(con: &Connection, mut hits: Vec<SearchHit>) -> Result<V
                     r.get::<_, String>(1)?
                 ))
             })?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let down_rows = stmt_down
             .query_map(params![hit.rel_path], |r| {
@@ -283,8 +280,7 @@ fn attach_graph_metadata(con: &Connection, mut hits: Vec<SearchHit>) -> Result<V
                     r.get::<_, String>(1)?
                 ))
             })?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let svc_rows = stmt_svc
             .query_map(params![hit.stem, hit.rel_path], |r| {
@@ -296,8 +292,7 @@ fn attach_graph_metadata(con: &Connection, mut hits: Vec<SearchHit>) -> Result<V
                     Ok(format!("{}:{}", name, ports))
                 }
             })?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         hit.graph = Some(GraphAttachment {
             upstream: up_rows,
@@ -632,12 +627,55 @@ pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
     anyhow::bail!("Could not resolve keypath '{}'", keypath);
 }
 
+pub fn list_services(vault: &Path) -> Result<Vec<serde_json::Value>> {
+    let con = open_synced_db(vault)?;
+    let mut stmt = con.prepare(
+        "SELECT name, container_prefix, ports, replicas, role, host, network FROM services",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "name": r.get::<_, String>(0)?,
+                "container_prefix": r.get::<_, String>(1)?,
+                "ports": r.get::<_, String>(2)?,
+                "replicas": r.get::<_, String>(3)?,
+                "role": r.get::<_, String>(4)?,
+                "host": r.get::<_, String>(5)?,
+                "network": r.get::<_, String>(6)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn list_projects(vault: &Path) -> Result<Vec<serde_json::Value>> {
+    let con = open_synced_db(vault)?;
+    let mut stmt = con.prepare(
+        "SELECT stem, title, status, repo, host, network, summary FROM entities \
+         WHERE domain = '20-Projects' AND COALESCE(type, '') != 'moc' AND stem != 'Projects-MOC' AND stem NOT LIKE '%-MOC'",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "stem": r.get::<_, String>(0)?,
+                "title": r.get::<_, String>(1)?,
+                "status": r.get::<_, Option<String>>(2)?,
+                "repo": r.get::<_, Option<String>>(3)?,
+                "host": r.get::<_, Option<String>>(4)?,
+                "network": r.get::<_, Option<String>>(5)?,
+                "summary": r.get::<_, Option<String>>(6)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 pub fn list_notes(vault: &Path, domain: Option<&str>) -> Result<Vec<serde_json::Value>> {
     let con = open_synced_db(vault)?;
     let base = "SELECT rel_path, stem, title, type, summary, status, metadata_json FROM entities";
     let sql = if domain.is_some() {
         format!(
-            "{} WHERE domain = ?1 OR rel_path LIKE ?2 ORDER BY rel_path ASC",
+            "{} WHERE domain = ?1 OR rel_path LIKE ?2 ESCAPE '\\' ORDER BY rel_path ASC",
             base
         )
     } else {
@@ -665,7 +703,8 @@ pub fn list_notes(vault: &Path, domain: Option<&str>) -> Result<Vec<serde_json::
 
     let rows: Vec<serde_json::Value> = if let Some(dom) = domain {
         let clean = dom.trim().trim_end_matches('/');
-        stmt.query_map(rusqlite::params![clean, format!("{}/%", clean)], map_row)?
+        let escaped = crate::graph::escape_like(clean);
+        stmt.query_map(rusqlite::params![clean, format!("{}/%", escaped)], map_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         stmt.query_map([], map_row)?

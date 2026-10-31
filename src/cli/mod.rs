@@ -6,13 +6,13 @@ use std::path::PathBuf;
 
 use crate::constants::{CLI_DEFAULT_LIMIT, VERSION};
 use crate::graph::{calculate_blast_radius, extract_contract, traverse_graph};
-use crate::index::open_synced_db;
 use crate::mutations::{
     append_section_in_note, append_work_log, read_daily_note, replace_section_in_note,
     set_note_property, write_note,
 };
 use crate::search::{
-    execute_sql_query, format_hits_compact, get_keypath, list_notes, search_vault,
+    execute_sql_query, format_hits_compact, get_keypath, list_notes, list_projects, list_services,
+    search_vault,
 };
 use crate::storage::{extract_section, resolve_note_file, resolve_vault_path};
 use crate::verify::{lint_vault, reconcile_vault, run_verification_tests, verify_links};
@@ -353,22 +353,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Commands::Services { json } => {
-            let con = open_synced_db(&vault)?;
-            let mut stmt = con.prepare(
-                "SELECT name, container_prefix, ports, replicas, role, host, network FROM services",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(serde_json::json!({
-                    "name": r.get::<_, String>(0)?,
-                    "container_prefix": r.get::<_, String>(1)?,
-                    "ports": r.get::<_, String>(2)?,
-                    "replicas": r.get::<_, String>(3)?,
-                    "role": r.get::<_, String>(4)?,
-                    "host": r.get::<_, String>(5)?,
-                    "network": r.get::<_, String>(6)?,
-                }))
-            })?;
-            let items: Vec<serde_json::Value> = rows.filter_map(Result::ok).collect();
+            let items = list_services(&vault)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&items)?);
             } else {
@@ -383,23 +368,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Commands::Projects { json } => {
-            let con = open_synced_db(&vault)?;
-            let mut stmt = con.prepare(
-                "SELECT stem, title, status, repo, host, network, summary FROM entities \
-                 WHERE domain = '20-Projects' AND COALESCE(type, '') != 'moc' AND stem != 'Projects-MOC' AND stem NOT LIKE '%-MOC'",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(serde_json::json!({
-                    "stem": r.get::<_, String>(0)?,
-                    "title": r.get::<_, String>(1)?,
-                    "status": r.get::<_, Option<String>>(2)?,
-                    "repo": r.get::<_, Option<String>>(3)?,
-                    "host": r.get::<_, Option<String>>(4)?,
-                    "network": r.get::<_, Option<String>>(5)?,
-                    "summary": r.get::<_, Option<String>>(6)?,
-                }))
-            })?;
-            let items: Vec<serde_json::Value> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            let items = list_projects(&vault)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&items)?);
             } else {

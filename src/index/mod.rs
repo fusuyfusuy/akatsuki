@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::storage::parse_frontmatter;
+use crate::storage::{body_after_frontmatter, parse_frontmatter, strip_fenced_code};
 
 /// Renders a YAML scalar or collection as the text stored in a relation/invariant row.
 fn scalar_text(value: &Value) -> String {
@@ -51,18 +51,16 @@ pub fn extract_target_stem(raw: &str) -> String {
 /// Escaped wikilinks (`\[[x]]`) and wikilinks inside code fences are ignored as documentation.
 pub fn parse_wikilinks(body: &str) -> Vec<String> {
     use std::sync::OnceLock;
-    static FENCE_RE: OnceLock<Regex> = OnceLock::new();
     static INLINE_RE: OnceLock<Regex> = OnceLock::new();
     static RE: OnceLock<Regex> = OnceLock::new();
 
-    let fence_re = FENCE_RE
-        .get_or_init(|| Regex::new(r"(?s)(```.*?```|~~~.*?~~~)").expect("valid fence regex"));
-    let inline_re = INLINE_RE.get_or_init(|| Regex::new(r"`[^`\n]+`").expect("valid inline regex"));
+    let inline_re =
+        INLINE_RE.get_or_init(|| Regex::new(r"`+[^`\n]+`+").expect("valid inline regex"));
     let wikilink_re = RE.get_or_init(|| {
         Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]").expect("valid wikilink regex")
     });
 
-    let without_fences = fence_re.replace_all(body, "");
+    let without_fences = strip_fenced_code(body);
     let clean = inline_re.replace_all(&without_fences, "");
 
     let mut targets = Vec::new();
@@ -133,7 +131,7 @@ pub fn open_synced_db(vault: &Path) -> Result<Connection> {
 }
 
 /// Bumped whenever the projection's shape changes; a mismatch rebuilds the cache.
-const SCHEMA_VERSION: &str = "0.2.2";
+const SCHEMA_VERSION: &str = "0.2.3";
 
 fn stored_schema_version(con: &Connection) -> Result<Option<String>> {
     Ok(con
@@ -336,6 +334,28 @@ fn load_indexed_hashes(con: &Connection) -> Result<HashMap<String, String>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+fn indexed_vector_paths(con: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = con.prepare("SELECT DISTINCT rel_path FROM note_vectors")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn delete_note_projections(tx: &Connection, rel: &str, clear_fts: bool) -> Result<()> {
+    if clear_fts {
+        tx.execute("DELETE FROM notes_fts WHERE rel_path = ?1", params![rel])?;
+    }
+    tx.execute("DELETE FROM note_vectors WHERE rel_path = ?1", params![rel])?;
+    tx.execute("DELETE FROM entities WHERE rel_path = ?1", params![rel])?;
+    tx.execute("DELETE FROM services WHERE rel_path = ?1", params![rel])?;
+    tx.execute("DELETE FROM relations WHERE source_rel = ?1", params![rel])?;
+    tx.execute("DELETE FROM invariants WHERE source_rel = ?1", params![rel])?;
+    tx.execute(
+        "DELETE FROM verifications WHERE source_rel = ?1",
+        params![rel],
+    )?;
+    Ok(())
+}
+
 fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Result<SyncReport> {
     let t0 = std::time::Instant::now();
 
@@ -499,9 +519,7 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
 
     let mut missing_vectors = false;
     if crate::vectors::feature_enabled() {
-        let mut stmt = con.prepare("SELECT DISTINCT rel_path FROM note_vectors")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let with_vecs: HashSet<String> = rows.flatten().collect();
+        let with_vecs = indexed_vector_paths(con)?;
         if current_map.keys().any(|rel| !with_vecs.contains(rel)) {
             missing_vectors = true;
         }
@@ -536,28 +554,7 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
             "DELETE FROM file_meta WHERE rel_path = ?1",
             params![del_rel],
         )?;
-        tx.execute(
-            "DELETE FROM notes_fts WHERE rel_path = ?1",
-            params![del_rel],
-        )?;
-        tx.execute("DELETE FROM entities WHERE rel_path = ?1", params![del_rel])?;
-        tx.execute("DELETE FROM services WHERE rel_path = ?1", params![del_rel])?;
-        tx.execute(
-            "DELETE FROM relations WHERE source_rel = ?1",
-            params![del_rel],
-        )?;
-        tx.execute(
-            "DELETE FROM invariants WHERE source_rel = ?1",
-            params![del_rel],
-        )?;
-        tx.execute(
-            "DELETE FROM verifications WHERE source_rel = ?1",
-            params![del_rel],
-        )?;
-        tx.execute(
-            "DELETE FROM note_vectors WHERE rel_path = ?1",
-            params![del_rel],
-        )?;
+        delete_note_projections(&tx, &del_rel, true)?;
     }
 
     let verify_re = Regex::new(r"(?s)```bash:verify\s*\n(.*?)\n```")?;
@@ -584,7 +581,12 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
             Ok(parts) => parts,
             Err(e) => {
                 parse_errors.push(format!("'{}': {}", rel, e));
-                (serde_json::json!({}), content.clone())
+                (
+                    serde_json::json!({}),
+                    body_after_frontmatter(content)
+                        .trim_start_matches('\n')
+                        .to_string(),
+                )
             }
         };
 
@@ -640,21 +642,9 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         let metadata_json = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
         // Clean prior records. `rel_path` is UNINDEXED in the FTS table, so each
-        // DELETE scans it: skip it for notes that were never indexed.
-        if indexed_hashes.contains_key(rel) {
-            tx.execute("DELETE FROM notes_fts WHERE rel_path = ?1", params![rel])?;
-        }
-        // Old vectors describe old text: drop them so the missing-vector probe
-        // re-embeds this note even when embedding is skipped on this run.
-        tx.execute("DELETE FROM note_vectors WHERE rel_path = ?1", params![rel])?;
-        tx.execute("DELETE FROM entities WHERE rel_path = ?1", params![rel])?;
-        tx.execute("DELETE FROM services WHERE rel_path = ?1", params![rel])?;
-        tx.execute("DELETE FROM relations WHERE source_rel = ?1", params![rel])?;
-        tx.execute("DELETE FROM invariants WHERE source_rel = ?1", params![rel])?;
-        tx.execute(
-            "DELETE FROM verifications WHERE source_rel = ?1",
-            params![rel],
-        )?;
+        // DELETE scans it: skip it for notes that were never indexed. Old vectors
+        // describe old text, so drop them even when embedding is skipped on this run.
+        delete_note_projections(&tx, rel, indexed_hashes.contains_key(rel))?;
 
         // Insert notes_fts
         tx.execute(
@@ -863,14 +853,7 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
     // durable: an embedder failure must never roll back text rows or poison every
     // read command, and is reported (ADR-0002) instead of swallowed.
     if crate::vectors::feature_enabled() {
-        let mut existing_vector_rels: HashSet<String> = HashSet::new();
-        {
-            let mut stmt = con.prepare("SELECT DISTINCT rel_path FROM note_vectors")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            for r in rows.flatten() {
-                existing_vector_rels.insert(r);
-            }
-        }
+        let existing_vector_rels = indexed_vector_paths(con)?;
         for (rel, file) in &current_map {
             if !existing_vector_rels.contains(rel) && !vector_sources.iter().any(|(r, _)| r == rel)
             {

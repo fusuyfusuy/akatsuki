@@ -12,7 +12,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::search::SearchHit;
-use crate::storage::parse_frontmatter;
+use crate::storage::{body_after_frontmatter, fence_closes, fence_open, parse_frontmatter};
 
 /// Section windows are packed at this many characters.
 const MAX_CHUNK_CHARS: usize = 1200;
@@ -61,31 +61,14 @@ pub struct NoteChunk {
 /// Splits a note into embedding chunks: one per heading section (levels 1-4),
 /// windowed at [`MAX_CHUNK_CHARS`] on paragraph boundaries, each carrying a
 /// document header and breadcrumb so a chunk is interpretable on its own.
-fn extract_body_fallback(content: &str) -> String {
-    let text = content.strip_prefix('\u{feff}').unwrap_or(content);
-    if let Some(line_end) = text.find('\n') {
-        if text[..line_end].trim_end_matches('\r').trim() == "---" {
-            let after_open = &text[line_end + 1..];
-            let mut offset = 0usize;
-            for line in after_open.split_inclusive('\n') {
-                if line.trim_end_matches(['\r', '\n']).trim() == "---" {
-                    return after_open[offset + line.len()..]
-                        .trim_start_matches('\n')
-                        .to_string();
-                }
-                offset += line.len();
-            }
-        }
-    }
-    content.to_string()
-}
-
 pub fn chunk_note(rel_path: &str, content: &str) -> Result<Vec<NoteChunk>> {
     let (fm, body) = match parse_frontmatter(content) {
         Ok(parts) => parts,
         Err(_) => (
             Value::Object(Default::default()),
-            extract_body_fallback(content),
+            body_after_frontmatter(content)
+                .trim_start_matches('\n')
+                .to_string(),
         ),
     };
     Ok(chunk_parsed(rel_path, &fm, &body))
@@ -137,29 +120,23 @@ fn chunk_parsed(rel_path: &str, fm: &Value, body: &str) -> Vec<NoteChunk> {
         title: String,
     }
 
-    let mut in_fence: Option<char> = None;
+    let mut in_fence: Option<(char, usize)> = None;
     let mut headings: Vec<HeadingMatch> = Vec::new();
     let mut offset = 0usize;
 
     for line_str in body.split_inclusive('\n') {
         let line = line_str.trim_end_matches(['\r', '\n']);
-        let trimmed = line.trim_start();
 
-        if let Some(fence_char) = in_fence {
-            let fence_prefix = if fence_char == '`' { "```" } else { "~~~" };
-            if trimmed.starts_with(fence_prefix) {
+        if let Some((marker, open_len)) = in_fence {
+            if fence_closes(line, marker, open_len) {
                 in_fence = None;
             }
             offset += line_str.len();
             continue;
         }
 
-        if trimmed.starts_with("```") {
-            in_fence = Some('`');
-            offset += line_str.len();
-            continue;
-        } else if trimmed.starts_with("~~~") {
-            in_fence = Some('~');
+        if let Some(opened) = fence_open(line) {
+            in_fence = Some(opened);
             offset += line_str.len();
             continue;
         }
