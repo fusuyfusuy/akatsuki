@@ -131,7 +131,7 @@ pub fn open_synced_db(vault: &Path) -> Result<Connection> {
 }
 
 /// Bumped whenever the projection's shape changes; a mismatch rebuilds the cache.
-const SCHEMA_VERSION: &str = "0.2.3";
+const SCHEMA_VERSION: &str = "0.2.4";
 
 fn stored_schema_version(con: &Connection) -> Result<Option<String>> {
     Ok(con
@@ -214,9 +214,9 @@ fn create_tables(con: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS entities (
             rel_path TEXT PRIMARY KEY,
-            stem TEXT NOT NULL,
+            stem TEXT NOT NULL COLLATE NOCASE,
             domain TEXT NOT NULL,
-            title TEXT NOT NULL,
+            title TEXT NOT NULL COLLATE NOCASE,
             type TEXT NOT NULL,
             summary TEXT,
             status TEXT,
@@ -230,8 +230,8 @@ fn create_tables(con: &Connection) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS services (
-            name TEXT,
-            container_prefix TEXT,
+            name TEXT COLLATE NOCASE,
+            container_prefix TEXT COLLATE NOCASE,
             ports TEXT,
             host TEXT,
             network TEXT,
@@ -242,9 +242,14 @@ fn create_tables(con: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS relations (
             source_rel TEXT,
-            target_stem TEXT,
+            target_stem TEXT COLLATE NOCASE,
             relation_type TEXT
         );
+
+        CREATE INDEX IF NOT EXISTS idx_entities_stem ON entities(stem COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_stem COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_rel);
+        CREATE INDEX IF NOT EXISTS idx_services_rel ON services(rel_path);
 
         CREATE TABLE IF NOT EXISTS invariants (
             source_rel TEXT,
@@ -362,20 +367,14 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
     // 1. Gather all existing indexed hashes
     let indexed_hashes = load_indexed_hashes(con)?;
 
-    // 2. Discover markdown files
-    let ignored_dirs = [
-        ".git",
-        ".akatsuki",
-        ".venv",
-        "node_modules",
-        ".obsidian",
-        "__pycache__",
-        "_templates",
-    ];
+    // 2. Discover markdown files (skip all dot-directories below vault root)
+    let ignored_dirs = ["node_modules", "__pycache__", "_templates"];
     let walker = walkdir::WalkDir::new(vault).into_iter().filter_entry(|e| {
-        // The vault root itself may be named like an ignored directory.
+        if e.depth() == 0 {
+            return true;
+        }
         let name = e.file_name().to_string_lossy();
-        e.depth() == 0 || !ignored_dirs.iter().any(|ig| *ig == name)
+        !name.starts_with('.') && !ignored_dirs.iter().any(|ig| *ig == name)
     });
 
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -524,8 +523,15 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
             missing_vectors = true;
         }
     }
+    let has_orphan_vectors: bool = con
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM note_vectors WHERE rel_path NOT IN (SELECT rel_path FROM file_meta))",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
 
-    if to_delete.is_empty() && to_update.is_empty() && !missing_vectors {
+    if to_delete.is_empty() && to_update.is_empty() && !missing_vectors && !has_orphan_vectors {
         return Ok(SyncReport {
             added: 0,
             updated: 0,
@@ -538,122 +544,131 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
         });
     }
 
-    // 5. Apply SQLite Transactions
-    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut vector_sources: Vec<(String, String, String)> = Vec::new();
+    let mut committed_deleted = 0usize;
+    let mut committed_updated = 0usize;
+    let mut committed_added = 0usize;
 
-    // Another process may have synced while this one waited for the write lock.
-    // Apply only rows whose stored hash is still the one this scan started from;
-    // anything else was already advanced by that process and must not be rolled
-    // back to the (now stale) bytes read before the lock.
-    let current_hashes = load_indexed_hashes(&tx)?;
-    to_delete.retain(|rel| current_hashes.get(rel) == indexed_hashes.get(rel));
-    to_update.retain(|f| current_hashes.get(&f.rel_path) == indexed_hashes.get(&f.rel_path));
+    // 5. Apply SQLite lexical transaction only when lexical rows or orphan vectors need mutation
+    if !to_delete.is_empty() || !to_update.is_empty() || has_orphan_vectors {
+        let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-    for del_rel in to_delete {
-        tx.execute(
-            "DELETE FROM file_meta WHERE rel_path = ?1",
-            params![del_rel],
-        )?;
-        delete_note_projections(&tx, &del_rel, true)?;
-    }
+        let current_hashes = load_indexed_hashes(&tx)?;
+        to_delete.retain(|rel| current_hashes.get(rel) == indexed_hashes.get(rel));
+        to_update.retain(|f| current_hashes.get(&f.rel_path) == indexed_hashes.get(&f.rel_path));
 
-    let verify_re = Regex::new(r"(?s)```bash:verify\s*\n(.*?)\n```")?;
+        committed_deleted = to_delete.len();
+        committed_updated = to_update.len();
+        committed_added = to_update
+            .iter()
+            .filter(|f| !current_hashes.contains_key(&f.rel_path))
+            .count();
 
-    let now_iso = chrono::Utc::now().to_rfc3339();
-
-    // Notes whose text changed are the only ones that need re-embedding.
-    let mut vector_sources: Vec<(String, String)> = Vec::new();
-
-    for file in &to_update {
-        let rel = &file.rel_path;
-        let content = &file.content;
-        let stem = Path::new(rel)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(rel);
-        let domain = rel.split('/').next().unwrap_or("").to_string();
-        if crate::vectors::feature_enabled() {
-            vector_sources.push((rel.clone(), content.clone()));
+        for del_rel in to_delete {
+            tx.execute(
+                "DELETE FROM file_meta WHERE rel_path = ?1",
+                params![del_rel],
+            )?;
+            delete_note_projections(&tx, &del_rel, true)?;
         }
 
-        let parsed = parse_frontmatter(content);
-        let (fm, body) = match parsed {
-            Ok(parts) => parts,
-            Err(e) => {
-                parse_errors.push(format!("'{}': {}", rel, e));
-                (
-                    serde_json::json!({}),
-                    body_after_frontmatter(content)
-                        .trim_start_matches('\n')
-                        .to_string(),
-                )
+        static VERIFY_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let verify_re = VERIFY_RE.get_or_init(|| {
+            Regex::new(r"(?s)```bash:verify\s*\n(.*?)\n```").expect("valid verify regex")
+        });
+
+        let now_iso = chrono::Utc::now().to_rfc3339();
+
+        for file in &to_update {
+            let rel = &file.rel_path;
+            let content = &file.content;
+            let stem = Path::new(rel)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(rel);
+            let domain = rel.split_once('/').map_or("", |(d, _)| d).to_string();
+            if crate::vectors::feature_enabled() {
+                vector_sources.push((rel.clone(), file.hash.clone(), content.clone()));
             }
-        };
 
-        let title = fm
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or(stem)
-            .to_string();
-        let summary = fm
-            .get("summary")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let status = fm
-            .get("status")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let repo = fm
-            .get("repo")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let host = fm
-            .get("host")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let network = fm
-            .get("network")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            let parsed = parse_frontmatter(content);
+            let (fm, body) = match parsed {
+                Ok(parts) => parts,
+                Err(e) => {
+                    parse_errors.push(format!("'{}': {}", rel, e));
+                    (
+                        serde_json::json!({}),
+                        body_after_frontmatter(content)
+                            .trim_start_matches('\n')
+                            .to_string(),
+                    )
+                }
+            };
 
-        let tags_str = match fm.get("tags") {
-            Some(Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-            Some(Value::String(s)) => s.clone(),
-            _ => String::new(),
-        };
-        let note_type = fm
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("note")
-            .to_string();
-        let updated = fm
-            .get("updated")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let updated_by = fm
-            .get("updated_by")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let metadata_json = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
+            let title = fm
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(stem)
+                .to_string();
+            let summary = fm
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let status = fm
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let repo = fm
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let host = fm
+                .get("host")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let network = fm
+                .get("network")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
-        // Clean prior records. `rel_path` is UNINDEXED in the FTS table, so each
-        // DELETE scans it: skip it for notes that were never indexed. Old vectors
-        // describe old text, so drop them even when embedding is skipped on this run.
-        delete_note_projections(&tx, rel, indexed_hashes.contains_key(rel))?;
+            let tags_str = match fm.get("tags") {
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Some(Value::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let note_type = fm
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("note")
+                .to_string();
+            let updated = fm
+                .get("updated")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let updated_by = fm
+                .get("updated_by")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let metadata_json = serde_json::to_string(&fm).unwrap_or_else(|_| "{}".to_string());
 
-        // Insert notes_fts
-        tx.execute(
+            // Clean prior records. `rel_path` is UNINDEXED in the FTS table, so each
+            // DELETE scans it: skip it for notes that were never indexed. Old vectors
+            // describe old text, so drop them even when embedding is skipped on this run.
+            delete_note_projections(&tx, rel, indexed_hashes.contains_key(rel))?;
+
+            // Insert notes_fts
+            tx.execute(
             "INSERT INTO notes_fts (rel_path, stem, domain, title, tags, summary, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![rel, stem, domain, title, tags_str, summary, body],
         )?;
 
-        // Insert entities
-        tx.execute(
+            // Insert entities
+            tx.execute(
             "INSERT OR REPLACE INTO entities (rel_path, stem, domain, title, type, summary, status, repo, host, network, tags, updated, updated_by, metadata_json) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
@@ -662,51 +677,43 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
             ],
         )?;
 
-        let mut seen_relations: HashSet<(String, String)> = HashSet::new();
+            let mut seen_relations: HashSet<(String, String)> = HashSet::new();
 
-        // Frontmatter-declared relations keep the YAML key verbatim as the type,
-        // so declared dependencies are visible to blast/map/contract.
-        if let Some(Value::Object(declared)) = fm.get("relations") {
-            for (relation_type, targets) in declared {
-                match targets {
-                    Value::Array(items) => {
-                        for item in items {
-                            let target = extract_target_stem(&scalar_text(item));
+            // Frontmatter-declared relations keep the YAML key verbatim as the type,
+            // so declared dependencies are visible to blast/map/contract.
+            if let Some(Value::Object(declared)) = fm.get("relations") {
+                for (relation_type, targets) in declared {
+                    match targets {
+                        Value::Array(items) => {
+                            for item in items {
+                                let target = extract_target_stem(&scalar_text(item));
+                                insert_relation(
+                                    &tx,
+                                    &mut seen_relations,
+                                    rel,
+                                    &target,
+                                    relation_type,
+                                )?;
+                            }
+                        }
+                        other => {
+                            let target = extract_target_stem(&scalar_text(other));
                             insert_relation(&tx, &mut seen_relations, rel, &target, relation_type)?;
                         }
                     }
-                    other => {
-                        let target = extract_target_stem(&scalar_text(other));
-                        insert_relation(&tx, &mut seen_relations, rel, &target, relation_type)?;
-                    }
                 }
             }
-        }
 
-        // Body wikilinks resolve through note stems; escaped links (`\[[x]]`) are
-        // documentation, not references.
-        for clean_stem in parse_wikilinks(&body) {
-            insert_relation(&tx, &mut seen_relations, rel, &clean_stem, "references")?;
-        }
-        // Invariants: declared in frontmatter, or bulleted under an `Invariants`
-        // heading.
-        if let Some(Value::Array(rules)) = fm.get("invariants") {
-            for rule in rules {
-                let rule = scalar_text(rule);
-                if !rule.is_empty() {
-                    tx.execute(
-                        "INSERT INTO invariants (source_rel, invariant_text) VALUES (?1, ?2)",
-                        params![rel, rule],
-                    )?;
-                }
+            // Body wikilinks resolve through note stems; escaped links (`\[[x]]`) are
+            // documentation, not references.
+            for clean_stem in parse_wikilinks(&body) {
+                insert_relation(&tx, &mut seen_relations, rel, &clean_stem, "references")?;
             }
-        }
-        let invariants_section = crate::storage::extract_section(&body, "Invariants")
-            .or_else(|| crate::storage::extract_section(&body, "Non-Negotiable Invariants"));
-        if let Some(section) = invariants_section {
-            for line in section.lines() {
-                if let Some(rule) = line.trim().strip_prefix("- ") {
-                    let rule = rule.trim();
+            // Invariants: declared in frontmatter, or bulleted under an `Invariants`
+            // heading.
+            if let Some(Value::Array(rules)) = fm.get("invariants") {
+                for rule in rules {
+                    let rule = scalar_text(rule);
                     if !rule.is_empty() {
                         tx.execute(
                             "INSERT INTO invariants (source_rel, invariant_text) VALUES (?1, ?2)",
@@ -715,149 +722,169 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
                     }
                 }
             }
-        }
-
-        // Extract bash:verify blocks
-        for cap in verify_re.captures_iter(&body) {
-            let cmd = cap[1].trim();
-            if !cmd.is_empty() {
-                tx.execute(
-                    "INSERT INTO verifications (source_rel, command) VALUES (?1, ?2)",
-                    params![rel, cmd],
-                )?;
-            }
-        }
-
-        // Services catalog table: host comes from this machine, not a literal.
-        let default_host = crate::storage::machine_id();
-        if rel.ends_with("Services-Catalog.md") {
-            for line in body.lines() {
-                let trimmed = line.trim();
-                if !trimmed.starts_with('|')
-                    || trimmed.contains(":---")
-                    || trimmed.contains("Service / Stack")
-                {
-                    continue;
-                }
-                let mut raw_cols: Vec<String> = Vec::new();
-                let mut col = String::new();
-                let mut chars = trimmed.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if c == '\\' && chars.peek() == Some(&'|') {
-                        col.push('|');
-                        chars.next();
-                    } else if c == '|' {
-                        raw_cols.push(col.trim().to_string());
-                        col.clear();
-                    } else {
-                        col.push(c);
-                    }
-                }
-                raw_cols.push(col.trim().to_string());
-
-                if raw_cols.len() >= 6 {
-                    let svc_name = raw_cols[1].replace(['*', '`'], "").trim().to_string();
-                    let container = raw_cols[2].replace('`', "").trim().to_string();
-                    let ports = raw_cols[3].trim().to_string();
-                    let replicas = raw_cols[4].trim().to_string();
-                    let role = raw_cols[5].trim().to_string();
-
-                    if !svc_name.is_empty() {
-                        tx.execute(
-                            "INSERT INTO services (name, container_prefix, ports, host, network, replicas, role, rel_path) VALUES (?1, ?2, ?3, ?4, 'default', ?5, ?6, ?7)",
-                            params![svc_name, container, ports, default_host, replicas, role, rel],
+            let invariants_section = crate::storage::extract_section(&body, "Invariants")
+                .or_else(|| crate::storage::extract_section(&body, "Non-Negotiable Invariants"));
+            if let Some(section) = invariants_section {
+                for line in section.lines() {
+                    if let Some(rule) = line.trim().strip_prefix("- ") {
+                        let rule = rule.trim();
+                        if !rule.is_empty() {
+                            tx.execute(
+                            "INSERT INTO invariants (source_rel, invariant_text) VALUES (?1, ?2)",
+                            params![rel, rule],
                         )?;
+                        }
                     }
                 }
             }
-        }
 
-        // Notes that declare `ports:` or are typed as a service are services too.
-        if fm.get("ports").is_some() || note_type == "service" {
-            let ports_val = match fm.get("ports") {
-                Some(Value::Array(items)) => scalar_join(items),
-                Some(Value::String(s)) => s.clone(),
-                Some(other) => scalar_text(other),
-                None => String::new(),
-            };
-            let container = fm
-                .get("container")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{}_*", stem));
-            let svc_host = host.clone().unwrap_or_else(|| default_host.clone());
-            let svc_net = network.clone().unwrap_or_else(|| "default".to_string());
-
-            tx.execute(
-                "INSERT INTO services (name, container_prefix, ports, host, network, replicas, role, rel_path) VALUES (?1, ?2, ?3, ?4, ?5, '1', ?6, ?7)",
-                params![stem, container, ports_val, svc_host, svc_net, summary, rel],
-            )?;
-        }
-
-        // Explicit `services:` frontmatter block.
-        if let Some(svcs) = fm.get("services").and_then(|v| v.as_array()) {
-            for s in svcs {
-                let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let container = s
-                    .get("container")
-                    .or_else(|| s.get("container_prefix"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let ports = s
-                    .get("ports")
-                    .or_else(|| s.get("port"))
-                    .map(|v| match v {
-                        Value::Array(items) => scalar_join(items),
-                        Value::String(s) => s.clone(),
-                        other => scalar_text(other),
-                    })
-                    .unwrap_or_default();
-                let s_host = s
-                    .get("host")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(host.as_deref().unwrap_or(&default_host));
-                let s_net = s
-                    .get("network")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(network.as_deref().unwrap_or("default"));
-                let replicas = s
-                    .get("replicas")
-                    .map(|v| match v {
-                        Value::String(s) => s.clone(),
-                        other => scalar_text(other),
-                    })
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "1".to_string());
-                let role = s.get("role").and_then(|v| v.as_str()).unwrap_or("");
-
-                if !name.is_empty() {
+            // Extract bash:verify blocks
+            for cap in verify_re.captures_iter(&body) {
+                let cmd = cap[1].trim();
+                if !cmd.is_empty() {
                     tx.execute(
-                        "INSERT INTO services (name, container_prefix, ports, host, network, replicas, role, rel_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        params![name, container, ports, s_host, s_net, replicas, role, rel],
+                        "INSERT INTO verifications (source_rel, command) VALUES (?1, ?2)",
+                        params![rel, cmd],
                     )?;
                 }
             }
+
+            // Services catalog table: host comes from this machine, not a literal.
+            let default_host = crate::storage::machine_id();
+            if rel.ends_with("Services-Catalog.md") {
+                for line in body.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.starts_with('|')
+                        || trimmed.contains(":---")
+                        || trimmed.contains("Service / Stack")
+                    {
+                        continue;
+                    }
+                    let mut raw_cols: Vec<String> = Vec::new();
+                    let mut col = String::new();
+                    let mut chars = trimmed.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        if c == '\\' && chars.peek() == Some(&'|') {
+                            col.push('|');
+                            chars.next();
+                        } else if c == '|' {
+                            raw_cols.push(col.trim().to_string());
+                            col.clear();
+                        } else {
+                            col.push(c);
+                        }
+                    }
+                    raw_cols.push(col.trim().to_string());
+
+                    if raw_cols.len() >= 6 {
+                        let svc_name = raw_cols[1].replace(['*', '`'], "").trim().to_string();
+                        let container = raw_cols[2].replace('`', "").trim().to_string();
+                        let ports = raw_cols[3].trim().to_string();
+                        let replicas = raw_cols[4].trim().to_string();
+                        let role = raw_cols[5].trim().to_string();
+
+                        if !svc_name.is_empty() {
+                            tx.execute(
+                            "INSERT INTO services (name, container_prefix, ports, host, network, replicas, role, rel_path) VALUES (?1, ?2, ?3, ?4, 'default', ?5, ?6, ?7)",
+                            params![svc_name, container, ports, default_host, replicas, role, rel],
+                        )?;
+                        }
+                    }
+                }
+            }
+
+            // Notes that declare `ports:` or are typed as a service are services too.
+            if fm.get("ports").is_some() || note_type == "service" {
+                let ports_val = match fm.get("ports") {
+                    Some(Value::Array(items)) => scalar_join(items),
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => scalar_text(other),
+                    None => String::new(),
+                };
+                let container = fm
+                    .get("container")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{}_*", stem));
+                let svc_host = host.clone().unwrap_or_else(|| default_host.clone());
+                let svc_net = network.clone().unwrap_or_else(|| "default".to_string());
+
+                tx.execute(
+                "INSERT INTO services (name, container_prefix, ports, host, network, replicas, role, rel_path) VALUES (?1, ?2, ?3, ?4, ?5, '1', ?6, ?7)",
+                params![stem, container, ports_val, svc_host, svc_net, summary, rel],
+            )?;
+            }
+
+            // Explicit `services:` frontmatter block.
+            if let Some(svcs) = fm.get("services").and_then(|v| v.as_array()) {
+                for s in svcs {
+                    let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let container = s
+                        .get("container")
+                        .or_else(|| s.get("container_prefix"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let ports = s
+                        .get("ports")
+                        .or_else(|| s.get("port"))
+                        .map(|v| match v {
+                            Value::Array(items) => scalar_join(items),
+                            Value::String(s) => s.clone(),
+                            other => scalar_text(other),
+                        })
+                        .unwrap_or_default();
+                    let s_host = s
+                        .get("host")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(host.as_deref().unwrap_or(&default_host));
+                    let s_net = s
+                        .get("network")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(network.as_deref().unwrap_or("default"));
+                    let replicas = s
+                        .get("replicas")
+                        .map(|v| match v {
+                            Value::String(s) => s.clone(),
+                            other => scalar_text(other),
+                        })
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "1".to_string());
+                    let role = s.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if !name.is_empty() {
+                        tx.execute(
+                        "INSERT INTO services (name, container_prefix, ports, host, network, replicas, role, rel_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![name, container, ports, s_host, s_net, replicas, role, rel],
+                    )?;
+                    }
+                }
+            }
         }
-    }
 
-    for file in &to_update {
+        for file in &to_update {
+            tx.execute(
+                "INSERT OR REPLACE INTO file_meta (rel_path, blake3_hash, size, indexed_at) VALUES (?1, ?2, ?3, ?4)",
+                params![&file.rel_path, file.hash, file.size as i64, &now_iso],
+            )?;
+        }
+
         tx.execute(
-            "INSERT OR REPLACE INTO file_meta (rel_path, blake3_hash, size, indexed_at) VALUES (?1, ?2, ?3, ?4)",
-            params![&file.rel_path, file.hash, file.size as i64, &now_iso],
+            "DELETE FROM note_vectors WHERE rel_path NOT IN (SELECT rel_path FROM file_meta)",
+            [],
         )?;
+
+        tx.commit()?;
     }
 
-    tx.commit()?;
-
-    // Embeddings run in their own transaction after the lexical projection is
-    // durable: an embedder failure must never roll back text rows or poison every
-    // read command, and is reported (ADR-0002) instead of swallowed.
+    // Embeddings run outside the lexical transaction on CPU and commit under a
+    // blake3_hash CAS check so deleted/superseded notes never leave ghost vectors.
     if crate::vectors::feature_enabled() {
         let existing_vector_rels = indexed_vector_paths(con)?;
         for (rel, file) in &current_map {
-            if !existing_vector_rels.contains(rel) && !vector_sources.iter().any(|(r, _)| r == rel)
+            if !existing_vector_rels.contains(rel)
+                && !vector_sources.iter().any(|(r, _, _)| r == rel)
             {
-                vector_sources.push((rel.clone(), file.content.clone()));
+                vector_sources.push((rel.clone(), file.hash.clone(), file.content.clone()));
             }
         }
     }
@@ -868,9 +895,9 @@ fn sync_vault_index_with(vault: &Path, con: &mut Connection, apply: bool) -> Res
     });
 
     Ok(SyncReport {
-        added: added_count,
-        updated: updated_count,
-        deleted: deleted_count,
+        added: committed_added,
+        updated: committed_updated,
+        deleted: committed_deleted,
         unchanged: unchanged_count,
         total: total_count,
         parse_errors,

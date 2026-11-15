@@ -14,7 +14,9 @@ use crate::search::{
     execute_sql_query, format_hits_compact, get_keypath, list_notes, list_projects, list_services,
     search_vault,
 };
-use crate::storage::{extract_section, resolve_note_file, resolve_vault_path};
+use crate::storage::{
+    extract_section, extract_toc, read_note_utf8, resolve_note_file_unique, resolve_vault_path,
+};
 use crate::verify::{lint_vault, reconcile_vault, run_verification_tests, verify_links};
 
 #[derive(Parser)]
@@ -54,6 +56,12 @@ pub enum Commands {
         note: String,
         #[arg(short, long)]
         section: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "section",
+            help = "Print markdown table of contents outline"
+        )]
+        toc: bool,
         #[arg(
             short,
             long,
@@ -285,16 +293,57 @@ pub fn run_cli(cli: Cli) -> Result<()> {
         Commands::Read {
             note,
             section,
+            toc,
             budget,
             json,
         } => {
-            let note_path = resolve_note_file(&vault, &note)
-                .ok_or_else(|| anyhow::anyhow!("Note '{}' not found in vault", note))?;
-            let raw_content = std::fs::read_to_string(&note_path)?;
+            let note_path = resolve_note_file_unique(&vault, &note)?;
+            let raw_content = read_note_utf8(&note_path)?;
+            if toc {
+                let toc_lines = extract_toc(&raw_content);
+                let stem = note_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&note);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "path": note_path.display().to_string(),
+                            "note": stem,
+                            "toc": toc_lines,
+                        }))?
+                    );
+                } else {
+                    println!("Table of Contents for {}:", stem);
+                    if toc_lines.is_empty() {
+                        println!("  (no headings)");
+                    } else {
+                        for line in toc_lines {
+                            println!("  {}", line);
+                        }
+                    }
+                }
+                return Ok(());
+            }
             let content = if let Some(sec) = section {
-                extract_section(&raw_content, &sec).ok_or_else(|| {
-                    anyhow::anyhow!("Section '{}' not found in '{}'", sec, note_path.display())
-                })?
+                match extract_section(&raw_content, &sec) {
+                    Some(text) => text,
+                    None => {
+                        let toc_lines = extract_toc(&raw_content);
+                        let hint = if toc_lines.is_empty() {
+                            "  (no headings)".to_string()
+                        } else {
+                            format!("  - {}", toc_lines.join("\n  - "))
+                        };
+                        anyhow::bail!(
+                            "Section '{}' not found in '{}'.\nAvailable sections:\n{}",
+                            sec,
+                            note_path.display(),
+                            hint
+                        );
+                    }
+                }
             } else {
                 raw_content
             };

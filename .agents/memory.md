@@ -1,16 +1,14 @@
 # Project Memory
 
 ## Active Epics & Scale
-- Scale: Native compiled Rust knowledge secretariat (akatsuki v0.2.3, ~6k LOC Rust across storage, index, search, vectors, graph, mutations, verify, mcp, cli).
-- Architecture: Dual-layer Markdown Git source-of-truth with SQLite WAL projection (`.akatsuki/cache.db`, schema version 0.2.3 auto-rebuilt on mismatch), parallel Blake3 content-hash change detection via Rayon, optional pure-Rust Candle embeddings (`intfloat/multilingual-e5-small`) behind `--features vectors` fused with BM25 through RRF, and a native JSON-RPC 2.0 MCP stdio server with 20 tools.
-- Legacy Python implementation is retained under `python/` as a parity reference only; it is not built, installed, or executed.
+- Scale: Native compiled Rust knowledge secretariat (akatsuki v0.2.4, ~6.7k LOC Rust across storage, index, search, vectors, graph, mutations, verify, mcp, cli; legacy `python/` retired).
+- Architecture: Dual-layer Markdown Git source-of-truth with SQLite WAL projection (`.akatsuki/cache.db`, schema version 0.2.4 auto-rebuilt on mismatch), parallel Blake3 content-hash change detection via Rayon, optional pure-Rust Candle embeddings (`intfloat/multilingual-e5-small`) behind `--features vectors` fused with BM25 through RRF, and a native JSON-RPC 2.0 MCP stdio server (JSONL + `Content-Length`) with 20 tools and 6+1 `akatsuki://` resources.
 
 ## KNOWN DEBT (open only — one line per item, delete when done)
-- MCP resource layer (`akatsuki://{note}`) absent <- Python parity gap; no MCP host requests resources yet -> implement `resources/list|read` when a host needs it.
-- `python/` legacy tree (3.5k LOC, 30 tracked files) retained <- migration parity reference -> delete once Rust parity is signed off.
-- Vector weights (~470 MB e5-small) are a local asset only <- CI has no model provisioning -> provision in CI when vector-path tests must run there.
-- Frontmatter edits of nested keypaths lose comments/key order <- serde roundtrip fallback in `mutations::rewrite_note` -> extend the textual patcher to nested maps if users report diffs.
-- `read --toc` / section-miss affordance not implemented <- legacy nicety, low demand -> implement when agents ask for a table of contents.
+# Deliberate gaps get ledger lines: - accepted <what> <- <why> -> <trigger>
+
+- e5-small weights (~470 MB) unprovisioned in GitHub Actions <- CI runner cache budget -> when full vector-embedding integration tests must run in CI
+- nested frontmatter keypaths lose YAML comments/order <- serde_yaml roundtrip fallback -> when users report comment loss on nested map edits
 
 ## Domain Vocabulary & Gotchas
 - Spill Trap: Antigravity dumps tool outputs > 4000 bytes to disk (`output.txt`). MCP `akatsuki_search` defaults to 5 matches (limit clamped to [1,100]) with dense breadcrumbs (~1.6 KB) to prevent agents wasting turns reading spilled files.

@@ -1,32 +1,10 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
-.eggs/
-
-# Virtual environments
-.venv/
-venv/
-ENV/
-
-# Testing & linting
-.pytest_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
 # Local testing vaults & scratch
 .akatsuki/
 *.tmp
 .scratch/
 test-vault*/
 
-# OS & Editor
+# OS, Editor & Rust build artifacts
 .DS_Store
 Thumbs.db
 *.swp

@@ -12,15 +12,27 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::constants::DOMAIN_MOCS;
 use crate::index::{open_cache_db, sync_vault_index};
 use crate::storage::{
     auto_heal_frontmatter, contained_path, dump_frontmatter, is_raw_path, locate_section,
-    locate_section_exact, machine_id, parse_frontmatter, patch_frontmatter_keys, resolve_note_file,
-    resolve_note_file_unique, split_frontmatter, write_atomic, VaultLock,
+    locate_section_exact, machine_id, normalize_heading, parse_frontmatter, patch_frontmatter_keys,
+    read_note_utf8, resolve_note_file_optional_unique, resolve_note_file_unique, split_frontmatter,
+    strip_fenced_code, write_atomic, VaultLock,
 };
 
 /// The project that owns vault-maintenance entries in the daily audit trail.
 const AUDIT_PROJECT: &str = "akatsuki";
+
+fn has_internal_akatsuki_segment(path: &Path) -> bool {
+    path.components().any(|comp| match comp {
+        std::path::Component::Normal(c) => {
+            let s = c.to_string_lossy();
+            s == ".akatsuki" || s == ".akatsuki.lock" || s.starts_with(".akatsuki")
+        }
+        _ => false,
+    })
+}
 
 /// Asserts that a note path does not target internal engine metadata files (.akatsuki, .akatsuki.lock).
 fn ensure_writable_note_path(
@@ -28,18 +40,11 @@ fn ensure_writable_note_path(
     rel_path: &str,
     resolved_path: Option<&Path>,
 ) -> Result<()> {
-    let trimmed = rel_path.trim();
-    let p = Path::new(trimmed);
-    for comp in p.components() {
-        if let std::path::Component::Normal(c) = comp {
-            let s = c.to_string_lossy();
-            if s == ".akatsuki" || s == ".akatsuki.lock" || s.starts_with(".akatsuki") {
-                bail!(
-                    "Cannot mutate internal akatsuki metadata files: {}",
-                    rel_path
-                );
-            }
-        }
+    if has_internal_akatsuki_segment(Path::new(rel_path.trim())) {
+        bail!(
+            "Cannot mutate internal akatsuki metadata files: {}",
+            rel_path
+        );
     }
 
     if let Some(target) = resolved_path {
@@ -50,21 +55,29 @@ fn ensure_writable_note_path(
         } else {
             vault.to_path_buf()
         };
-        let norm_vault = crate::storage::normalize_path(&abs_vault);
-        let norm_target = crate::storage::normalize_path(target);
-        if let Ok(rel) = norm_target.strip_prefix(&norm_vault) {
-            for comp in rel.components() {
-                if let std::path::Component::Normal(c) = comp {
-                    let s = c.to_string_lossy();
-                    if s == ".akatsuki" || s == ".akatsuki.lock" || s.starts_with(".akatsuki") {
-                        bail!(
-                            "Cannot mutate internal akatsuki metadata files: {}",
-                            rel_path
-                        );
-                    }
-                }
+        let canon_vault = fs::canonicalize(&abs_vault)
+            .unwrap_or_else(|_| crate::storage::normalize_path(&abs_vault));
+        let canon_target =
+            fs::canonicalize(target).unwrap_or_else(|_| crate::storage::normalize_path(target));
+        if let Ok(rel) = canon_target.strip_prefix(&canon_vault) {
+            if has_internal_akatsuki_segment(rel) {
+                bail!(
+                    "Cannot mutate internal akatsuki metadata files: {}",
+                    rel_path
+                );
             }
         }
+    }
+    Ok(())
+}
+
+fn ensure_valid_heading(heading: &str) -> Result<()> {
+    reject_control_chars("Heading", heading)?;
+    if normalize_heading(heading).is_empty() {
+        bail!(
+            "Heading '{}' must contain at least one alphanumeric or identifier character",
+            heading
+        );
     }
     Ok(())
 }
@@ -120,7 +133,8 @@ pub fn write_note(
         .context("Path traversal outside vault boundary is forbidden")?;
     ensure_writable_note_path(vault, rel_path, Some(&target_path))?;
 
-    if target_path.exists() && !overwrite {
+    let existed = target_path.exists();
+    if existed && !overwrite {
         bail!(
             "File '{}' already exists. Pass overwrite=true to replace.",
             target_rel
@@ -136,6 +150,9 @@ pub fn write_note(
     };
 
     write_atomic(&target_path, &payload)?;
+    if !existed && !raw && target_rel.ends_with(".md") {
+        register_in_parent_moc_if_present(vault, &target_rel)?;
+    }
     record_audit(vault, "write", &target_rel)?;
     sync_index(vault);
 
@@ -182,12 +199,12 @@ fn append_work_log_inner(
         )
     };
 
-    let daily_dir = vault.join("01-Daily");
-    fs::create_dir_all(&daily_dir)?;
-    let daily_file = daily_dir.join(format!("{}.md", date_str));
+    let daily_rel = format!("01-Daily/{}.md", date_str);
+    let daily_file = contained_path(vault, &daily_rel)
+        .with_context(|| format!("Daily note path '{}' escapes vault boundary", daily_rel))?;
 
     let content = if daily_file.is_file() {
-        fs::read_to_string(&daily_file)?
+        read_note_utf8(&daily_file)?
     } else {
         format!(
             "---\ntitle: \"{}\"\ndate: {}\ntype: daily\ntags: [daily, worklog]\nsummary: \"Daily activity log for {}\"\n---\n\n# {}\n\n## 📝 Work Log & Session Notes\n\n",
@@ -212,12 +229,7 @@ fn append_work_log_inner(
             rebuilt.extend(lines[end..].iter().map(|l| l.to_string()));
             rebuilt.join("\n")
         }
-        None => format!(
-            "{}\n\n{}\n\n{}\n",
-            body.trim_end(),
-            target_heading,
-            entry
-        ),
+        None => format!("{}\n\n{}\n\n{}\n", body.trim_end(), target_heading, entry),
     };
     let new_content = restore_eol(&content, format!("{}{}", prefix, new_body));
 
@@ -232,14 +244,14 @@ pub fn replace_section_in_note(
     new_section_content: &str,
 ) -> Result<()> {
     reject_control_chars("Note path", rel_path)?;
-    reject_control_chars("Heading", heading)?;
+    ensure_valid_heading(heading)?;
     ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
     let note_path = resolve_note_file_unique(vault, rel_path)?;
     ensure_writable_note_path(vault, rel_path, Some(&note_path))?;
 
-    let text = fs::read_to_string(&note_path)?;
+    let text = read_note_utf8(&note_path)?;
     let (mut fm, body) = parse_frontmatter(&text)
         .with_context(|| format!("Note '{}' has invalid frontmatter", note_path.display()))?;
 
@@ -276,7 +288,7 @@ pub fn set_note_value(vault: &Path, rel_path: &str, keypath: &str, value: Value)
     let note_path = resolve_note_file_unique(vault, rel_path)?;
     ensure_writable_note_path(vault, rel_path, Some(&note_path))?;
 
-    let text = fs::read_to_string(&note_path)?;
+    let text = read_note_utf8(&note_path)?;
     let (mut fm, body) = parse_frontmatter(&text)
         .with_context(|| format!("Note '{}' has invalid frontmatter", note_path.display()))?;
 
@@ -299,27 +311,28 @@ pub fn append_section_in_note(
     content_to_append: &str,
 ) -> Result<()> {
     reject_control_chars("Note path", rel_path)?;
-    reject_control_chars("Heading", heading)?;
+    ensure_valid_heading(heading)?;
     ensure_writable_note_path(vault, rel_path, None)?;
     let _lock = VaultLock::acquire(vault)?;
 
-    // A missing note is created; an ambiguous one is an error, never a guess.
-    let note_path = if resolve_note_file(vault, rel_path).is_some() {
-        let path = resolve_note_file_unique(vault, rel_path)?;
-        ensure_writable_note_path(vault, rel_path, Some(&path))?;
-        path
-    } else {
-        create_note(vault, rel_path, heading)?
-    };
+    // A missing note is created in one atomic write; an ambiguous one is an error.
+    match resolve_note_file_optional_unique(vault, rel_path)? {
+        Some(note_path) => {
+            ensure_writable_note_path(vault, rel_path, Some(&note_path))?;
+            let text = read_note_utf8(&note_path)?;
+            let (mut fm, body) = parse_frontmatter(&text).with_context(|| {
+                format!("Note '{}' has invalid frontmatter", note_path.display())
+            })?;
+            stamp_provenance(&mut fm);
+            let edit = |b: &str| Ok(appended_body(b, heading, content_to_append));
+            let out = rewrite_note(&text, &fm, &body, Some(Vec::new()), &edit)?;
+            write_atomic(&note_path, &out)?;
+        }
+        None => {
+            create_note_with_section(vault, rel_path, heading, content_to_append)?;
+        }
+    }
 
-    let text = fs::read_to_string(&note_path)?;
-    let (mut fm, body) = parse_frontmatter(&text)
-        .with_context(|| format!("Note '{}' has invalid frontmatter", note_path.display()))?;
-
-    stamp_provenance(&mut fm);
-    let edit = |b: &str| Ok(appended_body(b, heading, content_to_append));
-    let out = rewrite_note(&text, &fm, &body, Some(Vec::new()), &edit)?;
-    write_atomic(&note_path, &out)?;
     record_audit(vault, "append", &format!("{} #{}", rel_path, heading))?;
     sync_index(vault);
 
@@ -353,7 +366,7 @@ pub fn read_daily_note(vault: &Path, date_opt: Option<&str>) -> Result<(String, 
         .with_context(|| format!("Daily note path '{}' escapes the vault", rel))?;
 
     if daily_file.is_file() {
-        let content = fs::read_to_string(&daily_file)?;
+        let content = read_note_utf8(&daily_file)?;
         Ok((content, true))
     } else {
         Ok((
@@ -444,17 +457,27 @@ fn rewrite_note(
     if let (Some(mut edits), Some((_, raw_body))) = (extra, split_frontmatter(text)) {
         edits.extend(provenance_edits(fm));
         if let Ok(patched) = patch_frontmatter_keys(text, &edits) {
-            if let Some((block, _)) = split_frontmatter(&patched) {
-                return Ok(restore_eol(text, format!("{}{}", block, edit(raw_body)?)));
+            let matches_expected =
+                parse_frontmatter(&patched).is_ok_and(|(patched_fm, _)| &patched_fm == fm);
+            if matches_expected {
+                if let Some((block, _)) = split_frontmatter(&patched) {
+                    return Ok(restore_eol(text, format!("{}{}", block, edit(raw_body)?)));
+                }
             }
         }
     }
+    // mimodept: nested frontmatter keypaths lose YAML comments/order <- serde_yaml roundtrip fallback -> when users report comment loss on nested map edits
     Ok(restore_eol(text, dump_frontmatter(fm, &edit(parsed_body)?)))
 }
 
-/// Creates a note that does not exist yet, seeded with its frontmatter and the
-/// requested heading. Caller holds the vault lock.
-fn create_note(vault: &Path, rel_path: &str, heading: &str) -> Result<PathBuf> {
+/// Creates a note that does not exist yet, seeded with its frontmatter, the
+/// requested heading, and initial body content in a single atomic write.
+fn create_note_with_section(
+    vault: &Path,
+    rel_path: &str,
+    heading: &str,
+    content_to_append: &str,
+) -> Result<PathBuf> {
     ensure_writable_note_path(vault, rel_path, None)?;
     let rel = if rel_path.trim().ends_with(".md") {
         rel_path.trim().to_string()
@@ -466,14 +489,66 @@ fn create_note(vault: &Path, rel_path: &str, heading: &str) -> Result<PathBuf> {
     ensure_writable_note_path(vault, rel_path, Some(&target))?;
 
     let seed = format!(
-        "# {}\n\n{}\n",
+        "# {}\n\n{}\n\n{}\n",
         rel_stem(&rel),
-        normalize_section_heading(heading)
+        normalize_section_heading(heading),
+        content_to_append.trim_end()
     );
     let healed = auto_heal_frontmatter(&seed, &rel)?;
     write_atomic(&target, &healed)?;
+    register_in_parent_moc_if_present(vault, &rel)?;
 
     Ok(target)
+}
+
+/// Registers a newly created domain note into its existing parent MOC so that
+/// `ORIENT -> MUTATE -> VERIFY` passes without manual MOC surgery.
+fn register_in_parent_moc_if_present(vault: &Path, rel_path: &str) -> Result<()> {
+    let clean = rel_path.trim().trim_start_matches('/').replace('\\', "/");
+    if clean.starts_with("01-Daily/")
+        || clean == "40-Systems/ADRs/ADRs-MOC.md"
+        || DOMAIN_MOCS.iter().any(|(_, moc)| *moc == clean)
+    {
+        return Ok(());
+    }
+    let Some((domain, _)) = clean.split_once('/') else {
+        return Ok(());
+    };
+    let parent_moc_rel = if clean.starts_with("40-Systems/ADRs/")
+        && contained_path(vault, "40-Systems/ADRs/ADRs-MOC.md").is_some_and(|p| p.is_file())
+    {
+        "40-Systems/ADRs/ADRs-MOC.md"
+    } else if let Some((_, moc)) = DOMAIN_MOCS.iter().find(|(known, _)| *known == domain) {
+        *moc
+    } else {
+        return Ok(());
+    };
+
+    let Some(moc_path) = contained_path(vault, parent_moc_rel).filter(|p| p.is_file()) else {
+        return Ok(());
+    };
+    let mut moc_text = read_note_utf8(&moc_path)?;
+    let unfenced_lower = strip_fenced_code(&moc_text).to_lowercase();
+    let rel_no_md = clean.strip_suffix(".md").unwrap_or(&clean);
+    let stem = Path::new(&clean)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(rel_no_md);
+    let rel_lower = rel_no_md.to_lowercase();
+    let stem_lower = stem.to_lowercase();
+    let already_linked = unfenced_lower.contains(&format!("[[{}]]", rel_lower))
+        || unfenced_lower.contains(&format!("[[{}|", rel_lower))
+        || unfenced_lower.contains(&format!("[[{}]]", stem_lower))
+        || unfenced_lower.contains(&format!("[[{}|", stem_lower));
+    if already_linked {
+        return Ok(());
+    }
+
+    if !moc_text.ends_with('\n') {
+        moc_text.push('\n');
+    }
+    moc_text.push_str(&format!("- [[{}]]\n", rel_no_md));
+    write_atomic(&moc_path, &moc_text)
 }
 
 /// `## Heading` derived from a caller-supplied heading of any depth.
@@ -576,6 +651,9 @@ fn parse_scalar(raw: &str) -> Value {
             || (raw.starts_with('\'') && raw.ends_with('\'')));
     if quoted {
         return json!(&raw[1..raw.len() - 1]);
+    }
+    if raw == "null" {
+        return Value::Null;
     }
     if let Ok(number) = raw.parse::<i64>() {
         if number.to_string() == raw {

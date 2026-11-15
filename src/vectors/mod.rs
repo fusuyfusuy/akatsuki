@@ -80,7 +80,7 @@ fn chunk_parsed(rel_path: &str, fm: &Value, body: &str) -> Vec<NoteChunk> {
         .and_then(|s| s.to_str())
         .unwrap_or(rel_path)
         .to_string();
-    let domain = rel_path.split('/').next().unwrap_or("").to_string();
+    let domain = rel_path.split_once('/').map_or("", |(d, _)| d).to_string();
     let display_title = fm
         .get("title")
         .and_then(|v| v.as_str())
@@ -112,7 +112,9 @@ fn chunk_parsed(rel_path: &str, fm: &Value, body: &str) -> Vec<NoteChunk> {
         header.push_str(&format!("\n[Tags: {}]", tags));
     }
 
-    let heading_re = Regex::new(r"^(#{1,4})[ \t]+(.+)$").expect("static heading regex");
+    static HEADING_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let heading_re = HEADING_RE
+        .get_or_init(|| Regex::new(r"^(#{1,4})[ \t]+(.+)$").expect("static heading regex"));
 
     struct HeadingMatch {
         start: usize,
@@ -291,16 +293,19 @@ pub fn hybrid_note(vault: &Path) -> Option<String> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) {
         Ok(con) => {
-            let count: i64 = con
-                .query_row("SELECT count(*) FROM note_vectors", [], |r| r.get(0))
-                .unwrap_or(0);
-            if count == 0 {
-                Some(
+            let _ = con.busy_timeout(std::time::Duration::from_secs(5));
+            match con.query_row("SELECT count(*) FROM note_vectors", [], |r| {
+                r.get::<_, i64>(0)
+            }) {
+                Ok(0) => Some(
                     "semantic ranking inactive: vector index is empty; run `akatsuki reconcile`"
                         .to_string(),
-                )
-            } else {
-                None
+                ),
+                Ok(_) => None,
+                Err(e) => Some(format!(
+                    "semantic ranking inactive: vector index query failed ({})",
+                    e
+                )),
             }
         }
         Err(_) => Some("semantic ranking inactive: vector index unreadable".to_string()),
@@ -312,14 +317,15 @@ pub fn setup_models() -> Result<String> {
     {
         let target_dir = get_models_dir()?;
         println!(
-            "Fetching intfloat/multilingual-e5-small weights into: {}",
+            "Fetching {} weights into: {}",
+            crate::constants::DEFAULT_EMBED_MODEL,
             target_dir.display()
         );
 
         let api = hf_hub::api::sync::ApiBuilder::new()
             .with_cache_dir(target_dir.clone())
             .build()?;
-        let repo = api.model("intfloat/multilingual-e5-small".to_string());
+        let repo = api.model(crate::constants::DEFAULT_EMBED_MODEL.to_string());
 
         for file in ["tokenizer.json", "config.json", "model.safetensors"] {
             println!("  Downloading {}...", file);
@@ -354,7 +360,22 @@ pub mod candle_engine {
         device: Device,
     }
 
+    static EMBEDDER_CACHE: std::sync::Mutex<Option<std::sync::Arc<CandleEmbedder>>> =
+        std::sync::Mutex::new(None);
+
     impl CandleEmbedder {
+        pub fn shared() -> Result<std::sync::Arc<Self>> {
+            let mut guard = EMBEDDER_CACHE
+                .lock()
+                .map_err(|_| anyhow::anyhow!("CandleEmbedder cache mutex poisoned"))?;
+            if let Some(existing) = guard.as_ref() {
+                return Ok(std::sync::Arc::clone(existing));
+            }
+            let loaded = std::sync::Arc::new(Self::load()?);
+            *guard = Some(std::sync::Arc::clone(&loaded));
+            Ok(loaded)
+        }
+
         pub fn load() -> Result<Self> {
             let model_dir = get_models_dir()?;
             let config_path = model_dir.join("config.json");
@@ -442,27 +463,16 @@ pub mod candle_engine {
     }
 }
 
-/// Embeds and stores the chunks of every given note, replacing prior chunks.
-///
-/// Returns a human-readable note about what happened (or why nothing did) so the
-/// reconcile report never claims work it did not perform.
+/// Embeds and stores the chunks of every given `(rel_path, blake3_hash, content)`
+/// tuple, computing CPU embeddings outside SQLite locks and committing only rows
+/// whose `file_meta.blake3_hash` still matches.
 pub fn sync_note_vectors(
     con: &mut rusqlite::Connection,
-    notes: &[(String, String)],
-) -> Result<String> {
-    let tx = con.transaction()?;
-    let report = sync_note_vectors_tx(&tx, notes)?;
-    tx.commit()?;
-    Ok(report)
-}
-
-pub fn sync_note_vectors_tx(
-    tx: &rusqlite::Transaction,
-    notes: &[(String, String)],
+    notes: &[(String, String, String)],
 ) -> Result<String> {
     #[cfg(not(feature = "vectors"))]
     {
-        let _ = tx;
+        let _ = con;
         Ok(format!(
             "disabled: this binary lacks the `vectors` feature ({} changed note(s) left unembedded)",
             notes.len()
@@ -481,17 +491,15 @@ pub fn sync_note_vectors_tx(
             ));
         }
 
-        let embedder = candle_engine::CandleEmbedder::load()?;
-        let mut embedded = 0usize;
+        type EncodedChunk = (NoteChunk, Vec<u8>, i64);
+        let embedder = candle_engine::CandleEmbedder::shared()?;
+        let mut prepared: Vec<(&str, &str, Vec<EncodedChunk>)> = Vec::with_capacity(notes.len());
 
-        for (rel_path, content) in notes {
+        // Pure CPU inference runs outside any SQLite transaction so readers/writers never block.
+        for (rel_path, expected_hash, content) in notes {
             let chunks = chunk_note(rel_path, content)?;
-            tx.execute(
-                "DELETE FROM note_vectors WHERE rel_path = ?1",
-                rusqlite::params![rel_path],
-            )?;
-
-            for chunk in &chunks {
+            let mut encoded = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
                 let vector = embedder.encode_passage(&chunk.embed_text)?;
                 if vector.len() != crate::constants::DEFAULT_EMBED_DIM {
                     bail!(
@@ -500,6 +508,43 @@ pub fn sync_note_vectors_tx(
                         crate::constants::DEFAULT_EMBED_DIM
                     );
                 }
+                let blob = pack_vector(&vector);
+                let dim = vector.len() as i64;
+                encoded.push((chunk, blob, dim));
+            }
+            prepared.push((rel_path.as_str(), expected_hash.as_str(), encoded));
+        }
+
+        let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut embedded_chunks = 0usize;
+        let mut embedded_notes = 0usize;
+
+        for (rel_path, expected_hash, encoded_chunks) in prepared {
+            let live_hash: Option<String> = match tx.query_row(
+                "SELECT blake3_hash FROM file_meta WHERE rel_path = ?1",
+                rusqlite::params![rel_path],
+                |r| r.get(0),
+            ) {
+                Ok(h) => Some(h),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            };
+
+            if live_hash.as_deref() != Some(expected_hash) {
+                if live_hash.is_none() {
+                    tx.execute(
+                        "DELETE FROM note_vectors WHERE rel_path = ?1",
+                        rusqlite::params![rel_path],
+                    )?;
+                }
+                continue;
+            }
+
+            tx.execute(
+                "DELETE FROM note_vectors WHERE rel_path = ?1",
+                rusqlite::params![rel_path],
+            )?;
+            for (chunk, blob, dim) in encoded_chunks {
                 tx.execute(
                     "INSERT OR REPLACE INTO note_vectors \
                      (chunk_id, rel_path, stem, domain, display_title, display_summary, tags, breadcrumb, chunk_index, total_chunks, preview, vector_blob, dim) \
@@ -516,18 +561,24 @@ pub fn sync_note_vectors_tx(
                         chunk.chunk_index as i64,
                         chunk.total_chunks as i64,
                         chunk.preview,
-                        pack_vector(&vector),
-                        vector.len() as i64,
+                        blob,
+                        dim,
                     ],
                 )?;
-                embedded += 1;
+                embedded_chunks += 1;
             }
+            embedded_notes += 1;
         }
+
+        tx.execute(
+            "DELETE FROM note_vectors WHERE rel_path NOT IN (SELECT rel_path FROM file_meta)",
+            [],
+        )?;
+        tx.commit()?;
 
         Ok(format!(
             "embedded {} chunk(s) across {} changed note(s)",
-            embedded,
-            notes.len()
+            embedded_chunks, embedded_notes
         ))
     }
 }
@@ -555,74 +606,62 @@ pub fn search_vectors(
             bail!("Vector index missing; run `akatsuki reconcile` first.");
         }
 
-        let embedder = candle_engine::CandleEmbedder::load()?;
+        let embedder = candle_engine::CandleEmbedder::shared()?;
         let query_vector = embedder.encode_query(query)?;
 
         let con = rusqlite::Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
+        con.busy_timeout(std::time::Duration::from_secs(5))?;
 
-        let sql = if domain_filter.is_some() {
+        let norm_domain = domain_filter
+            .map(|d| d.trim().trim_end_matches('/'))
+            .filter(|d| !d.is_empty());
+        let sql = if norm_domain.is_some() {
             "SELECT rel_path, stem, domain, display_title, display_summary, breadcrumb, preview, vector_blob, dim \
-             FROM note_vectors WHERE domain = ?1"
+             FROM note_vectors WHERE domain = ?1 OR rel_path LIKE ?2 ESCAPE '\\'"
         } else {
             "SELECT rel_path, stem, domain, display_title, display_summary, breadcrumb, preview, vector_blob, dim \
              FROM note_vectors"
         };
         let mut stmt = con.prepare(sql)?;
 
-        struct NoteVectorRow {
-            rel_path: String,
-            stem: String,
-            domain: String,
-            title: String,
-            summary: String,
-            breadcrumb: Option<String>,
-            preview: String,
-            blob: Vec<u8>,
-            dim: i64,
-        }
-
-        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<NoteVectorRow> {
-            Ok(NoteVectorRow {
-                rel_path: row.get(0)?,
-                stem: row.get(1)?,
-                domain: row.get(2)?,
-                title: row.get(3)?,
-                summary: row.get(4)?,
-                breadcrumb: row.get(5)?,
-                preview: row.get(6)?,
-                blob: row.get(7)?,
-                dim: row.get(8)?,
-            })
-        };
-
-        let rows: Vec<_> = if let Some(domain) = domain_filter {
-            stmt.query_map(rusqlite::params![domain], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+        let mut rows = if let Some(dom) = norm_domain {
+            let like_prefix = format!("{}/%", crate::graph::escape_like(dom));
+            stmt.query(rusqlite::params![dom, like_prefix])?
         } else {
-            stmt.query_map([], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+            stmt.query([])?
         };
 
-        // One hit per note: the best-scoring chunk represents it.
+        // Stream rows directly without materializing every vector_blob in memory at once.
         let mut best: std::collections::HashMap<String, SearchHit> =
             std::collections::HashMap::new();
-        for row in rows {
-            let rel_path = row.rel_path;
-            let stem = row.stem;
-            let domain = row.domain;
-            let title = row.title;
-            let summary = row.summary;
-            let breadcrumb = row.breadcrumb;
-            let preview = row.preview;
-            let blob = row.blob;
-            let dim = row.dim;
-            if dim as usize * 4 != blob.len() {
-                continue;
+        while let Some(row) = rows.next()? {
+            let rel_path: String = row.get(0)?;
+            let stem: String = row.get(1)?;
+            let domain: String = row.get(2)?;
+            let title: String = row.get(3)?;
+            let summary: String = row.get(4)?;
+            let breadcrumb: Option<String> = row.get(5)?;
+            let preview: String = row.get(6)?;
+            let blob_ref = row.get_ref(7)?.as_blob()?;
+            let dim: i64 = row.get(8)?;
+
+            let valid_len = usize::try_from(dim)
+                .ok()
+                .filter(|d| *d > 0)
+                .and_then(|d| d.checked_mul(4))
+                .is_some_and(|expected| expected == blob_ref.len());
+            if !valid_len {
+                bail!(
+                    "Corrupt vector row for '{}' (dim={}, bytes={}); re-run `akatsuki reconcile`",
+                    rel_path,
+                    dim,
+                    blob_ref.len()
+                );
             }
-            let vector = unpack_vector(&blob);
+            let vector = unpack_vector(blob_ref);
             if vector.len() != query_vector.len() {
                 bail!(
                     "Vector for '{}' has {} dimensions but the model produces {}; re-run `akatsuki reconcile`",

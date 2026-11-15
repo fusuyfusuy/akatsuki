@@ -8,14 +8,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 use crate::constants::{DOMAIN_MOCS, ROOT_ANCHORS};
-use crate::index::{
-    open_cache_db, open_synced_db, sync_vault_index, sync_vault_index_dry_run, SyncReport,
+use crate::index::{open_cache_db, sync_vault_index, sync_vault_index_dry_run, SyncReport};
+use crate::storage::{
+    parse_frontmatter, read_note_utf8, strip_fenced_code, write_atomic, VaultLock,
 };
-use crate::storage::{parse_frontmatter, strip_fenced_code, write_atomic, VaultLock};
 
 /// Default hard ceiling for a single embedded invariant assertion.
 const DEFAULT_INVARIANT_TIMEOUT_SECS: u64 = 10;
@@ -47,7 +48,11 @@ fn invariant_timeout() -> Result<Duration> {
 /// except `_templates/` and hidden top-level entries, in a stable order.
 fn linkable_notes(vault: &Path) -> Result<Vec<(String, PathBuf)>> {
     let mut notes = Vec::new();
-    for entry in WalkDir::new(vault) {
+    let walker = WalkDir::new(vault).into_iter().filter_entry(|e| {
+        e.depth() == 0
+            || (!e.file_name().to_string_lossy().starts_with('.') && e.file_name() != "_templates")
+    });
+    for entry in walker {
         let entry = entry.with_context(|| format!("Failed to walk {}", vault.display()))?;
         if !entry.file_type().is_file() {
             continue;
@@ -56,9 +61,6 @@ fn linkable_notes(vault: &Path) -> Result<Vec<(String, PathBuf)>> {
             continue;
         }
         let rel = relative_slash_path(vault, entry.path());
-        if rel.starts_with("_templates") || rel.starts_with('.') {
-            continue;
-        }
         notes.push((rel, entry.path().to_path_buf()));
     }
     notes.sort_by(|a, b| a.0.cmp(&b.0));
@@ -107,12 +109,12 @@ fn raw_asset_files(vault: &Path) -> Result<Vec<(String, PathBuf)>> {
         if !root.exists() {
             continue;
         }
-        for entry in WalkDir::new(&root) {
+        let walker = WalkDir::new(&root)
+            .into_iter()
+            .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'));
+        for entry in walker {
             let entry = entry.with_context(|| format!("Failed to walk {}", root.display()))?;
             if !entry.file_type().is_file() {
-                continue;
-            }
-            if entry.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
             assets.push((
@@ -127,20 +129,41 @@ fn raw_asset_files(vault: &Path) -> Result<Vec<(String, PathBuf)>> {
 
 /// Reads a raw asset for linting; an unreadable asset is itself a lint violation.
 fn read_asset(rel: &str, abs: &Path) -> std::result::Result<String, String> {
-    fs::read_to_string(abs).map_err(|e| format!("'{rel}': File read error during lint: {e}"))
+    read_note_utf8(abs).map_err(|e| format!("'{rel}': File read error during lint: {e}"))
+}
+
+fn repo_test_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(pytest|pnpm\s+test|npm\s+test|cargo\s+test|bun\s+test|uv\s+run\s+pytest|python3?\s+[\w_./-]*test[\w_-]*\.py|python3?\s+verify_backup\.py)\b",
+        )
+        .expect("valid repo_test regex")
+    })
+}
+
+fn verify_block_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)```bash:verify\s*\r?\n(.*?)\r?\n```").expect("valid regex"))
 }
 
 pub fn lint_vault(vault: &Path) -> Result<LintReport> {
-    let con = open_synced_db(vault)?;
+    let mut con = open_cache_db(vault)?;
+    let sync = sync_vault_index(vault, &mut con)?;
 
-    let repo_test_re = Regex::new(
-        r"(?i)(pytest|npm test|cargo test|bun test|python3\s+[\w_-]*test[\w_-]*\.py|python3\s+verify_backup\.py)",
-    )?;
-    let verify_re = Regex::new(r"(?s)```bash:verify\s*\n(.*?)\n```")?;
+    let repo_test_re = repo_test_regex();
+    let verify_re = verify_block_regex();
 
     let mut errors = Vec::new();
-    let mut total_notes = 0usize;
+    let mut parse_failed_rels = HashSet::new();
+    for err in &sync.parse_errors {
+        if let Some((rel, _)) = err.split_once(": ") {
+            parse_failed_rels.insert(rel.to_string());
+        }
+        errors.push(err.clone());
+    }
 
+    let mut indexed_rels = HashSet::new();
     {
         let mut stmt = con.prepare("SELECT rel_path, type, metadata_json FROM entities")?;
         let rows = stmt.query_map([], |row| {
@@ -153,7 +176,10 @@ pub fn lint_vault(vault: &Path) -> Result<LintReport> {
 
         for row in rows {
             let (rel, note_type, metadata_json) = row?;
-            total_notes += 1;
+            indexed_rels.insert(rel.clone());
+            if parse_failed_rels.contains(&rel) {
+                continue;
+            }
 
             let meta: Value = serde_json::from_str(&metadata_json)
                 .with_context(|| format!("Corrupt metadata_json for '{}'", rel))?;
@@ -182,16 +208,12 @@ pub fn lint_vault(vault: &Path) -> Result<LintReport> {
             if !note_path.exists() {
                 continue;
             }
-            match fs::read_to_string(&note_path) {
+            match read_note_utf8(&note_path) {
                 Ok(text) => match parse_frontmatter(&text) {
                     Ok((_, body)) => {
-                        // Boundary Check: Ensure bash:verify does not run repo unit tests
                         for cap in verify_re.captures_iter(&body) {
                             let cmd = &cap[1];
-                            if repo_test_re.is_match(cmd)
-                                && !cmd.contains("[ -")
-                                && !cmd.contains("hostname")
-                            {
+                            if repo_test_re.is_match(cmd) {
                                 errors.push(format!(
                                     "'{}': Boundary violation: bash:verify block invokes repo unit tests ('{}'). Akatsuki tests strictly machine invariants (ports, containers, daemons).",
                                     rel, cmd.trim()
@@ -205,6 +227,7 @@ pub fn lint_vault(vault: &Path) -> Result<LintReport> {
             }
         }
     }
+    let total_notes = indexed_rels.union(&parse_failed_rels).count();
 
     for (rel, abs) in raw_asset_files(vault)? {
         let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -274,6 +297,43 @@ struct LinkAudit {
     unindexed: Vec<(String, String)>,
 }
 
+fn link_audit_regexes() -> (&'static Regex, &'static Regex, &'static Regex) {
+    static INLINE: OnceLock<Regex> = OnceLock::new();
+    static WIKILINK: OnceLock<Regex> = OnceLock::new();
+    static MDLINK: OnceLock<Regex> = OnceLock::new();
+    (
+        INLINE.get_or_init(|| Regex::new(r"`+[^`\n]+`+").expect("valid inline regex")),
+        WIKILINK.get_or_init(|| {
+            Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]").expect("valid wikilink regex")
+        }),
+        MDLINK.get_or_init(|| {
+            Regex::new(r#"\[(?:[^\]]*)\]\(([^)#\s]+)(?:#[^)\s]*)?(?:\s+["'][^"']*["'])?\)"#)
+                .expect("valid mdlink regex")
+        }),
+    )
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Audits the vault's link graph by walking the markdown files themselves.
 ///
 /// The `relations` projection is deliberately not consulted: it is derived from the
@@ -297,15 +357,13 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
         inbound.insert(rel.clone(), HashSet::new());
     }
 
-    let inline_re = Regex::new(r"`+[^`\n]+`+")?;
-    let wikilink_re = Regex::new(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]")?;
-    let mdlink_re = Regex::new(r"\[(?:[^\]]*)\]\(([^)#\s]+)(?:#[^)]*)?\)")?;
+    let (inline_re, wikilink_re, mdlink_re) = link_audit_regexes();
 
     let mut broken = Vec::new();
     let mut broken_markdown = Vec::new();
 
     for (src_rel, abs) in &notes {
-        let text = match fs::read_to_string(abs) {
+        let text = match read_note_utf8(abs) {
             Ok(text) => text,
             Err(e) => {
                 broken.push((src_rel.clone(), format!("Unreadable file: {e}")));
@@ -333,12 +391,34 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
             if without_anchor.is_empty() {
                 continue;
             }
-            let target_clean = without_anchor.strip_suffix(".md").unwrap_or(without_anchor);
-            if let Some(target_rel) = rels.get(&target_clean.to_lowercase()) {
+            let norm = without_anchor
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .strip_suffix(".md")
+                .unwrap_or(without_anchor)
+                .replace('\\', "/")
+                .to_lowercase();
+            if let Some(target_rel) = rels.get(&norm) {
                 if let Some(sources) = inbound.get_mut(target_rel) {
                     sources.insert(src_rel.clone());
                 }
-            } else if let Some(target_rels) = stems.get(&file_stem_lower(target_clean)) {
+            } else if norm.contains('/') {
+                let suffix = format!("/{norm}");
+                let suffix_matches: Vec<&String> = rels
+                    .iter()
+                    .filter(|(k, _)| k.ends_with(&suffix))
+                    .map(|(_, v)| v)
+                    .collect();
+                if suffix_matches.is_empty() {
+                    broken.push((src_rel.clone(), target.to_string()));
+                } else {
+                    for target_rel in suffix_matches {
+                        if let Some(sources) = inbound.get_mut(target_rel) {
+                            sources.insert(src_rel.clone());
+                        }
+                    }
+                }
+            } else if let Some(target_rels) = stems.get(&file_stem_lower(&norm)) {
                 for target_rel in target_rels {
                     if let Some(sources) = inbound.get_mut(target_rel) {
                         sources.insert(src_rel.clone());
@@ -354,22 +434,24 @@ fn audit_links(vault: &Path) -> Result<LinkAudit> {
             if is_external_or_anchor_link(target) {
                 continue;
             }
-            let joined = abs.parent().unwrap_or(vault).join(target);
+            let decoded = percent_decode(target);
+            if decoded.starts_with('/') {
+                broken_markdown.push((src_rel.clone(), target.to_string()));
+                continue;
+            }
+            let joined = abs.parent().unwrap_or(vault).join(&decoded);
             match joined.canonicalize() {
-                Ok(resolved) => {
-                    if !resolved.is_file() {
-                        continue;
-                    }
-                    match resolved.strip_prefix(&vault_canon) {
-                        Ok(rel) => {
+                Ok(resolved) => match resolved.strip_prefix(&vault_canon) {
+                    Ok(rel) => {
+                        if resolved.is_file() {
                             let target_rel = rel.to_string_lossy().replace('\\', "/");
                             if let Some(sources) = inbound.get_mut(&target_rel) {
                                 sources.insert(src_rel.clone());
                             }
                         }
-                        Err(_) => continue,
                     }
-                }
+                    Err(_) => broken_markdown.push((src_rel.clone(), target.to_string())),
+                },
                 Err(_) => broken_markdown.push((src_rel.clone(), target.to_string())),
             }
         }
@@ -469,25 +551,29 @@ pub struct ReconcileReport {
 /// frontmatter unparseable. Returns the note's new content when at least one line
 /// needs quoting, leaving every other byte of the file untouched.
 fn quote_colon_scalars(text: &str, rel: &str, actions: &mut Vec<String>) -> Option<String> {
+    if parse_frontmatter(text).is_ok() {
+        return None;
+    }
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    if lines.first().is_none_or(|line| line.trim_end() != "---") {
+    if lines
+        .first()
+        .is_none_or(|line| line.trim_start_matches('\u{feff}').trim_end() != "---")
+    {
         return None;
     }
     let closing = (1..lines.len()).find(|&i| lines[i].trim_end() == "---")?;
     let fm_start = lines[0].len();
     let fm_end: usize = lines[..closing].iter().map(|line| line.len()).sum();
 
-    let mut changed = false;
+    let mut pending_actions = Vec::new();
     let mut block_indent: Option<usize> = None;
     let mut rewritten = String::with_capacity(fm_end - fm_start);
     for line in text[fm_start..fm_end].split_inclusive('\n') {
-        // Keep the line's own terminator: only the quoted lines may change.
         let body = line.strip_suffix('\n').unwrap_or(line);
         let body = body.strip_suffix('\r').unwrap_or(body);
         let terminator = &line[body.len()..];
         let indent_len = body.len() - body.trim_start().len();
 
-        // Lines inside a `|` / `>` block scalar are literal text, never `key: value`.
         if let Some(parent_indent) = block_indent {
             if body.trim().is_empty() || indent_len > parent_indent {
                 rewritten.push_str(line);
@@ -502,20 +588,27 @@ fn quote_colon_scalars(text: &str, rel: &str, actions: &mut Vec<String>) -> Opti
         let stripped = body.trim();
         if stripped.contains(':') && !stripped.starts_with('-') && !stripped.starts_with('#') {
             if let Some((key, raw_value)) = stripped.split_once(':') {
-                let value = raw_value.trim();
+                let raw_trimmed = raw_value.trim();
+                let (value, comment_suffix) = match raw_trimmed.find(" #") {
+                    Some(idx)
+                        if !raw_trimmed.starts_with('"') && !raw_trimmed.starts_with('\'') =>
+                    {
+                        (raw_trimmed[..idx].trim_end(), &raw_trimmed[idx..])
+                    }
+                    _ => (raw_trimmed, ""),
+                };
                 let already_quoted = (value.starts_with('"') && value.ends_with('"'))
                     || (value.starts_with('\'') && value.ends_with('\''));
                 let is_flow_mapping = value.starts_with('{') && value.ends_with('}');
                 let is_flow_sequence = value.starts_with('[') && value.ends_with(']');
                 if value.contains(": ") && !already_quoted && !is_flow_mapping && !is_flow_sequence
                 {
-                    let indent = &body[..body.len() - body.trim_start().len()];
+                    let indent = &body[..indent_len];
                     rewritten.push_str(&format!(
-                        "{indent}{key}: \"{}\"{terminator}",
+                        "{indent}{key}: \"{}\"{comment_suffix}{terminator}",
                         value.replace('\\', "\\\\").replace('"', "\\\"")
                     ));
-                    actions.push(format!("Auto-quoted frontmatter field '{key}' in {rel}"));
-                    changed = true;
+                    pending_actions.push(format!("Auto-quoted frontmatter field '{key}' in {rel}"));
                     continue;
                 }
             }
@@ -523,13 +616,17 @@ fn quote_colon_scalars(text: &str, rel: &str, actions: &mut Vec<String>) -> Opti
         rewritten.push_str(line);
     }
 
-    if !changed {
+    if pending_actions.is_empty() {
         return None;
     }
     let mut new_content = String::with_capacity(text.len() + rewritten.len());
     new_content.push_str(&text[..fm_start]);
     new_content.push_str(&rewritten);
     new_content.push_str(&text[fm_end..]);
+    if parse_frontmatter(&new_content).is_err() {
+        return None;
+    }
+    actions.extend(pending_actions);
     Some(new_content)
 }
 
@@ -589,7 +686,10 @@ pub fn reconcile_vault(vault: &Path, dry_run: bool) -> Result<ReconcileReport> {
         let stem = file_stem_of(&rel);
         let target_link = format!("[[{}]]", rel.strip_suffix(".md").unwrap_or(&rel));
         let stem_link = format!("[[{stem}]]");
-        if moc_text.contains(&target_link) || moc_text.contains(&stem_link) {
+        let moc_uncode = strip_fenced_code(&moc_text).to_lowercase();
+        if moc_uncode.contains(&target_link.to_lowercase())
+            || moc_uncode.contains(&stem_link.to_lowercase())
+        {
             continue;
         }
 
@@ -653,6 +753,9 @@ pub fn run_verification_tests(
     note_filter: Option<&str>,
     dry_run: bool,
 ) -> Result<TestReport> {
+    if !dry_run {
+        let _ = invariant_env_mode()?;
+    }
     let mut con = open_cache_db(vault)?;
     let _ = sync_vault_index(vault, &mut con)?;
 
@@ -752,68 +855,129 @@ fn is_external_or_anchor_link(target: &str) -> bool {
     false
 }
 
-/// Security gate for invariant assertion commands.
-/// Rejects dangerous, destructive, or system-modifying operations before bash execution.
-fn is_dangerous_invariant_command(command: &str) -> bool {
-    // 1. Output redirection (> or >>), excluding standard discards to /dev/null and fd duplicates
-    let sanitized_redir = command
+fn strip_shell_quotes(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut chars = command.chars();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+                out.push(' ');
+            }
+            Some('"') => {
+                if c == '\\' {
+                    let _ = chars.next();
+                } else if c == '"' {
+                    quote = None;
+                }
+                out.push(' ');
+            }
+            _ => {
+                if c == '\\' {
+                    let _ = chars.next();
+                    out.push(' ');
+                } else if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    out.push(' ');
+                } else {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn has_forbidden_redirection(unquoted: &str) -> bool {
+    let sanitized = unquoted
         .replace(">>/dev/null", "")
         .replace(">> /dev/null", "")
+        .replace("&>/dev/null", "")
+        .replace("&> /dev/null", "")
         .replace(">/dev/null", "")
         .replace("> /dev/null", "")
         .replace("2>&1", "")
         .replace(">&2", "")
         .replace("1>&2", "");
-    if sanitized_redir.contains('>') {
+    sanitized.contains('>')
+}
+
+/// Security gate for invariant assertion commands.
+/// Rejects dangerous, destructive, or system-modifying operations before bash execution.
+fn is_dangerous_invariant_command(command: &str) -> bool {
+    let unquoted = strip_shell_quotes(command);
+    if has_forbidden_redirection(&unquoted) {
         return true;
     }
-
-    // 2. Fork bombs
     if command.contains(":(){ :|:& };:") || command.contains(":(){:|:&};:") {
         return true;
     }
 
     let lower = command.to_lowercase();
-
-    // 3. Low-level disk or filesystem manipulation
+    let unquoted_lower = unquoted.to_lowercase();
     if lower.contains("dd if=") || lower.contains("mkfs") {
         return true;
     }
 
-    // 4. Token-based matching for destructive commands
-    let is_boundary =
-        |c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`' | '$' | '<');
+    let is_boundary = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '|' | '&' | '(' | ')' | '`' | '$' | '<' | '{' | '}' | ','
+            )
+    };
     for token in lower.split(is_boundary) {
-        let trimmed = token.trim_matches(|c: char| c == '"' || c == '\'' || c == '\\');
-        match trimmed {
-            "rm" | "rmdir" | "reboot" | "shutdown" | "passwd" | "poweroff" | "halt" | "init" => {
-                if trimmed == "init" {
-                    if lower.contains("init 0") || lower.contains("init 6") {
-                        return true;
-                    }
-                } else {
-                    return true;
-                }
-            }
+        let trimmed = token.trim_matches(|c: char| matches!(c, '"' | '\'' | '\\'));
+        let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        match base {
+            "rm" | "rmdir" | "shred" | "unlink" | "reboot" | "shutdown" | "passwd" | "poweroff"
+            | "halt" => return true,
+            "init" if lower.contains("init 0") || lower.contains("init 6") => return true,
+            "find" if unquoted_lower.contains("-delete") => return true,
+            "tee" if !unquoted_lower.contains("tee /dev/null") => return true,
             _ => {}
         }
     }
 
-    // 5. Additional explicit patterns
-    if lower.contains("rm -rf") || lower.contains("rm -r") || lower.contains("rm -f") {
-        return true;
-    }
-
-    false
+    lower.contains("rm -rf") || lower.contains("rm -r") || lower.contains("rm -f")
 }
 
 /// Environment variables an invariant keeps under `AKATSUKI_INVARIANT_ENV=clean`.
 const CLEAN_ENV_ALLOWLIST: [&str; 3] = ["PATH", "HOME", "LANG"];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InvariantEnvMode {
+    Inherit,
+    Clean,
+}
+
+fn invariant_env_mode() -> Result<InvariantEnvMode> {
+    match std::env::var("AKATSUKI_INVARIANT_ENV") {
+        Err(std::env::VarError::NotPresent) => Ok(InvariantEnvMode::Inherit),
+        Ok(raw) => match raw.trim() {
+            "" | "inherit" => Ok(InvariantEnvMode::Inherit),
+            "clean" => Ok(InvariantEnvMode::Clean),
+            other => {
+                bail!("Invalid AKATSUKI_INVARIANT_ENV '{other}': expected 'clean' or 'inherit'")
+            }
+        },
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("Invalid AKATSUKI_INVARIANT_ENV: non-UTF-8 value")
+        }
+    }
+}
+
 /// Spawns `bash -c` in its own process group with stdin closed. Vault-authored
 /// shell is executed by design (see README trust model); the environment is
 /// inherited unless `AKATSUKI_INVARIANT_ENV=clean` scrubs it to an allowlist.
-fn spawn_invariant(command: &str, cwd: &Path) -> std::io::Result<std::process::Child> {
+fn spawn_invariant(
+    command: &str,
+    cwd: &Path,
+    env_mode: InvariantEnvMode,
+) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
 
     let script = format!("set -eo pipefail;\n{}", command);
@@ -825,7 +989,7 @@ fn spawn_invariant(command: &str, cwd: &Path) -> std::io::Result<std::process::C
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    if std::env::var("AKATSUKI_INVARIANT_ENV").is_ok_and(|v| v == "clean") {
+    if env_mode == InvariantEnvMode::Clean {
         cmd.env_clear();
         for key in CLEAN_ENV_ALLOWLIST {
             if let Some(value) = std::env::var_os(key) {
@@ -836,35 +1000,57 @@ fn spawn_invariant(command: &str, cwd: &Path) -> std::io::Result<std::process::C
     cmd.spawn()
 }
 
-/// Captures at most 2 MiB from `pipe` on a thread, then keeps draining (and
-/// discarding) so the child never receives SIGPIPE for being chatty.
-fn drain_capped<R: std::io::Read + Send + 'static>(
-    pipe: Option<R>,
-) -> Option<std::sync::mpsc::Receiver<Vec<u8>>> {
-    use std::io::Read;
-
-    let mut pipe = pipe?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = pipe.by_ref().take(2 * 1024 * 1024).read_to_end(&mut buf);
-        let _ = tx.send(buf);
-        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
-    });
-    Some(rx)
+struct CappedPipe {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
 }
 
-/// SIGKILLs the whole process group led by `child` (also reaps stragglers such as
-/// `(sleep 30 &)` after a normal exit; ESRCH on an empty group is ignored).
-fn reap_group(child: &mut std::process::Child) {
+/// Captures at most 2 MiB from `pipe` incrementally on a thread, then keeps draining
+/// (and discarding) so the child never receives SIGPIPE and partial output survives
+/// even if a `setsid` grandchild outlives a timeout.
+fn drain_capped<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Option<CappedPipe> {
+    const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
+    let mut pipe = pipe?;
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let buf_writer = Arc::clone(&buf);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut guard) = buf_writer.lock() {
+                        let remaining = MAX_CAPTURE_BYTES.saturating_sub(guard.len());
+                        if remaining > 0 {
+                            guard.extend_from_slice(&chunk[..n.min(remaining)]);
+                        }
+                    }
+                }
+            }
+        }
+        let _ = tx.send(());
+    });
+    Some(CappedPipe { buf, done: rx })
+}
+
+/// SIGKILLs the whole process group led by `pgid` (reaping background stragglers
+/// such as `(sleep 30 &)`; ESRCH on an empty group is ignored).
+fn reap_group(pgid: u32) {
     let _ = Command::new("kill")
         .arg("-KILL")
-        .arg(format!("-{}", child.id()))
+        .arg(format!("-{pgid}"))
         .status();
 }
 
-fn received(rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
-    rx.and_then(|rx| rx.recv_timeout(Duration::from_millis(500)).ok())
+fn received(pipe: Option<CappedPipe>, wait: Duration) -> Vec<u8> {
+    let Some(pipe) = pipe else {
+        return Vec::new();
+    };
+    let _ = pipe.done.recv_timeout(wait);
+    pipe.buf
+        .lock()
+        .map(|guard| guard.clone())
         .unwrap_or_default()
 }
 
@@ -878,15 +1064,20 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
             "Security violation: command contains prohibited destructive or system-modifying operations".to_string(),
         );
     }
+    let env_mode = match invariant_env_mode() {
+        Ok(mode) => mode,
+        Err(e) => return (1, String::new(), format!("{e:#}")),
+    };
     let timeout = match invariant_timeout() {
         Ok(timeout) => timeout,
         Err(e) => return (1, String::new(), format!("{e:#}")),
     };
 
-    let mut child = match spawn_invariant(command, cwd) {
+    let mut child = match spawn_invariant(command, cwd, env_mode) {
         Ok(child) => child,
         Err(e) => return (1, String::new(), format!("Failed to spawn bash: {}", e)),
     };
+    let pgid = child.id();
     let rx_out = drain_capped(child.stdout.take());
     let rx_err = drain_capped(child.stderr.take());
 
@@ -902,7 +1093,7 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
             Ok(None) => {}
             Err(e) => {
                 eprintln!("Failed to await invariant: {}", e);
-                reap_group(&mut child);
+                reap_group(pgid);
                 let _ = child.wait();
                 return (
                     1,
@@ -913,16 +1104,21 @@ fn run_invariant(command: &str, cwd: &Path) -> (i32, String, String) {
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            let _ = child.kill();
+            reap_group(pgid);
+            let _ = child.wait();
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    reap_group(&mut child);
-    let _ = child.wait();
+    reap_group(pgid);
 
-    let stdout = received(rx_out);
-    let stderr = received(rx_err);
+    let drain_wait = if timed_out {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_millis(500)
+    };
+    let stdout = received(rx_out, drain_wait);
+    let stderr = received(rx_err, drain_wait);
 
     if timed_out {
         return (

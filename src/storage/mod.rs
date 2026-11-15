@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-use crate::constants::{LOCK_TIMEOUT_SECS, RAW_EXTS};
+use crate::constants::{LOCK_TIMEOUT_SECS, MAX_NOTE_READ_BYTES, RAW_EXTS};
 
 pub struct VaultLock {
     _file: File,
@@ -20,6 +20,12 @@ pub struct VaultLock {
 impl VaultLock {
     pub fn acquire(vault: &Path) -> Result<Self> {
         let lock_path = vault.join(".akatsuki.lock");
+        if fs::symlink_metadata(&lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            anyhow::bail!(
+                "Refusing to open symlinked lockfile: {}",
+                lock_path.display()
+            );
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -27,6 +33,12 @@ impl VaultLock {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("Failed to open lockfile: {}", lock_path.display()))?;
+        if fs::symlink_metadata(&lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            anyhow::bail!(
+                "Lockfile became a symlink during open: {}",
+                lock_path.display()
+            );
+        }
 
         let deadline = Instant::now() + Duration::from_secs(LOCK_TIMEOUT_SECS);
         loop {
@@ -232,6 +244,37 @@ pub fn shellexpand(s: &str) -> String {
     out
 }
 
+fn has_dot_component(path: &Path) -> bool {
+    path.components().any(|comp| match comp {
+        std::path::Component::Normal(c) => c.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
+fn within_vault_no_hidden(resolved: &Path, norm_vault: &Path, canon_vault: &Path) -> bool {
+    if let Ok(rel) = resolved.strip_prefix(canon_vault) {
+        return !rel.as_os_str().is_empty() && !has_dot_component(rel);
+    }
+    if let Ok(rel) = resolved.strip_prefix(norm_vault) {
+        return !rel.as_os_str().is_empty() && !has_dot_component(rel);
+    }
+    false
+}
+
+pub fn read_note_utf8(path: &Path) -> Result<String> {
+    let meta =
+        fs::metadata(path).with_context(|| format!("Failed to stat '{}'", path.display()))?;
+    if meta.len() > MAX_NOTE_READ_BYTES {
+        anyhow::bail!(
+            "File '{}' ({} bytes) exceeds {} byte safety ceiling",
+            path.display(),
+            meta.len(),
+            MAX_NOTE_READ_BYTES
+        );
+    }
+    fs::read_to_string(path).with_context(|| format!("Failed to read '{}'", path.display()))
+}
+
 pub fn contained_path(vault: &Path, rel_path: &str) -> Option<PathBuf> {
     let clean = rel_path.trim().trim_start_matches('/');
     if clean.is_empty() || clean == "." || clean == "./" || clean.contains('\0') {
@@ -244,46 +287,28 @@ pub fn contained_path(vault: &Path, rel_path: &str) -> Option<PathBuf> {
     } else {
         vault.to_path_buf()
     };
-    let candidate = abs_vault.join(clean);
-    let norm_candidate = normalize_path(&candidate);
     let norm_vault = normalize_path(&abs_vault);
-
-    if !norm_candidate.starts_with(&norm_vault) || norm_candidate == norm_vault {
+    let norm_candidate = normalize_path(&abs_vault.join(clean));
+    let rel_lexical = norm_candidate.strip_prefix(&norm_vault).ok()?;
+    if rel_lexical.as_os_str().is_empty() || has_dot_component(rel_lexical) {
         return None;
     }
 
-    let components: Vec<std::path::Component> = norm_candidate
-        .strip_prefix(&norm_vault)
-        .ok()?
-        .components()
-        .collect();
-
-    // Disallow hidden directory traversals (e.g. .git/hooks)
-    for comp in &components {
-        if let std::path::Component::Normal(c) = comp {
-            if let Some(s) = c.to_str() {
-                if s.starts_with('.') && s != ".akatsuki" && s != ".akatsuki.lock" {
-                    return None;
-                }
-            }
-        }
-    }
-
-    // A symlink inside the vault must never resolve outside of it: containment is
-    // enforced against the real target, not the lexical path.
+    // Enforce containment and hidden-directory exclusion both lexically and after
+    // resolving every intermediate symlink against the canonical vault root.
     let canon_vault = fs::canonicalize(&abs_vault).unwrap_or_else(|_| norm_vault.clone());
-    let mut resolved = norm_vault.clone();
-    for comp in components {
+    let mut resolved = canon_vault.clone();
+    for comp in rel_lexical.components() {
         resolved.push(comp);
         if fs::symlink_metadata(&resolved).is_ok_and(|m| m.file_type().is_symlink()) {
             resolved = fs::canonicalize(&resolved).ok()?;
-            if !resolved.starts_with(&norm_vault) && !resolved.starts_with(&canon_vault) {
+            if !within_vault_no_hidden(&resolved, &norm_vault, &canon_vault) {
                 return None;
             }
         }
     }
 
-    Some(resolved)
+    within_vault_no_hidden(&resolved, &norm_vault, &canon_vault).then_some(resolved)
 }
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
@@ -353,14 +378,15 @@ fn is_fence(line: &str) -> bool {
     line.trim_end() == "---"
 }
 
-/// Text following the opening `---` fence line, or `None` when the note does not
-/// begin with a frontmatter fence.
+/// Text following the opening `---` fence line (after optional UTF-8 BOM), or
+/// `None` when the note does not begin with a frontmatter fence.
 fn opening_fence(content: &str) -> Option<&str> {
-    let line_end = content.find('\n')?;
-    if !is_fence(&content[..line_end]) {
+    let text = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let line_end = text.find('\n')?;
+    if !is_fence(&text[..line_end]) {
         return None;
     }
-    Some(&content[line_end + 1..])
+    Some(&text[line_end + 1..])
 }
 
 /// `(yaml_end, body_start)` offsets of the first column-0 closing fence in `after_open`.
@@ -397,21 +423,61 @@ pub(crate) fn body_after_frontmatter(content: &str) -> &str {
     }
 }
 
+fn is_safe_bare_yaml_key(key: &str) -> bool {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return false;
+    }
+    !matches!(
+        key.to_ascii_lowercase().as_str(),
+        "true" | "false" | "null" | "~" | "yes" | "no" | "on" | "off"
+    )
+}
+
+fn is_structural_only_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    line.starts_with(['"', '\''])
+        || line.starts_with("<<")
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || line.contains(": &")
+        || line.contains(": *")
+}
+
 /// Line span `[start, end)` of top-level `key` in `lines` (key line plus its
 /// indented / sequence continuation lines). `Err` when the YAML uses a shape this
-/// patcher refuses to edit textually (quoted key, anchors, aliases, merge keys).
+/// patcher refuses to edit textually (quoted key, indented root, anchors, aliases).
 fn find_key_span(lines: &[&str], key: &str) -> Result<Option<(usize, usize)>> {
+    if !is_safe_bare_yaml_key(key) {
+        anyhow::bail!("key '{}' needs the structural rewrite path", key);
+    }
     let prefix = format!("{}:", key);
     let mut start = None;
+    let mut saw_col0_key = false;
     for (i, line) in lines.iter().enumerate() {
-        if line.starts_with(['"', '\''])
-            || line.starts_with("<<")
-            || line.contains(": &")
-            || line.contains(": *")
-        {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if is_structural_only_line(line) {
             anyhow::bail!("frontmatter shape needs the structural rewrite path");
         }
-        if start.is_none() && line.starts_with(&prefix) {
+        if !saw_col0_key && line.starts_with([' ', '\t']) {
+            anyhow::bail!("indented root mapping needs the structural rewrite path");
+        }
+        if !line.starts_with([' ', '\t', '-']) {
+            saw_col0_key = true;
+        }
+        if start.is_none()
+            && line.starts_with(&prefix)
+            && line[prefix.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace())
+        {
             start = Some(i);
         }
     }
@@ -421,8 +487,11 @@ fn find_key_span(lines: &[&str], key: &str) -> Result<Option<(usize, usize)>> {
     let mut end = start + 1;
     while end < lines.len() {
         let line = lines[end];
-        let continuation =
-            line.starts_with([' ', '\t']) || line.starts_with("- ") || line.trim().is_empty();
+        let trimmed = line.trim();
+        let continuation = line.starts_with([' ', '\t'])
+            || line.starts_with("- ")
+            || trimmed == "-"
+            || trimmed.is_empty();
         if !continuation {
             break;
         }
@@ -445,7 +514,7 @@ fn render_scalar(value: &Value) -> Result<String> {
 }
 
 /// Replaces (or appends) top-level scalar keys in the raw frontmatter text,
-/// leaving every other byte of the note untouched.
+/// leaving every other byte of the note untouched, and verifies the result parses.
 pub fn patch_frontmatter_keys(raw: &str, edits: &[(&str, Value)]) -> Result<String> {
     let after_open = opening_fence(raw).context("Malformed frontmatter: no opening '---' fence")?;
     let (yaml_end, _) = closing_fence(after_open)
@@ -475,12 +544,10 @@ pub fn patch_frontmatter_keys(raw: &str, edits: &[(&str, Value)]) -> Result<Stri
     }
 
     let open_len = raw.len() - after_open.len();
-    Ok(format!(
-        "{}{}{}",
-        &raw[..open_len],
-        yaml,
-        &after_open[yaml_end..]
-    ))
+    let patched = format!("{}{}{}", &raw[..open_len], yaml, &after_open[yaml_end..]);
+    parse_frontmatter(&patched)
+        .context("Textual frontmatter patch produced invalid YAML; falling back")?;
+    Ok(patched)
 }
 
 pub fn dump_frontmatter(meta: &Value, body: &str) -> String {
@@ -508,8 +575,14 @@ pub fn write_atomic(target: &Path, content: &str) -> Result<()> {
         let mut file = options
             .open(&tmp_path)
             .with_context(|| format!("Failed to create tmp file: {}", tmp_path.display()))?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
+        if let Err(e) = file
+            .write_all(content.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
     }
 
     if target.exists() {
@@ -542,18 +615,20 @@ pub fn resolve_note_file(vault: &Path, query: &str) -> Option<PathBuf> {
     resolve_all(vault, query).into_iter().next()
 }
 
-/// The single note matching `query`; an ambiguous or missing match is an error
-/// so a mutation can never land on an arbitrary one of several same-named notes.
-pub fn resolve_note_file_unique(vault: &Path, query: &str) -> Result<PathBuf> {
+/// Resolves `query` to `Ok(None)` when absent, `Ok(Some(path))` when unique, or
+/// `Err` when multiple notes match.
+pub fn resolve_note_file_optional_unique(vault: &Path, query: &str) -> Result<Option<PathBuf>> {
     let mut found = resolve_all(vault, query);
     match found.len() {
-        0 => anyhow::bail!("Note not found: {}", query),
-        1 => Ok(found.remove(0)),
+        0 => Ok(None),
+        1 => Ok(Some(found.remove(0))),
         _ => {
+            let canon_vault = fs::canonicalize(vault).unwrap_or_else(|_| vault.to_path_buf());
             let listed: Vec<String> = found
                 .iter()
                 .map(|p| {
-                    p.strip_prefix(vault)
+                    p.strip_prefix(&canon_vault)
+                        .or_else(|_| p.strip_prefix(vault))
                         .unwrap_or(p)
                         .to_string_lossy()
                         .into_owned()
@@ -562,6 +637,13 @@ pub fn resolve_note_file_unique(vault: &Path, query: &str) -> Result<PathBuf> {
             anyhow::bail!("Ambiguous note '{}': matches {}", query, listed.join(", "))
         }
     }
+}
+
+/// The single note matching `query`; an ambiguous or missing match is an error
+/// so a mutation or targeted read can never land on an arbitrary duplicate stem.
+pub fn resolve_note_file_unique(vault: &Path, query: &str) -> Result<PathBuf> {
+    resolve_note_file_optional_unique(vault, query)?
+        .ok_or_else(|| anyhow::anyhow!("Note '{}' not found in vault", query))
 }
 
 /// Every note matching `query`. An exact vault-relative path wins outright;
@@ -588,57 +670,43 @@ fn resolve_all(vault: &Path, query: &str) -> Vec<PathBuf> {
         }
     }
 
-    let from_cache = cache_candidates(vault, clean_q, &hyphenated, &spaced);
-    if !from_cache.is_empty() {
+    if let Some(from_cache) = cache_candidates(vault, clean_q, &hyphenated, &spaced) {
         return from_cache;
     }
     walk_candidates(vault, clean_q, &hyphenated, &spaced)
 }
 
-/// Cache lookup: exact-stem rows first, then rel_path order; rows whose file is
-/// gone or whose path is not contained in the vault are dropped.
-fn cache_candidates(vault: &Path, clean_q: &str, hyphenated: &str, spaced: &str) -> Vec<PathBuf> {
-    let cache_db = vault.join(".akatsuki/cache.db");
-    if !cache_db.is_file() {
-        return Vec::new();
-    }
-    let Ok(con) = rusqlite::Connection::open_with_flags(
-        &cache_db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    ) else {
-        return Vec::new();
-    };
+/// Reconciled projection lookup: always opens a synced DB so cold or stale caches
+/// never cause split-brain resolution or missed duplicate-stem ambiguity.
+fn cache_candidates(
+    vault: &Path,
+    clean_q: &str,
+    hyphenated: &str,
+    spaced: &str,
+) -> Option<Vec<PathBuf>> {
+    let con = crate::index::open_synced_db(vault).ok()?;
     let sql = "SELECT rel_path FROM entities \
                WHERE stem = ?1 COLLATE NOCASE OR stem = ?2 COLLATE NOCASE \
                OR title = ?1 COLLATE NOCASE OR title = ?3 COLLATE NOCASE \
                ORDER BY (stem = ?1 COLLATE NOCASE) DESC, rel_path";
-    let Ok(mut stmt) = con.prepare(sql) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(rusqlite::params![clean_q, hyphenated, spaced], |row| {
-        row.get::<_, String>(0)
-    }) else {
-        return Vec::new();
-    };
-    rows.flatten()
-        .filter_map(|rel| contained_path(vault, &rel))
-        .filter(|p| p.is_file())
-        .collect()
+    let mut stmt = con.prepare(sql).ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![clean_q, hyphenated, spaced], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()?;
+    Some(
+        rows.flatten()
+            .filter_map(|rel| contained_path(vault, &rel))
+            .filter(|p| p.is_file())
+            .collect(),
+    )
 }
 
-/// Filesystem fallback comparing stems. Hidden entries below the vault root are
-/// skipped (the root itself may legitimately be a dot-directory); matches are
-/// sorted so the result never depends on readdir order.
+/// Filesystem fallback (used only when `.akatsuki/cache.db` cannot be opened, e.g.
+/// read-only filesystem) comparing both stems and frontmatter `title`.
 fn walk_candidates(vault: &Path, clean_q: &str, hyphenated: &str, spaced: &str) -> Vec<PathBuf> {
-    let ignored_dirs = [
-        ".git",
-        ".akatsuki",
-        ".venv",
-        "node_modules",
-        ".obsidian",
-        "__pycache__",
-        "_templates",
-    ];
+    let ignored_dirs = ["node_modules", "_templates"];
     let walker = walkdir::WalkDir::new(vault).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
         let hidden = e.depth() > 0 && name.starts_with('.');
@@ -655,15 +723,28 @@ fn walk_candidates(vault: &Path, clean_q: &str, hyphenated: &str, spaced: &str) 
         .map(|e| e.into_path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
         .filter(|path| {
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                return false;
-            };
-            let stem_lower = stem.to_lowercase();
-            let stem_space = stem_lower.replace('-', " ");
-            stem_lower == q_stem_lower
-                || stem_lower == q_hyphen_lower
-                || stem_space == q_space_lower
-                || stem_space == q_stem_lower
+            let stem_match = path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| {
+                let stem_lower = s.to_lowercase();
+                let stem_space = stem_lower.replace('-', " ");
+                stem_lower == q_stem_lower
+                    || stem_lower == q_hyphen_lower
+                    || stem_space == q_space_lower
+                    || stem_space == q_stem_lower
+            });
+            if stem_match {
+                return true;
+            }
+            read_note_utf8(path)
+                .ok()
+                .and_then(|text| parse_frontmatter(&text).ok())
+                .and_then(|(fm, _)| {
+                    fm.get("title")
+                        .and_then(|v| v.as_str())
+                        .map(|t| t.to_lowercase())
+                })
+                .is_some_and(|title_lower| {
+                    title_lower == q_stem_lower || title_lower == q_space_lower
+                })
         })
         .collect();
     found.sort();
@@ -808,23 +889,67 @@ pub fn extract_section(content: &str, section_name: &str) -> Option<String> {
     Some(lines[start..end].join("\n"))
 }
 
+/// Extracts a fence-aware Table of Contents (`L{line_no}: {#...} {title}`) using
+/// 1-based physical line numbers of `content`.
+pub fn extract_toc(content: &str) -> Vec<String> {
+    let body = body_after_frontmatter(content);
+    let prefix_bytes = content.len().saturating_sub(body.len());
+    let base_line = content[..prefix_bytes]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count()
+        + 1;
+
+    let mut in_fence: Option<(char, usize)> = None;
+    let mut toc = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        if let Some((marker, open_len)) = in_fence {
+            if fence_closes(line, marker, open_len) {
+                in_fence = None;
+            }
+            continue;
+        }
+        if let Some(opened) = fence_open(line) {
+            in_fence = Some(opened);
+            continue;
+        }
+        if let Some((level, _)) = heading_at(line) {
+            if (1..=6).contains(&level) {
+                let raw_title = line.trim()[level..].trim();
+                toc.push(format!(
+                    "L{}: {} {}",
+                    base_line + idx,
+                    "#".repeat(level),
+                    raw_title
+                ));
+            }
+        }
+    }
+    toc
+}
+
 /// Note type inferred from the domain directory, mirroring the vault layout.
 pub fn infer_note_type(rel_path: &str) -> &'static str {
     let clean = rel_path.trim().trim_start_matches('/');
-    if clean.starts_with("20-Projects") {
-        "project"
-    } else if clean.starts_with("40-Systems") {
-        "system"
-    } else if clean.starts_with("30-Agents") {
-        "agent"
-    } else if clean.starts_with("01-Daily") {
-        "daily"
-    } else if clean.starts_with("90-Reference") {
-        "reference"
-    } else if clean.starts_with("90-Database") {
-        "database"
-    } else {
-        "note"
+    match clean.split_once('/').map(|(domain, _)| domain) {
+        Some("20-Projects") => "project",
+        Some("40-Systems") => "system",
+        Some("30-Agents") => "agent",
+        Some("01-Daily") => "daily",
+        Some("50-Configs") => "config",
+        Some("60-Scripts") => "script",
+        Some("90-Reference") => "reference",
+        Some("90-Database") => "database",
+        _ => "note",
+    }
+}
+
+fn truthy_scalar_string(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    match map.get(key)? {
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Value::Number(n) if n.as_i64() != Some(0) && n.as_f64() != Some(0.0) => Some(n.to_string()),
+        Value::Bool(true) => Some("true".to_string()),
+        _ => None,
     }
 }
 
@@ -844,46 +969,46 @@ pub fn auto_heal_frontmatter(content: &str, rel_path: &str) -> Result<String> {
     let inferred_type = infer_note_type(clean);
     let now = chrono::Local::now();
 
-    let heading_title = body
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("# ").map(|t| t.trim().to_string()));
-
-    let existing_text = |map: &serde_json::Map<String, Value>, key: &str| -> Option<String> {
-        map.get(key)
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.trim().to_string()),
-                Value::Number(n) => Some(n.to_string()),
-                Value::Bool(b) => Some(b.to_string()),
-                _ => None,
-            })
-            .filter(|s| !s.is_empty())
-    };
+    let unfenced_body = strip_fenced_code(&body);
+    let heading_title = unfenced_body.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("# ")
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+    });
 
     let map = fm
         .as_object()
         .context("Frontmatter must be a YAML mapping")?;
-    let title = existing_text(map, "title")
+    let title = truthy_scalar_string(map, "title")
         .or(heading_title)
         .unwrap_or_else(|| stem.clone());
-    let date = existing_text(map, "date").unwrap_or_else(|| now.format("%Y-%m-%d").to_string());
-    let note_type = existing_text(map, "type").unwrap_or_else(|| inferred_type.to_string());
-    let summary = existing_text(map, "summary")
+    let date =
+        truthy_scalar_string(map, "date").unwrap_or_else(|| now.format("%Y-%m-%d").to_string());
+    let note_type = truthy_scalar_string(map, "type").unwrap_or_else(|| inferred_type.to_string());
+    let summary = truthy_scalar_string(map, "summary")
         .unwrap_or_else(|| format!("{} overview and operational documentation.", title));
-    let updated = existing_text(map, "updated")
+    let updated = truthy_scalar_string(map, "updated")
         .unwrap_or_else(|| now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-    let updated_by = existing_text(map, "updated_by").unwrap_or_else(machine_id);
+    let updated_by = truthy_scalar_string(map, "updated_by").unwrap_or_else(machine_id);
     let tags = match map.get("tags") {
         Some(Value::Array(items)) if !items.is_empty() => Value::Array(items.clone()),
-        Some(Value::String(raw)) => Value::Array(
-            raw.split(',')
+        Some(Value::String(raw)) => {
+            let items: Vec<Value> = raw
+                .split(',')
                 .map(|t| t.trim())
                 .filter(|t| !t.is_empty())
                 .map(|t| Value::String(t.to_string()))
-                .collect(),
-        ),
-        _ => json!([inferred_type]),
+                .collect();
+            if items.is_empty() {
+                json!([note_type])
+            } else {
+                Value::Array(items)
+            }
+        }
+        _ => json!([note_type]),
     };
-    let status = match (note_type.as_str(), existing_text(map, "status")) {
+    let status = match (note_type.as_str(), truthy_scalar_string(map, "status")) {
         ("project", None) => Some(Value::String("active".to_string())),
         _ => None,
     };
@@ -902,6 +1027,7 @@ pub fn auto_heal_frontmatter(content: &str, rel_path: &str) -> Result<String> {
 
     Ok(dump_frontmatter(&fm, body.trim_start_matches('\n')))
 }
+
 /// Packs markdown into a heuristic token budget (~4 chars per token), always
 /// keeping the frontmatter block intact and marking the cut explicitly.
 pub fn apply_token_budget(text: &str, budget: Option<usize>) -> String {
@@ -919,12 +1045,17 @@ pub fn apply_token_budget(text: &str, budget: Option<usize>) -> String {
     let mut fences = 0usize;
     let mut frontmatter_chars = 0usize;
 
-    for line in text.split_inclusive('\n') {
+    for (idx, line) in text.split_inclusive('\n').enumerate() {
         if in_frontmatter {
             packed.push_str(line);
             used += line.len();
             frontmatter_chars += line.len();
-            if is_fence(line) {
+            let check_line = if idx == 0 {
+                line.strip_prefix('\u{feff}').unwrap_or(line)
+            } else {
+                line
+            };
+            if is_fence(check_line) {
                 fences += 1;
                 if fences == 2 {
                     in_frontmatter = false;

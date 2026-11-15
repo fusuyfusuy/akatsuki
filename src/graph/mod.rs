@@ -1,6 +1,6 @@
 //! Knowledge graph, blast radius calculation, map traversal, and contract extraction.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::index::{extract_target_stem, open_synced_db};
-use crate::storage::{parse_frontmatter, resolve_note_file};
+use crate::storage::{parse_frontmatter, read_note_utf8, resolve_note_file_unique};
 
 /// Escapes SQL LIKE special wildcard characters ('%', '_', '\').
 pub(crate) fn escape_like(s: &str) -> String {
@@ -99,10 +99,10 @@ fn blast_radius_with(con: &Connection, stem: &str) -> Result<BlastRadius> {
     let sink_rel = format!("%/{}.md", escaped_stem);
     let mut stmt_svc = con.prepare(
         "SELECT name, container_prefix, ports, host, network, rel_path FROM services \
-         WHERE name = ?1 OR container_prefix = ?1 OR rel_path LIKE ?2 ESCAPE '\\'",
+         WHERE name = ?1 OR container_prefix = ?1 OR rel_path = ?3 OR rel_path LIKE ?2 ESCAPE '\\'",
     )?;
     let boundary_sinks: Vec<ServiceItem> = stmt_svc
-        .query_map(params![stem, sink_rel], |r| {
+        .query_map(params![stem, sink_rel, exact_rel], |r| {
             Ok(ServiceItem {
                 name: r.get(0)?,
                 container_prefix: r.get(1)?,
@@ -170,10 +170,9 @@ pub struct NoteContract {
 
 /// Extracts the machine boundary contract of the note named by `note_query`.
 pub fn extract_contract(vault: &Path, note_query: &str) -> Result<NoteContract> {
-    let note_path = resolve_note_file(vault, note_query)
-        .with_context(|| format!("Note '{}' not found in vault", note_query))?;
+    let note_path = resolve_note_file_unique(vault, note_query)?;
 
-    let content = std::fs::read_to_string(&note_path)?;
+    let content = read_note_utf8(&note_path)?;
     let (fm, _) = parse_frontmatter(&content)
         .with_context(|| format!("Note '{}' has invalid frontmatter", note_path.display()))?;
 
@@ -182,11 +181,13 @@ pub fn extract_contract(vault: &Path, note_query: &str) -> Result<NoteContract> 
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
+    let canon_vault = std::fs::canonicalize(vault).unwrap_or_else(|_| vault.to_path_buf());
     let rel_path = note_path
-        .strip_prefix(vault)
+        .strip_prefix(&canon_vault)
+        .or_else(|_| note_path.strip_prefix(vault))
         .unwrap_or(&note_path)
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
 
     let title = fm
         .get("title")
@@ -221,21 +222,29 @@ pub fn extract_contract(vault: &Path, note_query: &str) -> Result<NoteContract> 
         .map(|s| s.to_string());
 
     let con = open_synced_db(vault)?;
-    let blast = blast_radius_with(&con, &stem)?;
 
-    let mut ports = Vec::new();
-    for svc in &blast.boundary_sinks {
-        if !svc.ports.is_empty() {
-            ports.push(format!("{}: {}", svc.name, svc.ports));
-        }
-    }
-
-    let dependencies: Vec<String> = blast
-        .downstream
+    // Scope ports and outgoing dependencies strictly to `rel_path` so duplicate
+    // stems across domains never contaminate one another's contracts.
+    let mut stmt_ports = con.prepare(
+        "SELECT name, ports FROM services \
+         WHERE rel_path = ?1 \
+            OR ((name = ?2 OR container_prefix = ?2) \
+                AND NOT EXISTS (SELECT 1 FROM entities e2 WHERE e2.stem = ?2 AND e2.rel_path != ?1))",
+    )?;
+    let ports: Vec<String> = stmt_ports
+        .query_map(params![rel_path, stem], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .map(|d| d.target_stem)
+        .filter(|(_, p)| !p.is_empty())
+        .map(|(n, p)| format!("{}: {}", n, p))
         .collect();
-    let dependents: Vec<String> = blast.upstream.into_iter().map(|u| u.source_rel).collect();
+
+    let mut stmt_up = con.prepare("SELECT source_rel FROM relations WHERE target_stem = ?1")?;
+    let dependents: Vec<String> = stmt_up
+        .query_map(params![stem], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut stmt_rel =
         con.prepare("SELECT relation_type, target_stem FROM relations WHERE source_rel = ?1")?;
@@ -247,6 +256,7 @@ pub fn extract_contract(vault: &Path, note_query: &str) -> Result<NoteContract> 
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let dependencies: Vec<String> = relations.iter().map(|r| r.target.clone()).collect();
 
     let mut stmt_inv =
         con.prepare("SELECT invariant_text FROM invariants WHERE source_rel = ?1")?;
@@ -324,25 +334,42 @@ fn traverse_down(
     current_depth: usize,
     max_depth: usize,
     ancestors: &[String],
+    edge_cache: &mut HashMap<String, Vec<(String, String)>>,
 ) -> Result<Vec<TreeNode>> {
     if current_depth >= max_depth {
         return Ok(Vec::new());
     }
 
-    let exact_rel = format!("{}.md", stem);
-    let mut stmt = con.prepare(DOWNSTREAM_SQL)?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map(params![exact_rel, stem], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let key = stem.to_lowercase();
+    let rows = if let Some(cached) = edge_cache.get(&key) {
+        cached.clone()
+    } else {
+        let exact_rel = format!("{}.md", stem);
+        let mut stmt = con.prepare_cached(DOWNSTREAM_SQL)?;
+        let fetched: Vec<(String, String)> = stmt
+            .query_map(params![exact_rel, stem], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        edge_cache.insert(key, fetched.clone());
+        fetched
+    };
 
     let mut children = Vec::with_capacity(rows.len());
     for (child_stem, relation_type) in rows {
-        let cycle = ancestors.iter().any(|a| a == &child_stem);
+        let cycle = ancestors
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(&child_stem));
         let mut nested = Vec::new();
         if !cycle {
             let mut path = ancestors.to_vec();
             path.push(child_stem.clone());
-            nested = traverse_down(con, &child_stem, current_depth + 1, max_depth, &path)?;
+            nested = traverse_down(
+                con,
+                &child_stem,
+                current_depth + 1,
+                max_depth,
+                &path,
+                edge_cache,
+            )?;
         }
         children.push(TreeNode {
             rel_path: resolve_stem_rel_path(con, &child_stem)?,
@@ -362,26 +389,44 @@ fn traverse_up(
     current_depth: usize,
     max_depth: usize,
     ancestors: &[String],
+    edge_cache: &mut HashMap<String, Vec<(String, String)>>,
 ) -> Result<Vec<TreeNode>> {
     if current_depth >= max_depth {
         return Ok(Vec::new());
     }
 
-    let mut stmt =
-        con.prepare("SELECT source_rel, relation_type FROM relations WHERE target_stem = ?1")?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map(params![stem], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let key = stem.to_lowercase();
+    let rows = if let Some(cached) = edge_cache.get(&key) {
+        cached.clone()
+    } else {
+        let mut stmt = con.prepare_cached(
+            "SELECT source_rel, relation_type FROM relations WHERE target_stem = ?1",
+        )?;
+        let fetched: Vec<(String, String)> = stmt
+            .query_map(params![stem], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        edge_cache.insert(key, fetched.clone());
+        fetched
+    };
 
     let mut children = Vec::with_capacity(rows.len());
     for (source_rel, relation_type) in rows {
         let child_stem = extract_target_stem(&source_rel);
-        let cycle = ancestors.iter().any(|a| a == &child_stem);
+        let cycle = ancestors
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(&child_stem));
         let mut nested = Vec::new();
         if !cycle {
             let mut path = ancestors.to_vec();
             path.push(child_stem.clone());
-            nested = traverse_up(con, &child_stem, current_depth + 1, max_depth, &path)?;
+            nested = traverse_up(
+                con,
+                &child_stem,
+                current_depth + 1,
+                max_depth,
+                &path,
+                edge_cache,
+            )?;
         }
         children.push(TreeNode {
             stem: child_stem,
@@ -451,14 +496,16 @@ pub fn traverse_graph(
     let stem = extract_target_stem(target);
     let root = vec![stem.clone()];
 
+    let mut down_cache = HashMap::new();
     let downstream = if direction == "both" || direction == "down" {
-        traverse_down(&con, &stem, 0, depth, &root)?
+        traverse_down(&con, &stem, 0, depth, &root, &mut down_cache)?
     } else {
         Vec::new()
     };
 
+    let mut up_cache = HashMap::new();
     let upstream = if direction == "both" || direction == "up" {
-        traverse_up(&con, &stem, 0, depth, &root)?
+        traverse_up(&con, &stem, 0, depth, &root, &mut up_cache)?
     } else {
         Vec::new()
     };
@@ -471,22 +518,38 @@ pub fn traverse_graph(
     let mut sinks: Vec<MapSink> = Vec::new();
     let mut stmt = con.prepare(
         "SELECT name, ports, host, network, rel_path FROM services \
-         WHERE name = ?1 OR container_prefix = ?1 OR rel_path LIKE ?2 ESCAPE '\\'",
+         WHERE name = ?1 OR container_prefix = ?1 OR rel_path = ?3 OR rel_path LIKE ?2 ESCAPE '\\'",
     )?;
     for sink_stem in &stems {
         let escaped_sink = escape_like(sink_stem);
-        let rows = stmt.query_map(params![sink_stem, format!("%/{}.md", escaped_sink)], |r| {
-            Ok(MapSink {
-                name: r.get(0)?,
-                ports: r.get(1)?,
-                host: r.get(2)?,
-                network: r.get(3)?,
-                rel_path: r.get(4)?,
-            })
-        })?;
+        let exact_rel = format!("{}.md", sink_stem);
+        let rows = stmt.query_map(
+            params![sink_stem, format!("%/{}.md", escaped_sink), exact_rel],
+            |r| {
+                Ok(MapSink {
+                    name: r.get(0)?,
+                    ports: r.get(1)?,
+                    host: r.get(2)?,
+                    network: r.get(3)?,
+                    rel_path: r.get(4)?,
+                })
+            },
+        )?;
         for row in rows {
             sinks.push(row?);
         }
+    }
+
+    let known: bool = con.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entities WHERE stem = ?1)",
+        params![stem],
+        |r| r.get(0),
+    )?;
+    if !known && upstream.is_empty() && downstream.is_empty() && sinks.is_empty() {
+        anyhow::bail!(
+            "Target '{}' not found: no indexed note, link or service",
+            target
+        );
     }
 
     let payload = serde_json::to_value(MapPayloadJson {

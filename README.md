@@ -74,7 +74,8 @@ akatsuki search "hardware specifications of primary host" --mode vector
 # Machine boundary contract extraction (ports, invariants, relations, dependents)
 akatsuki contract 40-Systems/Cluster-Topology.md
 
-# Token-budgeted surgical note read
+# Token-budgeted surgical note read or TOC outline
+akatsuki read "Cluster-Topology" --toc
 akatsuki read "Cluster-Topology" --section "Private Network Routing" --budget 500
 
 # Graph traversal and dependency blast radius
@@ -156,7 +157,7 @@ akatsuki mcp [--vault <dir>]
 | MCP Tool | CLI Equivalent | Key Arguments | Description |
 | :--- | :--- | :--- | :--- |
 | `akatsuki_search` | `akatsuki search` | `query`, `mode`, `domain`, `limit`, `with_graph` | Fast hybrid/BM25 search with contextual snippets and optional graph context. |
-| `akatsuki_read` | `akatsuki read` | `note` (or `path`, `target`), `section`, `budget` | Read full notes or extract individual headings with token budget packing. |
+| `akatsuki_read` | `akatsuki read` | `note` (or `path`, `target`), `section`, `toc`, `budget` | Read full notes, TOC outlines, or individual headings with token budget packing. |
 | `akatsuki_contract` | `akatsuki contract` | `note` (or `target`, `path`) | Extract machine boundary contracts (APIs, ports, schemas, invariants). |
 | `akatsuki_blast` | `akatsuki blast` | `target` (or `note`, `path`) | Compute upstream callers and downstream dependencies for blast radius analysis. |
 | `akatsuki_map` | `akatsuki map` | `target`, `depth`, `direction` | Hierarchical knowledge graph traversal (`up`, `down`, or `both`). |
@@ -174,7 +175,10 @@ akatsuki mcp [--vault <dir>]
 | `akatsuki_verify` | `akatsuki verify` | *(none)* | Verify bidirectional wikilink closure, markdown links, and MOC reachability. |
 | `akatsuki_test` | `akatsuki test` | `note`, `dry_run` | Execute machine-verifiable `bash:verify` assertions under security ceilings. |
 | `akatsuki_reconcile` | `akatsuki reconcile` | `dry_run` | Rebuild SQLite projection, auto-quote colon scalars, and sync vectors. |
-| `akatsuki_list_notes` | `akatsuki list` | `domain` | List notes in the vault with metadata, status, and domain filtering. |
+| `akatsuki_list_notes` | `akatsuki list` | `domain`, `limit` | List notes in the vault with metadata, status, and domain filtering. |
+
+### MCP Resources (`resources/list`, `resources/templates/list`, `resources/read`)
+Akatsuki also exposes static canonical resources (`akatsuki://services`, `akatsuki://projects`, `akatsuki://operator`, `akatsuki://daily`, `akatsuki://invariants`, `akatsuki://index`) and dynamic vault note resolution (`akatsuki://{note}`, capped at 64 KB) over both newline-delimited JSON-RPC and `Content-Length` stdio framing.
 
 ---
 

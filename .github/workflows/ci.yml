@@ -27,5 +27,9 @@ jobs:
       - name: Test
         run: cargo test
 
-      - name: Build with vectors feature
-        run: cargo build --features vectors
+      - name: Clippy (vectors feature)
+        run: cargo clippy --features vectors --all-targets -- -D warnings
+
+      # mimodept: e5-small weights (~470 MB) unprovisioned in GitHub Actions <- CI runner cache budget -> when full vector-embedding integration tests must run in CI
+      - name: Unit tests (vectors feature)
+        run: cargo test --features vectors --lib

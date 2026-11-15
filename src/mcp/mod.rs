@@ -2,10 +2,12 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
-use crate::constants::MCP_DEFAULT_LIMIT;
+use crate::constants::{
+    MAX_MCP_RESOURCE_BYTES, MCP_DEFAULT_LIMIT, MCP_DEFAULT_READ_BUDGET, MCP_SPILL_CEILING_BYTES,
+};
 use crate::graph::{calculate_blast_radius, extract_contract, traverse_graph};
 use crate::mutations::{
     append_section_in_note, append_work_log, read_daily_note, replace_section_in_note,
@@ -15,53 +17,144 @@ use crate::search::{
     execute_sql_query, format_hits_compact, get_keypath, list_notes, list_projects, list_services,
     search_vault,
 };
-use crate::storage::{extract_section, resolve_note_file};
+use crate::storage::{
+    contained_path, extract_section, extract_toc, read_note_utf8, resolve_note_file_unique,
+};
 use crate::verify::{lint_vault, reconcile_vault, run_verification_tests, verify_links};
 
-/// Longest accepted request line; anything larger is drained and rejected.
+/// Longest accepted request payload; anything larger is drained and rejected.
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
-/// One newline-delimited frame read from stdin.
+/// One JSON-RPC frame read from stdin (newline-delimited JSONL or LSP `Content-Length`).
 enum Frame {
-    Line(String),
+    Message {
+        payload: String,
+        content_length: bool,
+    },
     BadUtf8,
+    InvalidHeader,
     TooLarge,
 }
 
-/// Reads the next frame without ever buffering more than `MAX_REQUEST_BYTES`;
-/// an oversized line is consumed to its newline so the stream stays in sync.
-fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Frame>> {
+enum BoundedLine {
+    Eof,
+    Line(Vec<u8>),
+    TooLarge,
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> io::Result<BoundedLine> {
     let mut buf: Vec<u8> = Vec::new();
     let mut oversized = false;
     loop {
         let chunk = reader.fill_buf()?;
         if chunk.is_empty() {
-            return Ok((!buf.is_empty() || oversized).then(|| finish_frame(buf, oversized)));
+            if buf.is_empty() && !oversized {
+                return Ok(BoundedLine::Eof);
+            }
+            return Ok(if oversized {
+                BoundedLine::TooLarge
+            } else {
+                BoundedLine::Line(buf)
+            });
         }
         let newline = chunk.iter().position(|b| *b == b'\n');
         let take = newline.map_or(chunk.len(), |i| i + 1);
         if !oversized {
-            if buf.len() + take > MAX_REQUEST_BYTES {
+            if buf.len() + take > max_bytes {
                 oversized = true;
-                buf = Vec::new();
+                buf.clear();
             } else {
                 buf.extend_from_slice(&chunk[..take]);
             }
         }
         reader.consume(take);
         if newline.is_some() {
-            return Ok(Some(finish_frame(buf, oversized)));
+            return Ok(if oversized {
+                BoundedLine::TooLarge
+            } else {
+                BoundedLine::Line(buf)
+            });
         }
     }
 }
 
-fn finish_frame(buf: Vec<u8>, oversized: bool) -> Frame {
-    if oversized {
-        return Frame::TooLarge;
+fn is_http_header_start(trimmed: &str) -> bool {
+    trimmed
+        .get(..15)
+        .is_some_and(|p| p.eq_ignore_ascii_case("content-length:"))
+        || trimmed
+            .get(..13)
+            .is_some_and(|p| p.eq_ignore_ascii_case("content-type:"))
+}
+
+fn read_content_length_frame<R: BufRead>(reader: &mut R, first_line: &str) -> io::Result<Frame> {
+    let mut content_len: Option<usize> = None;
+    let mut current = first_line.trim_matches(['\r', '\n']).to_string();
+    loop {
+        if current.is_empty() {
+            break;
+        }
+        if let Some(rest) = current
+            .get(..15)
+            .filter(|p| p.eq_ignore_ascii_case("content-length:"))
+            .and_then(|_| current.get(15..))
+        {
+            match rest.trim().parse::<usize>() {
+                Ok(n) => content_len = Some(n),
+                Err(_) => return Ok(Frame::InvalidHeader),
+            }
+        }
+        match read_bounded_line(reader, 8192)? {
+            BoundedLine::Eof | BoundedLine::TooLarge => return Ok(Frame::InvalidHeader),
+            BoundedLine::Line(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => current = s.trim_matches(['\r', '\n']).to_string(),
+                Err(_) => return Ok(Frame::BadUtf8),
+            },
+        }
     }
-    match String::from_utf8(buf) {
-        Ok(line) => Frame::Line(line),
-        Err(_) => Frame::BadUtf8,
+
+    let Some(len) = content_len else {
+        return Ok(Frame::InvalidHeader);
+    };
+    if len > MAX_REQUEST_BYTES {
+        let _ = io::copy(&mut reader.take(len as u64), &mut io::sink())?;
+        return Ok(Frame::TooLarge);
+    }
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    match String::from_utf8(body) {
+        Ok(payload) => Ok(Frame::Message {
+            payload,
+            content_length: true,
+        }),
+        Err(_) => Ok(Frame::BadUtf8),
+    }
+}
+
+/// Reads the next frame without ever buffering more than `MAX_REQUEST_BYTES`;
+/// supports both newline-delimited JSON-RPC and `Content-Length` stdio framing.
+fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Frame>> {
+    loop {
+        match read_bounded_line(reader, MAX_REQUEST_BYTES)? {
+            BoundedLine::Eof => return Ok(None),
+            BoundedLine::TooLarge => return Ok(Some(Frame::TooLarge)),
+            BoundedLine::Line(bytes) => match String::from_utf8(bytes) {
+                Err(_) => return Ok(Some(Frame::BadUtf8)),
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if is_http_header_start(trimmed) {
+                        return read_content_length_frame(reader, trimmed).map(Some);
+                    }
+                    return Ok(Some(Frame::Message {
+                        payload: line,
+                        content_length: false,
+                    }));
+                }
+            },
+        }
     }
 }
 
@@ -143,14 +236,17 @@ fn handle_tools_call(vault: &Path, id: Value, params: &Value) -> Value {
         dispatch_tool(vault, tool_name, &tool_args)
     })) {
         Ok(pair) => pair,
-        Err(panic) => (
-            format!(
-                "Internal error: tool '{}' panicked: {}",
-                tool_name,
-                panic_message(&panic)
-            ),
-            true,
-        ),
+        Err(panic) => {
+            return rpc_error(
+                id,
+                -32603,
+                format!(
+                    "Internal error: tool '{}' panicked: {}",
+                    tool_name,
+                    panic_message(&panic)
+                ),
+            );
+        }
     };
 
     json!({
@@ -163,6 +259,158 @@ fn handle_tools_call(vault: &Path, id: Value, params: &Value) -> Value {
     })
 }
 
+pub fn get_resource_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "uri": "akatsuki://services",
+            "name": "Live Services Catalog",
+            "description": "Active containerized services, port allocations, and ingress routing.",
+            "mimeType": "application/json"
+        }),
+        json!({
+            "uri": "akatsuki://projects",
+            "name": "Projects Inventory",
+            "description": "Active production projects, tools, and technical architectures.",
+            "mimeType": "application/json"
+        }),
+        json!({
+            "uri": "akatsuki://operator",
+            "name": "Operator Profile & Machine Specs",
+            "description": "Hardware telemetry, communication standards, and system topology.",
+            "mimeType": "text/markdown"
+        }),
+        json!({
+            "uri": "akatsuki://daily",
+            "name": "Today's Operational Log",
+            "description": "Daily activity ledger, focus horizons, and session notes for today.",
+            "mimeType": "text/markdown"
+        }),
+        json!({
+            "uri": "akatsuki://invariants",
+            "name": "Global Architectural Invariants",
+            "description": "System-wide architectural contracts, non-negotiable boundaries, and protocols.",
+            "mimeType": "text/markdown"
+        }),
+        json!({
+            "uri": "akatsuki://index",
+            "name": "Master Vault Catalog",
+            "description": "Root index and map of contents across all knowledge domains.",
+            "mimeType": "text/markdown"
+        }),
+    ]
+}
+
+pub fn get_resource_templates() -> Vec<Value> {
+    vec![json!({
+        "uriTemplate": "akatsuki://{note}",
+        "name": "Akatsuki Vault Note",
+        "description": "Read any vault note by title, stem, or relative path.",
+        "mimeType": "text/markdown"
+    })]
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize, footer: &str) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let budget = max_bytes.saturating_sub(footer.len());
+    let mut cut = budget.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &text[..cut], footer)
+}
+
+fn read_contained_anchor(vault: &Path, rel: &str) -> Result<String, String> {
+    let path = contained_path(vault, rel).ok_or_else(|| format!("Path '{rel}' escapes vault."))?;
+    if !path.is_file() {
+        return Err(format!("{rel} not found in vault."));
+    }
+    read_note_utf8(&path).map_err(|e| format!("{e:#}"))
+}
+
+fn resolve_resource_payload(vault: &Path, uri: &str) -> Result<(&'static str, String), String> {
+    match uri {
+        "akatsuki://services" => {
+            let items = list_services(vault).map_err(|e| format!("Query failed: {e}"))?;
+            if !items.is_empty() {
+                let text = serde_json::to_string_pretty(&items).unwrap_or_default();
+                return Ok(("application/json", text));
+            }
+            if let Ok(cat) = read_contained_anchor(vault, "40-Systems/Services-Catalog.md") {
+                return Ok(("text/markdown", cat));
+            }
+            Ok(("application/json", "[]".to_string()))
+        }
+        "akatsuki://projects" => {
+            let items = list_projects(vault).map_err(|e| format!("Query failed: {e}"))?;
+            if !items.is_empty() {
+                let text = serde_json::to_string_pretty(&items).unwrap_or_default();
+                return Ok(("application/json", text));
+            }
+            if let Ok(moc) = read_contained_anchor(vault, "20-Projects/Projects-MOC.md") {
+                return Ok(("text/markdown", moc));
+            }
+            Ok(("application/json", "[]".to_string()))
+        }
+        "akatsuki://operator" => {
+            read_contained_anchor(vault, "OPERATOR.md").map(|t| ("text/markdown", t))
+        }
+        "akatsuki://daily" => read_daily_note(vault, None)
+            .map(|(content, _)| ("text/markdown", content))
+            .map_err(|e| format!("Read daily failed: {e}")),
+        "akatsuki://invariants" => {
+            read_contained_anchor(vault, "AGENTS.md").map(|t| ("text/markdown", t))
+        }
+        "akatsuki://index" => {
+            read_contained_anchor(vault, "INDEX.md").map(|t| ("text/markdown", t))
+        }
+        _ if uri.starts_with("akatsuki://") => {
+            let target = uri.trim_start_matches("akatsuki://").trim();
+            if target.is_empty() {
+                return Err("Resource URI missing note target.".to_string());
+            }
+            let note_path =
+                resolve_note_file_unique(vault, target).map_err(|e| format!("{e:#}"))?;
+            let content = read_note_utf8(&note_path).map_err(|e| format!("{e:#}"))?;
+            Ok(("text/markdown", content))
+        }
+        _ => Err(format!("Unsupported resource URI: '{uri}'")),
+    }
+}
+
+fn handle_resources_read(vault: &Path, id: Value, params: &Value) -> Value {
+    let Some(uri) = params
+        .get("uri")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return rpc_error(id, -32602, "params.uri must be a non-empty string");
+    };
+
+    match resolve_resource_payload(vault, uri) {
+        Ok((mime, text)) => {
+            let capped = truncate_utf8_bytes(
+                &text,
+                MAX_MCP_RESOURCE_BYTES,
+                "\n\n[... Truncated at 64 KB MCP resource ceiling ...]",
+            );
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": mime,
+                        "text": capped
+                    }]
+                }
+            })
+        }
+        Err(msg) => rpc_error(id, -32602, msg),
+    }
+}
+
 fn respond(vault: &Path, request: Request<'_>) -> Value {
     let Request { id, method, params } = request;
     match method {
@@ -172,7 +420,10 @@ fn respond(vault: &Path, request: Request<'_>) -> Value {
             "result": {
                 "protocolVersion": "2024-11-05",
                 "serverInfo": { "name": "akatsuki", "version": env!("CARGO_PKG_VERSION") },
-                "capabilities": { "tools": {} }
+                "capabilities": {
+                    "tools": {},
+                    "resources": { "subscribe": false, "listChanged": false }
+                }
             }
         }),
         "tools/list" => json!({
@@ -181,6 +432,17 @@ fn respond(vault: &Path, request: Request<'_>) -> Value {
             "result": { "tools": get_tool_definitions() }
         }),
         "tools/call" => handle_tools_call(vault, id, &params),
+        "resources/list" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "resources": get_resource_definitions() }
+        }),
+        "resources/templates/list" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "resourceTemplates": get_resource_templates() }
+        }),
+        "resources/read" => handle_resources_read(vault, id, &params),
         "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
         _ => rpc_error(id, -32601, format!("Method '{}' not found", method)),
     }
@@ -196,30 +458,54 @@ pub fn run_mcp_server(vault: &Path) -> Result<()> {
     let mut stdout = io::stdout();
 
     while let Some(frame) = read_frame(&mut stdin)? {
+        let mut use_cl = false;
         let response = match frame {
             Frame::BadUtf8 => Some(rpc_error(Value::Null, -32700, "Parse error: invalid UTF-8")),
+            Frame::InvalidHeader => Some(rpc_error(
+                Value::Null,
+                -32700,
+                "Parse error: invalid Content-Length header",
+            )),
             Frame::TooLarge => Some(rpc_error(
                 Value::Null,
                 -32600,
                 format!("Request exceeds {} bytes", MAX_REQUEST_BYTES),
             )),
-            Frame::Line(line) if line.trim().is_empty() => None,
-            Frame::Line(line) => match serde_json::from_str::<Value>(line.trim()) {
-                Err(e) => Some(rpc_error(
-                    Value::Null,
-                    -32700,
-                    format!("Parse error: {}", e),
-                )),
-                Ok(req) => match validate_request(&req) {
-                    Err(error) => Some(error),
-                    // JSON-RPC: a message without an id is a notification and MUST NOT be answered.
-                    Ok(None) => None,
-                    Ok(Some(request)) => Some(respond(vault, request)),
-                },
-            },
+            Frame::Message {
+                payload,
+                content_length,
+            } => {
+                use_cl = content_length;
+                if payload.trim().is_empty() {
+                    None
+                } else {
+                    match serde_json::from_str::<Value>(payload.trim()) {
+                        Err(e) => Some(rpc_error(
+                            Value::Null,
+                            -32700,
+                            format!("Parse error: {}", e),
+                        )),
+                        Ok(req) => match validate_request(&req) {
+                            Err(error) => Some(error),
+                            Ok(None) => None,
+                            Ok(Some(request)) => Some(respond(vault, request)),
+                        },
+                    }
+                }
+            }
         };
         if let Some(response) = response {
-            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+            let encoded = serde_json::to_string(&response)?;
+            if use_cl {
+                write!(
+                    stdout,
+                    "Content-Length: {}\r\n\r\n{}",
+                    encoded.len(),
+                    encoded
+                )?;
+            } else {
+                writeln!(stdout, "{}", encoded)?;
+            }
             stdout.flush()?;
         }
     }
@@ -244,16 +530,8 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             let limit = tri!(arg_usize(args, "limit")).unwrap_or(MCP_DEFAULT_LIMIT);
             let with_graph = tri!(arg_bool(args, "with_graph")).unwrap_or(false);
 
-            // Hybrid is the default intent; the effective engine is reported back,
-            // never assumed.
-            let requested = tri!(opt_str(args, "mode"));
-            let mode = requested.unwrap_or_else(|| {
-                if crate::vectors::degradation_note().is_none() {
-                    "hybrid"
-                } else {
-                    "bm25"
-                }
-            });
+            // Hybrid is the default intent; degradation is explicitly surfaced.
+            let mode = tri!(opt_str(args, "mode")).unwrap_or("hybrid");
 
             match search_vault(vault, query, domain, limit, with_graph, mode) {
                 Ok(hits) => {
@@ -272,33 +550,77 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             // Parameter aliasing: accept note, path, or target
             let target_query = tri!(req_str(args, &["note", "path", "target"]));
             let section = tri!(opt_str(args, "section"));
+            let toc = tri!(arg_bool(args, "toc")).unwrap_or(false);
             let budget = tri!(arg_usize(args, "budget"));
-
-            match resolve_note_file(vault, target_query) {
-                Some(p) => match std::fs::read_to_string(&p) {
-                    Ok(content) => {
-                        let selected = if let Some(sec) = section {
-                            match extract_section(&content, sec) {
-                                Some(s) => s,
-                                None => {
-                                    return (
-                                        format!("Section '{}' not found in '{}'", sec, p.display()),
-                                        true,
-                                    )
-                                }
-                            }
-                        } else {
-                            content
-                        };
-                        (crate::storage::apply_token_budget(&selected, budget), false)
-                    }
-                    Err(e) => (
-                        format!("Failed to read note '{}': {}", p.display(), e),
-                        true,
-                    ),
-                },
-                None => (format!("Note '{}' not found in vault.", target_query), true),
+            if toc && section.is_some() {
+                return (
+                    "Invalid parameters: 'toc' and 'section' are mutually exclusive.".to_string(),
+                    true,
+                );
             }
+
+            let p = match resolve_note_file_unique(vault, target_query) {
+                Ok(p) => p,
+                Err(e) => return (format!("{e:#}"), true),
+            };
+            let content = match read_note_utf8(&p) {
+                Ok(c) => c,
+                Err(e) => {
+                    return (
+                        format!("Failed to read note '{}': {e:#}", p.display()),
+                        true,
+                    )
+                }
+            };
+            if toc {
+                let toc_lines = extract_toc(&content);
+                let stem = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(target_query);
+                if toc_lines.is_empty() {
+                    return (
+                        format!("Table of Contents for {stem}:\n  (no headings)"),
+                        false,
+                    );
+                }
+                return (
+                    format!(
+                        "Table of Contents for {stem}:\n  {}",
+                        toc_lines.join("\n  ")
+                    ),
+                    false,
+                );
+            }
+            let selected = if let Some(sec) = section {
+                match extract_section(&content, sec) {
+                    Some(s) => s,
+                    None => {
+                        let toc_lines = extract_toc(&content);
+                        let hint = if toc_lines.is_empty() {
+                            "  (no headings)".to_string()
+                        } else {
+                            format!("  - {}", toc_lines.join("\n  - "))
+                        };
+                        return (
+                            format!(
+                                "Section '{}' not found in '{}'.\nAvailable sections:\n{}",
+                                sec,
+                                p.display(),
+                                hint
+                            ),
+                            true,
+                        );
+                    }
+                }
+            } else {
+                content
+            };
+            let effective_budget = budget.or(Some(MCP_DEFAULT_READ_BUDGET));
+            (
+                crate::storage::apply_token_budget(&selected, effective_budget),
+                false,
+            )
         }
         "akatsuki_contract" => {
             let note = tri!(req_str(args, &["note", "target", "path"]));
@@ -395,10 +717,22 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
             let note = tri!(opt_str_any(args, &["note", "target"]));
             let dry_run = tri!(arg_bool(args, "dry_run")).unwrap_or(false);
             match run_verification_tests(vault, note, dry_run) {
-                Ok(rep) => (
-                    serde_json::to_string_pretty(&rep).unwrap_or_default(),
-                    rep.failed > 0,
-                ),
+                Ok(rep) => {
+                    let pretty = serde_json::to_string_pretty(&rep).unwrap_or_default();
+                    let raw = if pretty.len() > MCP_SPILL_CEILING_BYTES {
+                        serde_json::to_string(&rep).unwrap_or(pretty)
+                    } else {
+                        pretty
+                    };
+                    (
+                        truncate_utf8_bytes(
+                            &raw,
+                            MCP_SPILL_CEILING_BYTES,
+                            "\n... [truncated at 3.8 KB MCP ceiling; pass 'note' to filter]",
+                        ),
+                        rep.failed > 0,
+                    )
+                }
                 Err(e) => (format!("Tests failed: {}", e), true),
             }
         }
@@ -416,17 +750,29 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
         "akatsuki_query" => {
             let sql = tri!(req_str(args, &["sql"]));
             match execute_sql_query(vault, sql) {
-                Ok(results) => (
-                    serde_json::to_string_pretty(&results).unwrap_or_default(),
-                    false,
-                ),
+                Ok(results) => {
+                    let pretty = serde_json::to_string_pretty(&results).unwrap_or_default();
+                    let raw = if pretty.len() > MCP_SPILL_CEILING_BYTES {
+                        serde_json::to_string(&results).unwrap_or(pretty)
+                    } else {
+                        pretty
+                    };
+                    (
+                        truncate_utf8_bytes(
+                            &raw,
+                            MCP_SPILL_CEILING_BYTES,
+                            "\n... [truncated at 3.8 KB MCP ceiling; add LIMIT to SQL query]",
+                        ),
+                        false,
+                    )
+                }
                 Err(e) => (format!("Query failed: {}", e), true),
             }
         }
         "akatsuki_set" => {
             let note = tri!(req_str(args, &["note"]));
             let key = tri!(req_str(args, &["key"]));
-            let Some(value) = args.get("value").filter(|v| !v.is_null()) else {
+            let Some(value) = args.get("value") else {
                 return (
                     "Error: Missing required parameter 'value'.".to_string(),
                     true,
@@ -500,11 +846,27 @@ pub fn dispatch_tool(vault: &Path, name: &str, args: &Value) -> (String, bool) {
         }
         "akatsuki_list_notes" => {
             let domain = tri!(opt_str(args, "domain"));
+            let limit = tri!(arg_usize(args, "limit"));
             match list_notes(vault, domain) {
-                Ok(notes) => (
-                    serde_json::to_string_pretty(&notes).unwrap_or_default(),
-                    false,
-                ),
+                Ok(mut notes) => {
+                    if let Some(max) = limit {
+                        notes.truncate(max);
+                    }
+                    let pretty = serde_json::to_string_pretty(&notes).unwrap_or_default();
+                    let raw = if pretty.len() > MCP_SPILL_CEILING_BYTES {
+                        serde_json::to_string(&notes).unwrap_or(pretty)
+                    } else {
+                        pretty
+                    };
+                    (
+                        truncate_utf8_bytes(
+                            &raw,
+                            MCP_SPILL_CEILING_BYTES,
+                            "\n... [truncated at 3.8 KB MCP ceiling; pass 'domain' or 'limit' to narrow]",
+                        ),
+                        false,
+                    )
+                }
                 Err(e) => (format!("List notes failed: {}", e), true),
             }
         }
@@ -531,7 +893,7 @@ pub fn get_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "akatsuki_read",
-            "description": "Read a note or section from Akatsuki. Accepts note title, path, or target interchangeably.",
+            "description": "Read a note, section, or markdown TOC outline from Akatsuki. Accepts note title, path, or target interchangeably.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -539,7 +901,8 @@ pub fn get_tool_definitions() -> Vec<Value> {
                     "path": { "type": "string", "description": "Alias for note" },
                     "target": { "type": "string", "description": "Alias for note" },
                     "section": { "type": "string", "description": "Optional section heading to extract" },
-                    "budget": { "type": "integer", "description": "Optional token budget (~4 characters each) to truncate output" }
+                    "toc": { "type": "boolean", "default": false, "description": "Return markdown table of contents outline only" },
+                    "budget": { "type": "integer", "description": "Optional token budget (~4 characters each; defaults to 900)" }
                 }
             }
         }),
@@ -682,7 +1045,7 @@ pub fn get_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "note": { "type": "string", "description": "Note title, stem, or relative path" },
                     "key": { "type": "string", "description": "Frontmatter property name" },
-                    "value": { "type": "string", "description": "New value as string, number, boolean, or JSON array" }
+                    "value": { "description": "New value (string, number, boolean, null, array, or object)" }
                 },
                 "required": ["note", "key", "value"]
             }
@@ -739,7 +1102,8 @@ pub fn get_tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "domain": { "type": "string", "description": "Optional domain filter (e.g. '20-Projects', '40-Systems')" }
+                    "domain": { "type": "string", "description": "Optional domain filter (e.g. '20-Projects', '40-Systems')" },
+                    "limit": { "type": "integer", "description": "Optional maximum number of notes to return" }
                 }
             }
         }),
@@ -755,11 +1119,13 @@ fn opt_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
     }
 }
 
-/// First present key among `keys` (alias order) as an optional string.
+/// First present non-blank key among `keys` (alias order) as an optional string.
 fn opt_str_any<'a>(args: &'a Value, keys: &[&str]) -> Result<Option<&'a str>, String> {
     for key in keys {
         if let Some(v) = opt_str(args, key)? {
-            return Ok(Some(v));
+            if !v.trim().is_empty() {
+                return Ok(Some(v));
+            }
         }
     }
     Ok(None)
@@ -768,7 +1134,7 @@ fn opt_str_any<'a>(args: &'a Value, keys: &[&str]) -> Result<Option<&'a str>, St
 /// Required non-empty string argument under any of the alias `keys`.
 fn req_str<'a>(args: &'a Value, keys: &[&str]) -> Result<&'a str, String> {
     match opt_str_any(args, keys)? {
-        Some(s) if !s.is_empty() => Ok(s),
+        Some(s) if !s.trim().is_empty() => Ok(s),
         _ => Err(format!("Error: Missing required parameter '{}'.", keys[0])),
     }
 }
@@ -778,12 +1144,17 @@ fn req_str_allow_empty<'a>(args: &'a Value, key: &str) -> Result<&'a str, String
     opt_str(args, key)?.ok_or_else(|| format!("Error: Missing required parameter '{key}'."))
 }
 
-/// MCP hosts routinely send booleans as strings (`"true"`); an unrecognized value is
-/// an error rather than a silent `false` (which executed live assertions on `dry_run`).
+/// MCP hosts routinely send booleans as strings (`"true"`) or integers (`1`/`0`); an
+/// unrecognized value is an error rather than a silent `false`.
 fn arg_bool(args: &Value, key: &str) -> Result<Option<bool>, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(v)) => Ok(Some(*v)),
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(1) => Ok(Some(true)),
+            Some(0) => Ok(Some(false)),
+            _ => Err(format!("Invalid parameter '{key}': expected a boolean.")),
+        },
         Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" => Ok(Some(true)),
             "false" | "0" | "no" => Ok(Some(false)),
@@ -793,16 +1164,22 @@ fn arg_bool(args: &Value, key: &str) -> Result<Option<bool>, String> {
     }
 }
 
-/// Accepts non-negative integers in either their numeric or string form.
+/// Accepts non-negative integers in numeric, integral-float, or string form.
 fn arg_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
     let invalid = || format!("Invalid parameter '{key}': expected a non-negative integer.");
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .and_then(|v| usize::try_from(v).ok())
-            .map(Some)
-            .ok_or_else(invalid),
+        Some(Value::Number(n)) => {
+            if let Some(u) = n.as_u64() {
+                return usize::try_from(u).map(Some).map_err(|_| invalid());
+            }
+            if let Some(f) = n.as_f64() {
+                if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= (usize::MAX as f64) {
+                    return Ok(Some(f as usize));
+                }
+            }
+            Err(invalid())
+        }
         Some(Value::String(s)) => s.trim().parse::<usize>().map(Some).map_err(|_| invalid()),
         Some(_) => Err(invalid()),
     }

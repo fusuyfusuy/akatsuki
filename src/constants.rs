@@ -2,16 +2,6 @@
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const DOMAIN_DIRS: &[&str] = &[
-    "01-Daily",
-    "20-Projects",
-    "30-Agents",
-    "40-Systems",
-    "50-Configs",
-    "60-Scripts",
-    "90-Reference",
-];
-
 /// Domain index notes: every note in a listed domain must be reachable from its MOC
 /// or from `INDEX.md`.
 pub const DOMAIN_MOCS: &[(&str, &str)] = &[
@@ -47,3 +37,21 @@ pub const SQL_DEADLINE_SECS: u64 = 5;
 
 /// SQLite length limit for any single string/blob produced by a query.
 pub const SQL_MAX_VALUE_BYTES: i32 = 8 * 1024 * 1024;
+
+/// Maximum columns permitted in a user-supplied read-only SQL query.
+pub const SQL_MAX_COLUMNS: i32 = 64;
+
+/// Cumulative serialized byte budget across all rows of a read-only SQL query.
+pub const SQL_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum size of a single note file read into memory during mutations/reads.
+pub const MAX_NOTE_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Default token budget applied to `akatsuki_read` when MCP caller omits `budget`.
+pub const MCP_DEFAULT_READ_BUDGET: usize = 900;
+
+/// Byte ceiling for MCP list/query/test tool responses to avoid the 4 KB host spill trap.
+pub const MCP_SPILL_CEILING_BYTES: usize = 3_800;
+
+/// Byte ceiling for a single `resources/read` response over MCP stdio.
+pub const MAX_MCP_RESOURCE_BYTES: usize = 65_536;

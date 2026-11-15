@@ -9,9 +9,11 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::constants::{MAX_SEARCH_LIMIT, SQL_DEADLINE_SECS, SQL_MAX_VALUE_BYTES};
+use crate::constants::{
+    MAX_SEARCH_LIMIT, SQL_DEADLINE_SECS, SQL_MAX_COLUMNS, SQL_MAX_TOTAL_BYTES, SQL_MAX_VALUE_BYTES,
+};
 use crate::index::open_synced_db;
-use crate::storage::{parse_frontmatter, resolve_note_file};
+use crate::storage::{parse_frontmatter, read_note_utf8, resolve_note_file};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
@@ -56,23 +58,28 @@ pub fn search_vault(
         // Explicit vector mode never silently becomes a keyword search: without
         // the feature or the weights it is an error the caller can act on.
         "vector" => crate::vectors::search_vectors(vault, clean_query, domain, limit)?,
-        _ /* hybrid */ => {
+        "hybrid" => {
             let bm25_limit = (limit * 2).max(20);
             let bm25_hits = run_bm25_search(&con, clean_query, domain, bm25_limit)?;
 
             #[cfg(feature = "vectors")]
             {
-                // Semantic hits are a bonus, never a silent substitution: when they
-                // are unavailable the caller is told through `vectors::hybrid_note`.
-                let vec_hits = crate::vectors::search_vectors(vault, clean_query, domain, bm25_limit)
-                    .unwrap_or_else(|e| {
-                        eprintln!("⚠ semantic ranking failed, using keyword ranking only: {e:#}");
-                        Vec::new()
-                    });
-                if vec_hits.is_empty() {
+                if !crate::vectors::are_models_available() {
                     bm25_hits.into_iter().take(limit).collect()
                 } else {
-                    fuse_rrf(bm25_hits, vec_hits, limit)
+                    let vec_hits =
+                        crate::vectors::search_vectors(vault, clean_query, domain, bm25_limit)
+                            .unwrap_or_else(|e| {
+                                eprintln!(
+                                    "⚠ semantic ranking failed, using keyword ranking only: {e:#}"
+                                );
+                                Vec::new()
+                            });
+                    if vec_hits.is_empty() {
+                        bm25_hits.into_iter().take(limit).collect()
+                    } else {
+                        fuse_rrf(bm25_hits, vec_hits, limit)
+                    }
                 }
             }
             #[cfg(not(feature = "vectors"))]
@@ -80,6 +87,10 @@ pub fn search_vault(
                 bm25_hits.into_iter().take(limit).collect()
             }
         }
+        other => anyhow::bail!(
+            "Invalid search mode '{}': expected 'hybrid', 'bm25', or 'vector'",
+            other
+        ),
     };
 
     if with_graph && !hits.is_empty() {
@@ -117,40 +128,41 @@ fn expand_query_term(word: &str) -> Vec<String> {
 }
 
 fn build_fts_clause(query: &str) -> Vec<String> {
-    let word_re = Regex::new(r"\w+").unwrap();
-    let words: Vec<String> = word_re
-        .find_iter(query)
-        .map(|m| m.as_str().to_string())
-        .collect();
+    static TOKEN_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static WORD_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let token_re =
+        TOKEN_RE.get_or_init(|| Regex::new(r#""([^"]+)"|(\w+)"#).expect("valid token regex"));
+    let word_re = WORD_RE.get_or_init(|| Regex::new(r"\w+").expect("valid word regex"));
 
-    if words.is_empty() {
+    let mut terms: Vec<String> = Vec::new();
+    for cap in token_re.captures_iter(query) {
+        if let Some(phrase_match) = cap.get(1) {
+            let phrase_words: Vec<&str> = word_re
+                .find_iter(phrase_match.as_str())
+                .map(|m| m.as_str())
+                .collect();
+            if !phrase_words.is_empty() {
+                terms.push(format!("\"{}\"", phrase_words.join(" ")));
+            }
+        } else if let Some(word_match) = cap.get(2) {
+            let variants = expand_query_term(word_match.as_str());
+            if variants.len() == 1 {
+                terms.push(variants[0].clone());
+            } else {
+                terms.push(format!("({})", variants.join(" OR ")));
+            }
+        }
+    }
+
+    if terms.is_empty() {
         return vec![];
     }
 
-    if query.starts_with('"') && query.ends_with('"') && query.len() > 2 {
-        let phrase = query.trim_matches('"').replace('"', "\"\"");
-        return vec![format!("\"{}\"", phrase)];
-    }
-
-    let clause = |op: &str| {
-        words
-            .iter()
-            .map(|w| {
-                let variants = expand_query_term(w);
-                if variants.len() == 1 {
-                    variants[0].clone()
-                } else {
-                    format!("({})", variants.join(" OR "))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(&format!(" {} ", op))
-    };
-
-    if words.len() > 1 {
-        vec![clause("AND"), clause("OR")]
+    let and_clause = terms.join(" AND ");
+    if terms.len() > 1 {
+        vec![and_clause, terms.join(" OR ")]
     } else {
-        vec![clause("AND")]
+        vec![and_clause]
     }
 }
 
@@ -165,8 +177,11 @@ pub fn run_bm25_search(
         return Ok(Vec::new());
     }
 
-    let domain_clause = if domain_filter.is_some() {
-        "AND domain = ?2"
+    let norm_domain = domain_filter
+        .map(|d| d.trim().trim_end_matches('/'))
+        .filter(|d| !d.is_empty());
+    let domain_clause = if norm_domain.is_some() {
+        "AND (domain = ?2 OR rel_path LIKE ?3 ESCAPE '\\')"
     } else {
         ""
     };
@@ -179,7 +194,7 @@ pub fn run_bm25_search(
         FROM notes_fts
         WHERE notes_fts MATCH ?1 {domain_clause}
         ORDER BY score
-        LIMIT ?3
+        LIMIT ?4
         "#
     );
 
@@ -204,11 +219,12 @@ pub fn run_bm25_search(
     };
 
     for q_clause in clauses {
-        let results: Vec<SearchHit> = if let Some(dom) = domain_filter {
-            stmt.query_map(params![q_clause, dom, limit as i64], map_hit)?
+        let results: Vec<SearchHit> = if let Some(dom) = norm_domain {
+            let like_prefix = format!("{}/%", crate::graph::escape_like(dom));
+            stmt.query_map(params![q_clause, dom, like_prefix, limit as i64], map_hit)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
-            stmt.query_map(params![q_clause, "", limit as i64], map_hit)?
+            stmt.query_map(params![q_clause, "", "", limit as i64], map_hit)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
 
@@ -378,9 +394,8 @@ fn strip_leading_sql_comments(mut s: &str) -> &str {
 }
 
 pub fn execute_sql_query(vault: &Path, sql: &str) -> Result<Vec<serde_json::Value>> {
-    let stripped = strip_leading_sql_comments(sql);
-    let trimmed = stripped.trim().trim_end_matches(';').trim();
-    let keyword = trimmed
+    let stripped = strip_leading_sql_comments(sql).trim();
+    let keyword = stripped
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -389,13 +404,23 @@ pub fn execute_sql_query(vault: &Path, sql: &str) -> Result<Vec<serde_json::Valu
         anyhow::bail!("Security violation: only SELECT, WITH and EXPLAIN queries are permitted.");
     }
 
-    if has_unquoted_semicolon(trimmed) {
+    if has_multiple_sql_statements(stripped) {
         anyhow::bail!("Security violation: multiple statements are not permitted.");
     }
 
-    let con = open_synced_db(vault)?;
+    // Reconcile first, then execute on a dedicated read-only + query_only connection.
+    let _synced = open_synced_db(vault)?;
+    let db_path = vault.join(".akatsuki/cache.db");
+    let con = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    con.busy_timeout(Duration::from_secs(5))?;
+    con.pragma_update(None, "query_only", "ON")?;
     con.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQL_MAX_VALUE_BYTES);
-    let mut stmt = con.prepare(trimmed)?;
+    con.set_limit(Limit::SQLITE_LIMIT_COLUMN, SQL_MAX_COLUMNS);
+
+    let mut stmt = con.prepare(stripped)?;
     if !stmt.readonly() {
         anyhow::bail!("Security violation: query is not read-only.");
     }
@@ -404,6 +429,13 @@ pub fn execute_sql_query(vault: &Path, sql: &str) -> Result<Vec<serde_json::Valu
         .into_iter()
         .map(|s| s.to_string())
         .collect();
+    if col_names.len() > SQL_MAX_COLUMNS as usize {
+        anyhow::bail!(
+            "Query returns {} columns (maximum permitted is {})",
+            col_names.len(),
+            SQL_MAX_COLUMNS
+        );
+    }
 
     // Interrupt the query from a timer thread; dropping `done` cancels the timer.
     let interrupt = con.get_interrupt_handle();
@@ -420,16 +452,65 @@ pub fn execute_sql_query(vault: &Path, sql: &str) -> Result<Vec<serde_json::Valu
     outcome.with_context(|| format!("query failed or was interrupted (limit {SQL_DEADLINE_SECS}s)"))
 }
 
-/// True when `sql` contains a `;` outside single/double-quoted literals, i.e. a
-/// second statement (a single trailing `;` has already been trimmed).
-fn has_unquoted_semicolon(sql: &str) -> bool {
-    let mut quote: Option<char> = None;
-    for c in sql.chars() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (None, '\'' | '"') => quote = Some(c),
-            (None, ';') => return true,
-            _ => {}
+/// Comment- and quote-aware scanner returning `true` when `sql` contains more
+/// than one non-empty SQL statement (`;` followed by non-comment tokens).
+fn has_multiple_sql_statements(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut saw_semicolon = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if saw_semicolon {
+            return true;
+        }
+        match b {
+            b'\'' | b'"' | b'`' => {
+                let quote = b;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len());
+            }
+            b';' => {
+                saw_semicolon = true;
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
     false
@@ -442,6 +523,7 @@ fn collect_rows(
     const MAX_SQL_ROWS: usize = 500;
     let mut rows = stmt.query([])?;
     let mut results = Vec::new();
+    let mut total_bytes = 0usize;
 
     while let Some(row) = rows.next()? {
         if results.len() >= MAX_SQL_ROWS {
@@ -450,22 +532,28 @@ fn collect_rows(
         let mut obj = serde_json::Map::new();
         for (i, name) in col_names.iter().enumerate() {
             let val_ref = row.get_ref(i)?;
-            let json_val = match val_ref {
-                rusqlite::types::ValueRef::Null => serde_json::Value::Null,
-                rusqlite::types::ValueRef::Integer(v) => serde_json::Value::from(v),
-                rusqlite::types::ValueRef::Real(v) => serde_json::Value::from(v),
+            let (json_val, cell_bytes) = match val_ref {
+                rusqlite::types::ValueRef::Null => (serde_json::Value::Null, 4),
+                rusqlite::types::ValueRef::Integer(v) => (serde_json::Value::from(v), 8),
+                rusqlite::types::ValueRef::Real(v) => (serde_json::Value::from(v), 8),
                 rusqlite::types::ValueRef::Text(v) => {
-                    let s = String::from_utf8_lossy(v);
-                    if let Ok(nested) = serde_json::from_str::<serde_json::Value>(&s) {
-                        nested
-                    } else {
-                        serde_json::Value::String(s.to_string())
-                    }
+                    let s = String::from_utf8_lossy(v).into_owned();
+                    let len = s.len();
+                    (serde_json::Value::String(s), len)
                 }
                 rusqlite::types::ValueRef::Blob(b) => {
-                    serde_json::Value::String(format!("<blob len={}>", b.len()))
+                    let s = format!("<blob len={}>", b.len());
+                    let len = s.len();
+                    (serde_json::Value::String(s), len)
                 }
             };
+            total_bytes = total_bytes.saturating_add(name.len() + cell_bytes + 4);
+            if total_bytes > SQL_MAX_TOTAL_BYTES {
+                anyhow::bail!(
+                    "Query result exceeds {} byte safety ceiling; narrow SELECT columns or add LIMIT",
+                    SQL_MAX_TOTAL_BYTES
+                );
+            }
             obj.insert(name.clone(), json_val);
         }
         results.push(serde_json::Value::Object(obj));
@@ -488,6 +576,25 @@ fn traverse_value_keypath(cur: &serde_json::Value, p: &str) -> Option<serde_json
     }
 }
 
+fn walk_value_tail(
+    mut cur: serde_json::Value,
+    tail: &[&str],
+    context_label: &str,
+) -> Result<serde_json::Value> {
+    for p in tail {
+        cur = traverse_value_keypath(&cur, p)
+            .ok_or_else(|| anyhow::anyhow!("Property '{}' not found in {}", p, context_label))?;
+    }
+    Ok(cur)
+}
+
+fn split_keypath_segments(raw: &str) -> Vec<&str> {
+    raw.split('.')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
     let clean_key = keypath.trim();
     if clean_key.is_empty() {
@@ -498,55 +605,31 @@ pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
 
     // 1. Longest-stem-first matching for "services."
     if let Some(rest) = clean_key.strip_prefix("services.") {
-        let parts: Vec<&str> = rest
-            .split('.')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .collect();
+        let parts = split_keypath_segments(rest);
         if !parts.is_empty() {
-            let mut stmt = con.prepare("SELECT name, container_prefix, ports, host, network, replicas, role, rel_path FROM services WHERE name = ?1 OR container_prefix = ?1 LIMIT 1")?;
+            let mut stmt = con.prepare(
+                "SELECT name, container_prefix, ports, host, network, replicas, role, rel_path \
+                 FROM services WHERE name = ?1 OR container_prefix = ?1 LIMIT 1",
+            )?;
             for i in (1..=parts.len()).rev() {
                 let candidate_svc = parts[..i].join(".");
                 let mut rows = stmt.query(params![candidate_svc])?;
                 if let Some(row) = rows.next()? {
-                    let mut obj = serde_json::Map::new();
-                    obj.insert("name".to_string(), serde_json::Value::String(row.get(0)?));
-                    obj.insert(
-                        "container_prefix".to_string(),
-                        serde_json::Value::String(row.get(1)?),
+                    let obj = serde_json::json!({
+                        "name": row.get::<_, String>(0)?,
+                        "container_prefix": row.get::<_, String>(1)?,
+                        "ports": row.get::<_, String>(2)?,
+                        "host": row.get::<_, String>(3)?,
+                        "network": row.get::<_, String>(4)?,
+                        "replicas": row.get::<_, String>(5)?,
+                        "role": row.get::<_, String>(6)?,
+                        "rel_path": row.get::<_, String>(7)?,
+                    });
+                    return walk_value_tail(
+                        obj,
+                        &parts[i..],
+                        &format!("service '{}'", candidate_svc),
                     );
-                    obj.insert("ports".to_string(), serde_json::Value::String(row.get(2)?));
-                    obj.insert("host".to_string(), serde_json::Value::String(row.get(3)?));
-                    obj.insert(
-                        "network".to_string(),
-                        serde_json::Value::String(row.get(4)?),
-                    );
-                    obj.insert(
-                        "replicas".to_string(),
-                        serde_json::Value::String(row.get(5)?),
-                    );
-                    obj.insert("role".to_string(), serde_json::Value::String(row.get(6)?));
-                    obj.insert(
-                        "rel_path".to_string(),
-                        serde_json::Value::String(row.get(7)?),
-                    );
-
-                    if i == parts.len() {
-                        return Ok(serde_json::Value::Object(obj));
-                    }
-                    let mut cur = serde_json::Value::Object(obj);
-                    for p in &parts[i..] {
-                        if let Some(next) = traverse_value_keypath(&cur, p) {
-                            cur = next;
-                        } else {
-                            anyhow::bail!(
-                                "Property '{}' not found in service '{}'",
-                                p,
-                                candidate_svc
-                            );
-                        }
-                    }
-                    return Ok(cur);
                 }
             }
         }
@@ -554,11 +637,7 @@ pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
 
     // 2. Longest-stem-first matching for "entities."
     if let Some(rest) = clean_key.strip_prefix("entities.") {
-        let parts: Vec<&str> = rest
-            .split('.')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .collect();
+        let parts = split_keypath_segments(rest);
         if !parts.is_empty() {
             let mut stmt = con.prepare(
                 "SELECT metadata_json FROM entities WHERE stem = ?1 OR rel_path = ?1 LIMIT 1",
@@ -568,59 +647,36 @@ pub fn get_keypath(vault: &Path, keypath: &str) -> Result<serde_json::Value> {
                 let mut rows = stmt.query(params![candidate_stem])?;
                 if let Some(row) = rows.next()? {
                     let raw: String = row.get(0)?;
-                    let mut cur: serde_json::Value =
-                        serde_json::from_str(&raw).with_context(|| {
-                            format!(
-                                "Entity '{}' carries unreadable metadata_json",
-                                candidate_stem
-                            )
-                        })?;
-                    for p in &parts[i..] {
-                        if let Some(next) = traverse_value_keypath(&cur, p) {
-                            cur = next;
-                        } else {
-                            anyhow::bail!(
-                                "Property '{}' not found in entity '{}'",
-                                p,
-                                candidate_stem
-                            );
-                        }
-                    }
-                    return Ok(cur);
+                    let cur: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+                        format!(
+                            "Entity '{}' carries unreadable metadata_json",
+                            candidate_stem
+                        )
+                    })?;
+                    return walk_value_tail(
+                        cur,
+                        &parts[i..],
+                        &format!("entity '{}'", candidate_stem),
+                    );
                 }
             }
         }
     }
 
     // 3. Direct frontmatter lookup on note file (with longest-stem matching for dotted files)
-    let parts: Vec<&str> = clean_key
-        .split('.')
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .collect();
+    let parts = split_keypath_segments(clean_key);
     for i in (1..=parts.len()).rev() {
         let candidate_stem = parts[..i].join(".");
         if let Some(note_path) = resolve_note_file(vault, &candidate_stem) {
-            let content = std::fs::read_to_string(&note_path)?;
+            let content = read_note_utf8(&note_path)?;
             let (fm, _) = parse_frontmatter(&content).with_context(|| {
                 format!("Note '{}' has invalid frontmatter", note_path.display())
             })?;
-            if i == parts.len() {
-                return Ok(fm);
-            }
-            let mut cur = fm;
-            for p in &parts[i..] {
-                if let Some(next) = traverse_value_keypath(&cur, p) {
-                    cur = next;
-                } else {
-                    anyhow::bail!(
-                        "Key '{}' not found in frontmatter of '{}'",
-                        p,
-                        note_path.display()
-                    );
-                }
-            }
-            return Ok(cur);
+            return walk_value_tail(
+                fm,
+                &parts[i..],
+                &format!("frontmatter of '{}'", note_path.display()),
+            );
         }
     }
 

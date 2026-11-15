@@ -30,7 +30,7 @@ KERNEL:
 ```shell
 akatsuki search   <query> [--domain <d>] [--limit <N>] [--mode hybrid|bm25|vector] [--with-graph] [--compact] [--json]
 akatsuki contract <note> [--json]
-akatsuki read     <note> [--section <sec>] [--budget <N>] [--json]     # alias: cat
+akatsuki read     <note> [--section <sec> | --toc] [--budget <N>] [--json]  # alias: cat
 akatsuki get      <key> [--json]
 akatsuki query    <sql> [--json]
 akatsuki blast    <target> [--json]
@@ -105,8 +105,8 @@ ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
 ### `contract` — Boundary Contract Slicing
 `akatsuki contract <note>` extracts machine-actionable interfaces: `note_type`, declared ports, `relations[]`, `invariants[]`, `verifications[]`, `dependencies[]`, `dependents[]`. Primary orientation primitive — use instead of `read`.
 
-### `read` — Token-Bounded Note Reading
-`akatsuki read <note> [--section <sec>] [--budget <N>]`: full note or one section; `--budget` packs to roughly $N$ tokens (~4 chars each), keeps the frontmatter block intact, and appends an explicit truncation notice.
+### `read` — Token-Bounded Note Reading & TOC Outlines
+`akatsuki read <note> [--section <sec> | --toc] [--budget <N>]`: full note, one section, or fence-aware table of contents (`--toc`); missing `--section` automatically lists `Available sections:`. `--budget` packs to roughly $N$ tokens (~4 chars each), keeps the frontmatter block intact, and appends an explicit truncation notice.
 
 ### `get` & `query` — Structured Data Extraction
 - `get <keypath>`: O(1) dotted lookup. `services.api.ports` reads the services projection; `entities.<stem>.<field>` reads that note's frontmatter; otherwise the keypath is walked over a note's frontmatter.
@@ -139,24 +139,24 @@ ORIENT -> CONTRACT -> MAP/BLAST -> MUTATE -> VERIFY -> LOG
 
 ### `list`, `lint` & `verify` — Vault Health Gates
 - `list [--domain d]`: `rel_path`, `stem`, `title`, `type`, `summary`, `status`, `tags`.
-- `lint`: strict YAML plus per-type required fields (`project` also needs `status`; every type needs `tags`), and syntax checks for raw assets under `50-Configs/` and `60-Scripts/` (`.yaml`, `.json`, `.sh`). `bash:verify` blocks that invoke repo unit tests are a boundary violation.
+- `lint`: strict YAML plus per-type required fields (`project` needs `status` + `tags`; `system|daily|agent|config|script|reference` need `tags`; `moc|note` need `title, date, type, summary`), and syntax checks for raw assets under `50-Configs/` and `60-Scripts/` (`.yaml`, `.json`, `.sh`). `bash:verify` blocks that invoke repo unit tests are a boundary violation.
 - `verify`: broken wikilinks, broken markdown links, orphan notes, and notes a domain MOC fails to index.
 
 ### `reconcile` — Projection Rebuild & Repair
-- Syncs the projection (Blake3 content hashes, Rayon-parallel scan), auto-quotes frontmatter scalars containing `": "`, appends unindexed notes to their domain MOC, and embeds changed notes when the vector feature is available.
+- Syncs the projection (Blake3 content hashes, Rayon-parallel scan), auto-quotes broken frontmatter scalars containing `": "`, appends unindexed notes to their domain MOC, garbage-collects orphan vectors, and embeds changed notes when the vector feature is available.
 - `--dry-run` reports every action it would take and writes nothing (including no index mutation).
-- Notes whose frontmatter cannot be parsed are indexed without metadata and reported as `unindexable frontmatter` errors — never silently dropped.
+- Notes whose frontmatter cannot be parsed are skipped by the projection and reported in `parse_errors` (and fail `lint`) — never silently dropped.
 
 ---
 
 ## MCP SERVER & TOOL DUALITY
 
-Run stdio daemon: `akatsuki mcp [--vault <dir>]`. Every tool call is panic-isolated: one failing tool returns `isError`, it never kills the server. Messages without an `id` are notifications and receive no reply.
+Run stdio daemon: `akatsuki mcp [--vault <dir>]` (supports both newline-delimited JSON-RPC and `Content-Length` stdio framing). Every tool call is panic-isolated (`catch_unwind` returns JSON-RPC `-32603` internal error; domain errors return `isError: true`). Messages without an `id` are notifications and receive no reply.
 
 | MCP Tool | CLI Equivalent | Key Arguments |
 | :--- | :--- | :--- |
 | `akatsuki_search` | `akatsuki search` | `query`, `mode`, `domain`, `limit`, `with_graph` |
-| `akatsuki_read` | `akatsuki read` | `note` (or `path`, `target`), `section`, `budget` |
+| `akatsuki_read` | `akatsuki read` | `note` (or `path`, `target`), `section`, `toc`, `budget` |
 | `akatsuki_contract` | `akatsuki contract` | `note` (or `target`, `path`) |
 | `akatsuki_blast` | `akatsuki blast` | `target` (or `note`, `path`) |
 | `akatsuki_map` | `akatsuki map` | `target` (or `note`, `path`), `depth`, `direction` |
@@ -174,10 +174,10 @@ Run stdio daemon: `akatsuki mcp [--vault <dir>]`. Every tool call is panic-isola
 | `akatsuki_verify` | `akatsuki verify` | *(none)* |
 | `akatsuki_test` | `akatsuki test` | `note`, `dry_run` |
 | `akatsuki_reconcile` | `akatsuki reconcile` | `dry_run` |
-| `akatsuki_list_notes` | `akatsuki list` | `domain` |
+| `akatsuki_list_notes` | `akatsuki list` | `domain`, `limit` |
 
-Booleans and numbers are accepted in either JSON or string form (`"dry_run": "true"` behaves as `true`).
-No MCP resource layer is implemented: `resources/*` returns `-32601`.
+Booleans and numbers are accepted in JSON, integral, or string form (`"dry_run": "true"` behaves as `true`).
+MCP resources (`resources/list`, `resources/templates/list`, `resources/read`) expose `akatsuki://services`, `akatsuki://projects`, `akatsuki://operator`, `akatsuki://daily`, `akatsuki://invariants`, `akatsuki://index`, and `akatsuki://{note}` (64 KB ceiling).
 
 ---
 
@@ -196,7 +196,7 @@ No MCP resource layer is implemented: `resources/*` returns `-32601`.
 - **Wikilinks**: Always link notes with standard syntax: `[[TargetNote]]` or `[[TargetNote|Alias]]`. Zero orphan notes permitted.
 
 ### 3. Frontmatter Contract
-- Every note carries `title`, `date`, `type`, `tags`, `summary` (`project` notes also `status`).
+- Every domain note carries `title`, `date`, `type`, `tags`, `summary` (`project` notes also `status`; `moc`/`note` omit `tags`).
 - `type` is inferred from the domain directory on write (`20-Projects` → project, `40-Systems` → system, …).
 - Malformed YAML is a hard error for `lint` and for any mutation of that note: metadata is never rewritten from a partial parse.
 
